@@ -1084,7 +1084,11 @@ mod tests {
             "x".to_string(),
             OperandDesc {
                 data_type: webnn_graph::ast::DataType::Float32,
-                shape: vec![1, 2, 3],
+                shape: vec![
+                    webnn_graph::ast::Dimension::Static(1),
+                    webnn_graph::ast::Dimension::Static(2),
+                    webnn_graph::ast::Dimension::Static(3),
+                ],
             },
         );
 
@@ -1439,7 +1443,7 @@ mod tests {
             "x".to_string(),
             OperandDesc {
                 data_type: webnn_graph::ast::DataType::Float32,
-                shape: vec![2],
+                shape: vec![webnn_graph::ast::Dimension::Static(2)],
             },
         );
 
@@ -1479,7 +1483,7 @@ mod tests {
             "x".to_string(),
             OperandDesc {
                 data_type: webnn_graph::ast::DataType::Float32,
-                shape: vec![2],
+                shape: vec![webnn_graph::ast::Dimension::Static(2)],
             },
         );
 
@@ -1580,7 +1584,7 @@ mod tests {
             "x".to_string(),
             OperandDesc {
                 data_type: webnn_graph::ast::DataType::Float32,
-                shape: vec![2],
+                shape: vec![webnn_graph::ast::Dimension::Static(2)],
             },
         );
 
