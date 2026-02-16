@@ -3740,8 +3740,10 @@ impl crate::converters::GraphConverter for OnnxConverter {
                 // ONNX BatchNormalization expects channel at axis=1 and rank>=2.
                 // Adapt WebNN inputs by inserting transposes/reshapes as needed.
                 let mut normalized_input_name = operand_name(graph, input_id);
+                let mut normalized_input_shape = input_operand.descriptor.shape.clone();
                 let mut transpose_back_perm: Option<Vec<i64>> = None;
                 let mut reshape_back_shape: Option<Vec<i64>> = None;
+                let mut layernorm_axis_override: Option<i64> = None;
                 if op.op_type == "batchNormalization" {
                     let rank = input_operand.descriptor.shape.len();
                     let axis = op
@@ -3765,6 +3767,7 @@ impl crate::converters::GraphConverter for OnnxConverter {
                             &mut nodes,
                             &mut initializers,
                         );
+                        normalized_input_shape = vec![1, channels];
                         node_output_name = format!("{}_bn_output", op_name);
                         reshape_back_shape = Some(vec![channels as i64]);
                     } else if normalized_axis != 1 {
@@ -3785,51 +3788,115 @@ impl crate::converters::GraphConverter for OnnxConverter {
                             ..Default::default()
                         });
                         normalized_input_name = transposed_input_name;
+                        normalized_input_shape = perm
+                            .iter()
+                            .map(|&i| input_operand.descriptor.shape[i as usize])
+                            .collect();
                         node_output_name = format!("{}_bn_output", op_name);
                         transpose_back_perm = Some(perm);
                     }
                 }
-                inputs.push(normalized_input_name);
-
-                // For layer normalization, check if axes are empty or if input is 0D
-                // When axes are empty, no normalization occurs (output = bias or 0)
                 if op.op_type == "layerNormalization" {
-                    let axes = op
-                        .attributes
-                        .get("axes")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect::<Vec<i64>>())
-                        .unwrap_or_else(std::vec::Vec::new);
-
-                    // Handle empty axes or 0D tensor with axes=[-1] case
-                    // When axes are empty or when input is 0D scalar, no normalization occurs
-                    // This matches Chromium's implementation
-                    let is_0d_with_default_axes =
-                        input_operand.descriptor.shape.is_empty() && axes == vec![-1];
-                    if axes.is_empty() || is_0d_with_default_axes {
+                    let rank = input_operand.descriptor.shape.len();
+                    let axes_raw = op.attributes.get("axes").and_then(|v| v.as_array());
+                    if rank == 0 {
                         let output_name = operand_name(
                             graph,
                             op.output_operand.expect("Single-output operation expected"),
                         );
-
-                        if has_bias && op.input_operands.len() > 2 {
-                            // output = bias + 0
-                            let bias_name = operand_name(graph, op.input_operands[2]);
-                            let zero_name = format!("{}_zero", op_name);
-                            initializers.push(Self::create_scalar_initializer(
-                                zero_name.clone(),
-                                input_data_type,
-                                0.0,
-                            ));
+                        if has_bias {
+                            let mut optional_input_index = 1usize;
+                            if has_scale && op.input_operands.len() > optional_input_index {
+                                optional_input_index += 1;
+                            }
+                            if op.input_operands.len() > optional_input_index {
+                                nodes.push(NodeProto {
+                                    input: vec![operand_name(
+                                        graph,
+                                        op.input_operands[optional_input_index],
+                                    )],
+                                    output: vec![output_name],
+                                    name: op_name,
+                                    op_type: "Identity".to_string(),
+                                    ..Default::default()
+                                });
+                            } else {
+                                let zero_name = format!("{}_zero", op_name);
+                                initializers.push(Self::create_scalar_initializer(
+                                    zero_name.clone(),
+                                    input_data_type,
+                                    0.0,
+                                ));
+                                nodes.push(NodeProto {
+                                    input: vec![zero_name],
+                                    output: vec![output_name],
+                                    name: op_name,
+                                    op_type: "Identity".to_string(),
+                                    ..Default::default()
+                                });
+                            }
+                        } else {
                             nodes.push(NodeProto {
-                                input: vec![bias_name, zero_name],
+                                input: vec![
+                                    operand_name(graph, input_id),
+                                    operand_name(graph, input_id),
+                                ],
                                 output: vec![output_name],
                                 name: op_name,
-                                op_type: "Add".to_string(),
+                                op_type: "Sub".to_string(),
                                 ..Default::default()
                             });
+                        }
+                        continue;
+                    }
+
+                    if let Some(arr) = axes_raw
+                        && arr.is_empty()
+                    {
+                        let output_name = operand_name(
+                            graph,
+                            op.output_operand.expect("Single-output operation expected"),
+                        );
+                        if has_bias {
+                            let mut optional_input_index = 1usize;
+                            if has_scale && op.input_operands.len() > optional_input_index {
+                                optional_input_index += 1;
+                            }
+                            if op.input_operands.len() > optional_input_index {
+                                let bias_name =
+                                    operand_name(graph, op.input_operands[optional_input_index]);
+                                let input_name = operand_name(graph, input_id);
+                                let zero_like_name = format!("{}_zero_like", op_name);
+                                nodes.push(NodeProto {
+                                    input: vec![input_name.clone(), input_name],
+                                    output: vec![zero_like_name.clone()],
+                                    name: format!("{}_zero_like_sub", op_name),
+                                    op_type: "Sub".to_string(),
+                                    ..Default::default()
+                                });
+                                nodes.push(NodeProto {
+                                    input: vec![zero_like_name, bias_name],
+                                    output: vec![output_name],
+                                    name: op_name,
+                                    op_type: "Add".to_string(),
+                                    ..Default::default()
+                                });
+                            } else {
+                                let zero_name = format!("{}_zero", op_name);
+                                initializers.push(Self::create_scalar_initializer(
+                                    zero_name.clone(),
+                                    input_data_type,
+                                    0.0,
+                                ));
+                                nodes.push(NodeProto {
+                                    input: vec![zero_name],
+                                    output: vec![output_name],
+                                    name: op_name,
+                                    op_type: "Identity".to_string(),
+                                    ..Default::default()
+                                });
+                            }
                         } else {
-                            // output = input - input = 0
                             let input_name = operand_name(graph, input_id);
                             nodes.push(NodeProto {
                                 input: vec![input_name.clone(), input_name],
@@ -3841,34 +3908,68 @@ impl crate::converters::GraphConverter for OnnxConverter {
                         }
                         continue;
                     }
+
+                    let mut axes = if let Some(arr) = axes_raw {
+                        arr.iter().filter_map(|v| v.as_i64()).collect::<Vec<i64>>()
+                    } else {
+                        (1..rank as i64).collect::<Vec<i64>>()
+                    };
+                    for axis in &mut axes {
+                        if *axis < 0 {
+                            *axis += rank as i64;
+                        }
+                    }
+                    axes.retain(|&axis| axis >= 0 && axis < rank as i64);
+                    let mut seen = std::collections::HashSet::new();
+                    axes.retain(|axis| seen.insert(*axis));
+
+                    if !axes.is_empty() {
+                        let non_axes: Vec<i64> =
+                            (0..rank as i64).filter(|idx| !axes.contains(idx)).collect();
+                        let mut perm = non_axes.clone();
+                        perm.extend_from_slice(&axes);
+                        let identity: Vec<i64> = (0..rank as i64).collect();
+                        if perm != identity {
+                            let transposed_input_name = format!("{}_ln_axes_tail", op_name);
+                            nodes.push(NodeProto {
+                                input: vec![normalized_input_name],
+                                output: vec![transposed_input_name.clone()],
+                                name: format!("{}_ln_pre_transpose", op_name),
+                                op_type: "Transpose".to_string(),
+                                attribute: vec![AttributeProto {
+                                    name: "perm".to_string(),
+                                    r#type: AttributeType::Ints as i32,
+                                    ints: perm.clone(),
+                                    ..Default::default()
+                                }],
+                                ..Default::default()
+                            });
+                            normalized_input_name = transposed_input_name;
+                            normalized_input_shape = perm
+                                .iter()
+                                .map(|&i| input_operand.descriptor.shape[i as usize])
+                                .collect();
+                            node_output_name = format!("{}_ln_output", op_name);
+                            let mut inverse = vec![0i64; rank];
+                            for (new_pos, &old_pos) in perm.iter().enumerate() {
+                                inverse[old_pos as usize] = new_pos as i64;
+                            }
+                            transpose_back_perm = Some(inverse);
+                        }
+                    }
+                    layernorm_axis_override = Some((rank.saturating_sub(axes.len())) as i64);
                 }
+                inputs.push(normalized_input_name);
 
                 // Determine scale/bias shape based on normalization type
                 let scale_bias_shape = if op.op_type == "layerNormalization" {
-                    // For layer norm, ONNX LayerNormalization expects scale/bias shape to match
-                    // X.shape[axis:], i.e., all dimensions from axis to the end
-                    let axes = op
-                        .attributes
-                        .get("axes")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect::<Vec<i64>>())
-                        .unwrap_or_else(|| vec![-1]);
-
-                    // Get the first axis (ONNX only supports a single axis parameter)
-                    let first_axis = axes.first().copied().unwrap_or(-1);
-                    let actual_axis = if first_axis < 0 {
-                        ((input_operand.descriptor.shape.len() as i64 + first_axis) as usize)
-                            .min(input_operand.descriptor.shape.len())
-                    } else {
-                        (first_axis as usize).min(input_operand.descriptor.shape.len())
-                    };
-
-                    // Calculate product of all dimensions from axis to end
-                    let mut size = 1i64;
-                    for i in actual_axis..input_operand.descriptor.shape.len() {
-                        size *= input_operand.descriptor.shape[i] as i64;
-                    }
-                    vec![size]
+                    let axis = layernorm_axis_override
+                        .unwrap_or((normalized_input_shape.len().saturating_sub(1)) as i64)
+                        as usize;
+                    normalized_input_shape[axis..]
+                        .iter()
+                        .map(|&d| d as i64)
+                        .collect()
                 } else if op.op_type == "batchNormalization" {
                     // For batch norm, scale/bias/mean/variance shape is [channels]
                     // Channel dimension is specified by the axis parameter
@@ -3989,9 +4090,25 @@ impl crate::converters::GraphConverter for OnnxConverter {
                     // Python API order: [input, scale?, bias?]
                     // ONNX order: [input, scale, bias]
 
+                    let mut optional_input_index = 1usize;
+                    let scale_input_id =
+                        if has_scale && op.input_operands.len() > optional_input_index {
+                            let id = op.input_operands[optional_input_index];
+                            optional_input_index += 1;
+                            Some(id)
+                        } else {
+                            None
+                        };
+                    let bias_input_id =
+                        if has_bias && op.input_operands.len() > optional_input_index {
+                            Some(op.input_operands[optional_input_index])
+                        } else {
+                            None
+                        };
+
                     // Add scale input (from operand or create default with 1.0)
-                    if has_scale && op.input_operands.len() > 1 {
-                        inputs.push(operand_name(graph, op.input_operands[1]));
+                    if let Some(scale_input_id) = scale_input_id {
+                        inputs.push(operand_name(graph, scale_input_id));
                     } else {
                         // Create default scale initializer (all 1.0) with proper dtype
                         let scale_name = format!("{}_scale_default", op_name);
@@ -4005,8 +4122,8 @@ impl crate::converters::GraphConverter for OnnxConverter {
                     }
 
                     // Add bias input (from operand or create default with 0.0) - optional for layer norm
-                    if has_bias && op.input_operands.len() > 2 {
-                        inputs.push(operand_name(graph, op.input_operands[2]));
+                    if let Some(bias_input_id) = bias_input_id {
+                        inputs.push(operand_name(graph, bias_input_id));
                     } else if op.op_type != "layerNormalization" || has_bias {
                         // Batch/instance norm always need bias; layer norm only if explicitly requested
                         let bias_name = format!("{}_bias_default", op_name);
@@ -4020,7 +4137,13 @@ impl crate::converters::GraphConverter for OnnxConverter {
                     }
                 }
 
-                let attributes = Self::create_operation_attributes(op, graph);
+                let mut attributes = Self::create_operation_attributes(op, graph);
+                if op.op_type == "layerNormalization"
+                    && let Some(axis) = layernorm_axis_override
+                    && let Some(attr) = attributes.iter_mut().find(|a| a.name == "axis")
+                {
+                    attr.i = axis;
+                }
                 nodes.push(NodeProto {
                     input: inputs,
                     output: vec![node_output_name.clone()],
@@ -4248,6 +4371,136 @@ impl crate::converters::GraphConverter for OnnxConverter {
                     name: op_name,
                     op_type: "ScatterND".to_string(),
                     attribute: vec![],
+                    ..Default::default()
+                });
+            } else if op.op_type.eq_ignore_ascii_case("pad") {
+                let input_id = op.input_operands[0];
+                let input_name = operand_name(graph, input_id);
+                let output_id = op
+                    .output_operand
+                    .ok_or(GraphError::InvalidConversionOperand { operand: 0 })?;
+                let output_name = operand_name(graph, output_id);
+                let input_operand = graph.operand(input_id).ok_or_else(|| {
+                    Self::invalid_operand("pad input lookup", input_id, Some((op, idx)))
+                })?;
+                let rank = input_operand.descriptor.shape.len();
+
+                let beginning = Self::parse_i64_array(op, "beginningPadding")
+                    .or_else(|| Self::parse_i64_array(op, "beginning_padding"))
+                    .unwrap_or_else(|| vec![0; rank]);
+                let ending = Self::parse_i64_array(op, "endingPadding")
+                    .or_else(|| Self::parse_i64_array(op, "ending_padding"))
+                    .unwrap_or_else(|| vec![0; rank]);
+
+                if beginning.len() != rank || ending.len() != rank {
+                    return Err(GraphError::ConversionFailed {
+                        format: "onnx".to_string(),
+                        reason: format!(
+                            "pad padding rank mismatch: input rank={}, beginning={:?}, ending={:?}",
+                            rank, beginning, ending
+                        ),
+                    });
+                }
+
+                if rank == 0 && beginning.is_empty() && ending.is_empty() {
+                    nodes.push(NodeProto {
+                        input: vec![input_name],
+                        output: vec![output_name],
+                        name: op_name,
+                        op_type: "Identity".to_string(),
+                        ..Default::default()
+                    });
+                    continue;
+                }
+
+                let mut pads = beginning;
+                pads.extend_from_slice(&ending);
+                let pads_name = format!("{}_pads", op_name);
+                initializers.push(TensorProto {
+                    name: pads_name.clone(),
+                    data_type: ProtoDataType::Int64 as i32,
+                    dims: vec![pads.len() as i64],
+                    int64_data: pads,
+                    ..Default::default()
+                });
+
+                let mode = op
+                    .attributes
+                    .get("mode")
+                    .or_else(|| op.attributes.get("options").and_then(|o| o.get("mode")))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("constant")
+                    .to_ascii_lowercase();
+                let onnx_mode = if mode == "reflection" {
+                    "reflect".to_string()
+                } else {
+                    mode
+                };
+
+                let mut inputs = vec![input_name, pads_name];
+                if onnx_mode == "constant" {
+                    let value = Self::parse_f64_attr(
+                        op.attributes
+                            .get("value")
+                            .or_else(|| op.attributes.get("options").and_then(|o| o.get("value"))),
+                    )
+                    .unwrap_or(0.0);
+                    let value_name = format!("{}_pad_value", op_name);
+
+                    let value_tensor = match input_operand.descriptor.data_type {
+                        DataType::Float32 => TensorProto {
+                            name: value_name.clone(),
+                            data_type: ProtoDataType::Float as i32,
+                            dims: vec![],
+                            raw_data: (value as f32).to_le_bytes().to_vec(),
+                            ..Default::default()
+                        },
+                        DataType::Float16 => {
+                            let bits = half::f16::from_f32(value as f32).to_bits();
+                            TensorProto {
+                                name: value_name.clone(),
+                                data_type: ProtoDataType::Float16 as i32,
+                                dims: vec![],
+                                raw_data: bits.to_le_bytes().to_vec(),
+                                ..Default::default()
+                            }
+                        }
+                        DataType::Int64 => TensorProto {
+                            name: value_name.clone(),
+                            data_type: ProtoDataType::Int64 as i32,
+                            dims: vec![],
+                            int64_data: vec![value as i64],
+                            ..Default::default()
+                        },
+                        DataType::Uint64 => TensorProto {
+                            name: value_name.clone(),
+                            data_type: ProtoDataType::Uint64 as i32,
+                            dims: vec![],
+                            uint64_data: vec![value as u64],
+                            ..Default::default()
+                        },
+                        _ => Self::create_scalar_initializer(
+                            value_name.clone(),
+                            Self::data_type_code(input_operand.descriptor.data_type),
+                            value as f32,
+                        ),
+                    };
+
+                    initializers.push(value_tensor);
+                    inputs.push(value_name);
+                }
+
+                nodes.push(NodeProto {
+                    input: inputs,
+                    output: vec![output_name],
+                    name: op_name,
+                    op_type: "Pad".to_string(),
+                    attribute: vec![AttributeProto {
+                        name: "mode".to_string(),
+                        r#type: AttributeType::String as i32,
+                        s: onnx_mode.into_bytes(),
+                        ..Default::default()
+                    }],
                     ..Default::default()
                 });
             } else {
@@ -5032,5 +5285,83 @@ mod tests {
             f32::from_le_bytes(bytes)
         };
         assert!(value.is_infinite() && value.is_sign_positive());
+    }
+
+    #[test]
+    fn test_pad_constant_value_accepts_nan_string() {
+        let operands = vec![
+            Operand {
+                kind: OperandKind::Input,
+                descriptor: OperandDescriptor {
+                    data_type: DataType::Float32,
+                    shape: vec![2, 2],
+                    pending_permutation: vec![],
+                },
+                name: Some("input".to_string()),
+            },
+            Operand {
+                kind: OperandKind::Output,
+                descriptor: OperandDescriptor {
+                    data_type: DataType::Float32,
+                    shape: vec![4, 4],
+                    pending_permutation: vec![],
+                },
+                name: Some("output".to_string()),
+            },
+        ];
+
+        let operations = vec![Operation {
+            op_type: "pad".to_string(),
+            input_operands: vec![0],
+            output_operand: Some(1),
+            output_operands: vec![],
+            attributes: serde_json::json!({
+                "beginningPadding": [1, 1],
+                "endingPadding": [1, 1],
+                "value": "NaN"
+            }),
+            label: None,
+        }];
+
+        let graph = GraphInfo {
+            operands,
+            input_operands: vec![0],
+            output_operands: vec![1],
+            operations,
+            constant_operand_ids_to_handles: HashMap::new(),
+            id_to_constant_tensor_operand_map: HashMap::new(),
+            quantized: false,
+        };
+
+        let converted = OnnxConverter
+            .convert(&graph)
+            .expect("pad conversion should succeed");
+        let model = ModelProto::decode(converted.data.as_slice()).expect("decode model");
+        let graph_proto = model.graph.expect("graph");
+
+        let pad_node = graph_proto
+            .node
+            .iter()
+            .find(|n| n.op_type == "Pad")
+            .expect("Pad node");
+        assert_eq!(pad_node.input.len(), 3);
+        assert!(!pad_node.input[2].is_empty());
+
+        let value_init = graph_proto
+            .initializer
+            .iter()
+            .find(|t| t.name == pad_node.input[2])
+            .expect("pad value initializer");
+        assert_eq!(value_init.data_type, ProtoDataType::Float as i32);
+
+        let value = if let Some(v) = value_init.float_data.first() {
+            *v
+        } else {
+            let bytes: [u8; 4] = value_init.raw_data[0..4]
+                .try_into()
+                .expect("4 bytes for float32");
+            f32::from_le_bytes(bytes)
+        };
+        assert!(value.is_nan());
     }
 }
