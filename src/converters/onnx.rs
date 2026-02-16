@@ -532,15 +532,6 @@ impl OnnxConverter {
             });
         }
 
-        if let Some(diagonal) = op.attributes.get("diagonal").and_then(|v| v.as_i64()) {
-            attributes.push(AttributeProto {
-                name: "k".to_string(), // ONNX uses "k" for diagonal offset
-                r#type: AttributeType::Int as i32,
-                i: diagonal,
-                ..Default::default()
-            });
-        }
-
         attributes
     }
 
@@ -2654,9 +2645,21 @@ impl crate::converters::GraphConverter for OnnxConverter {
                 };
 
                 let attributes = Self::create_operation_attributes(op, graph);
+                let mut tri_inputs = vec![input_name];
+                if let Some(diagonal) = op.attributes.get("diagonal").and_then(|v| v.as_i64()) {
+                    let k_name = format!("{}_k", op_name);
+                    initializers.push(TensorProto {
+                        name: k_name.clone(),
+                        data_type: ProtoDataType::Int64 as i32,
+                        dims: vec![],
+                        int64_data: vec![diagonal],
+                        ..Default::default()
+                    });
+                    tri_inputs.push(k_name);
+                }
 
                 nodes.push(NodeProto {
-                    input: vec![input_name],
+                    input: tri_inputs,
                     output: vec![operand_name(
                         graph,
                         op.output_operand.expect("Single-output operation expected"),
