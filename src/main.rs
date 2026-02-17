@@ -188,17 +188,15 @@ fn run() -> Result<(), GraphError> {
                     format: converted.format.to_string(),
                 });
             }
-            // Build zeroed inputs
+            // Build zeroed byte inputs (size from descriptor dtype)
             let inputs: Vec<rustnn::TrtxInput> = artifacts
                 .input_names_to_descriptors
                 .iter()
                 .map(|(name, desc)| {
-                    let shape: Vec<usize> = desc.shape.iter().map(|&s| s as usize).collect();
-                    let total: usize = shape.iter().product();
+                    let byte_len = desc.byte_length().unwrap_or(0).max(1);
                     rustnn::TrtxInput {
                         name: name.clone(),
-                        shape,
-                        data: vec![0f32; total.max(1)],
+                        data: vec![0u8; byte_len],
                     }
                 })
                 .collect();
