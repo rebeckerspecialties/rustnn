@@ -838,7 +838,7 @@ impl CoremlMlProgramConverter {
         inputs.insert("x".to_string(), Self::create_name_argument(input_name));
 
         // Add num_splits or split_sizes
-        if let Some(splits_val) = op.attributes.get("splits") {
+        if let Some(splits_val) = op.get_attr("splits") {
             if let Some(count) = splits_val.as_u64() {
                 // Equal splits - use num_splits
                 inputs.insert(
@@ -859,7 +859,7 @@ impl CoremlMlProgramConverter {
         }
 
         // Add axis
-        if let Some(axis) = op.attributes.get("axis").and_then(|v| v.as_i64()) {
+        if let Some(axis) = op.get_attr("axis").and_then(|v| v.as_i64()) {
             inputs.insert("axis".to_string(), Self::create_int_argument(axis as i32));
         }
 
@@ -1060,7 +1060,7 @@ impl CoremlMlProgramConverter {
                 }
 
                 // Add transpose parameters if specified
-                if let Some(a_transpose) = op.attributes.get("aTranspose").and_then(|v| v.as_bool())
+                if let Some(a_transpose) = op.get_attr("aTranspose").and_then(|v| v.as_bool())
                 {
                     inputs.insert(
                         "transpose_x".to_string(),
@@ -1068,7 +1068,7 @@ impl CoremlMlProgramConverter {
                     );
                 }
 
-                if let Some(b_transpose) = op.attributes.get("bTranspose").and_then(|v| v.as_bool())
+                if let Some(b_transpose) = op.get_attr("bTranspose").and_then(|v| v.as_bool())
                 {
                     inputs.insert(
                         "transpose_y".to_string(),
@@ -1166,7 +1166,7 @@ impl CoremlMlProgramConverter {
                     inputs.insert("x".to_string(), Self::create_argument(&input_names[0]));
                 }
                 // Add alpha parameter from attributes
-                if let Some(alpha) = op.attributes.get("alpha").and_then(|v| v.as_f64()) {
+                if let Some(alpha) = op.get_attr("alpha").and_then(|v| v.as_f64()) {
                     inputs.insert(
                         "alpha".to_string(),
                         Self::create_immediate_float(alpha as f32),
@@ -1189,14 +1189,14 @@ impl CoremlMlProgramConverter {
                     inputs.insert("x".to_string(), Self::create_argument(&input_names[0]));
                 }
                 // Add alpha parameter from attributes
-                if let Some(alpha) = op.attributes.get("alpha").and_then(|v| v.as_f64()) {
+                if let Some(alpha) = op.get_attr("alpha").and_then(|v| v.as_f64()) {
                     inputs.insert(
                         "alpha".to_string(),
                         Self::create_immediate_float(alpha as f32),
                     );
                 }
                 // Add beta parameter from attributes
-                if let Some(beta) = op.attributes.get("beta").and_then(|v| v.as_f64()) {
+                if let Some(beta) = op.get_attr("beta").and_then(|v| v.as_f64()) {
                     inputs.insert(
                         "beta".to_string(),
                         Self::create_immediate_float(beta as f32),
@@ -1259,7 +1259,7 @@ impl CoremlMlProgramConverter {
                 // If not specified in WebNN, default is to reverse all dimensions
                 // Note: Empty perm array is valid for 0D scalar tensors
                 if let Some(permutation) =
-                    op.attributes.get("permutation").and_then(|v| v.as_array())
+                    op.get_attr("permutation").and_then(|v| v.as_array().cloned())
                 {
                     let perm_u32: Vec<u32> = permutation
                         .iter()
@@ -1295,7 +1295,7 @@ impl CoremlMlProgramConverter {
 
                 // Add shape parameter from attributes (required by CoreML)
                 // Note: Empty shape array is valid for 0D scalar tensors
-                if let Some(new_shape) = op.attributes.get("newShape").and_then(|v| v.as_array()) {
+                if let Some(new_shape) = op.get_attr("newShape").and_then(|v| v.as_array().cloned()) {
                     let shape_values: Vec<u32> = new_shape
                         .iter()
                         .filter_map(|v| v.as_i64().map(|i| i as u32))
@@ -1322,7 +1322,7 @@ impl CoremlMlProgramConverter {
                 }
 
                 // Add parameters from attributes
-                if let Some(strides) = op.attributes.get("strides").and_then(|v| v.as_array()) {
+                if let Some(strides) = op.get_attr("strides").and_then(|v| v.as_array().cloned()) {
                     let strides_u32: Vec<u32> = strides
                         .iter()
                         .filter_map(|v| v.as_u64().map(|u| u as u32))
@@ -1335,7 +1335,7 @@ impl CoremlMlProgramConverter {
                     }
                 }
 
-                if let Some(dilations) = op.attributes.get("dilations").and_then(|v| v.as_array()) {
+                if let Some(dilations) = op.get_attr("dilations").and_then(|v| v.as_array().cloned()) {
                     let dilations_u32: Vec<u32> = dilations
                         .iter()
                         .filter_map(|v| v.as_u64().map(|u| u as u32))
@@ -1348,7 +1348,7 @@ impl CoremlMlProgramConverter {
                     }
                 }
 
-                if let Some(pads) = op.attributes.get("pads").and_then(|v| v.as_array()) {
+                if let Some(pads) = op.get_attr("pads").and_then(|v| v.as_array().cloned()) {
                     let pads_u32: Vec<u32> = pads
                         .iter()
                         .filter_map(|v| v.as_u64().map(|u| u as u32))
@@ -1361,7 +1361,7 @@ impl CoremlMlProgramConverter {
                     }
                 }
 
-                if let Some(groups) = op.attributes.get("groups").and_then(|v| v.as_u64()) {
+                if let Some(groups) = op.get_attr("groups").and_then(|v| v.as_u64()) {
                     inputs.insert(
                         "groups".to_string(),
                         Self::create_immediate_int(groups as u32),
@@ -1395,7 +1395,7 @@ impl CoremlMlProgramConverter {
                 );
 
                 // Add parameters from attributes
-                if let Some(strides) = op.attributes.get("strides").and_then(|v| v.as_array()) {
+                if let Some(strides) = op.get_attr("strides").and_then(|v| v.as_array().cloned()) {
                     let strides_u32: Vec<u32> = strides
                         .iter()
                         .filter_map(|v| v.as_u64().map(|u| u as u32))
@@ -1408,7 +1408,7 @@ impl CoremlMlProgramConverter {
                     }
                 }
 
-                if let Some(dilations) = op.attributes.get("dilations").and_then(|v| v.as_array()) {
+                if let Some(dilations) = op.get_attr("dilations").and_then(|v| v.as_array().cloned()) {
                     let dilations_u32: Vec<u32> = dilations
                         .iter()
                         .filter_map(|v| v.as_u64().map(|u| u as u32))
@@ -1421,7 +1421,7 @@ impl CoremlMlProgramConverter {
                     }
                 }
 
-                if let Some(pads) = op.attributes.get("pads").and_then(|v| v.as_array()) {
+                if let Some(pads) = op.get_attr("pads").and_then(|v| v.as_array().cloned()) {
                     let pads_u32: Vec<u32> = pads
                         .iter()
                         .filter_map(|v| v.as_u64().map(|u| u as u32))
@@ -1443,7 +1443,7 @@ impl CoremlMlProgramConverter {
                 // For now, skip adding output_shape when using padding (custom pad_type).
                 // TODO: Compute full output shape from outputSizes + input shape + channels
 
-                if let Some(groups) = op.attributes.get("groups").and_then(|v| v.as_u64()) {
+                if let Some(groups) = op.get_attr("groups").and_then(|v| v.as_u64()) {
                     inputs.insert(
                         "groups".to_string(),
                         Self::create_immediate_int(groups as u32),
@@ -1514,7 +1514,7 @@ impl CoremlMlProgramConverter {
                 if let Some(window_dimensions) = op
                     .attributes
                     .get("windowDimensions")
-                    .and_then(|v| v.as_array())
+                    .and_then(|v| v.as_array().cloned())
                 {
                     let window_dimensions_u32: Vec<u32> = window_dimensions
                         .iter()
@@ -1528,7 +1528,7 @@ impl CoremlMlProgramConverter {
                     }
                 }
 
-                if let Some(strides) = op.attributes.get("strides").and_then(|v| v.as_array()) {
+                if let Some(strides) = op.get_attr("strides").and_then(|v| v.as_array().cloned()) {
                     let strides_u32: Vec<u32> = strides
                         .iter()
                         .filter_map(|v| v.as_u64().map(|u| u as u32))
@@ -1541,7 +1541,7 @@ impl CoremlMlProgramConverter {
                     }
                 }
 
-                if let Some(dilations) = op.attributes.get("dilations").and_then(|v| v.as_array()) {
+                if let Some(dilations) = op.get_attr("dilations").and_then(|v| v.as_array().cloned()) {
                     let dilations_u32: Vec<u32> = dilations
                         .iter()
                         .filter_map(|v| v.as_u64().map(|u| u as u32))
@@ -1557,7 +1557,7 @@ impl CoremlMlProgramConverter {
                     }
                 }
 
-                if let Some(pads) = op.attributes.get("pads").and_then(|v| v.as_array()) {
+                if let Some(pads) = op.get_attr("pads").and_then(|v| v.as_array().cloned()) {
                     let pads_u32: Vec<u32> = pads
                         .iter()
                         .filter_map(|v| v.as_u64().map(|u| u as u32))
@@ -1587,7 +1587,7 @@ impl CoremlMlProgramConverter {
                 // When axes is empty, mean equals input, so output = bias + (scale * 0)
                 // We emulate this by: input - input = 0, then 0 + bias
                 let axes_vec: Vec<i32> =
-                    if let Some(axes) = op.attributes.get("axes").and_then(|v| v.as_array()) {
+                    if let Some(axes) = op.get_attr("axes").and_then(|v| v.as_array().cloned()) {
                         axes.iter()
                             .filter_map(|v| v.as_i64().map(|i| i as i32))
                             .collect()
@@ -1648,7 +1648,7 @@ impl CoremlMlProgramConverter {
                 );
 
                 // Add epsilon parameter
-                if let Some(epsilon) = op.attributes.get("epsilon").and_then(|v| v.as_f64()) {
+                if let Some(epsilon) = op.get_attr("epsilon").and_then(|v| v.as_f64()) {
                     inputs.insert(
                         "epsilon".to_string(),
                         Self::create_immediate_float(epsilon as f32),
@@ -1712,7 +1712,7 @@ impl CoremlMlProgramConverter {
                 }
 
                 // Add epsilon parameter
-                if let Some(epsilon) = op.attributes.get("epsilon").and_then(|v| v.as_f64()) {
+                if let Some(epsilon) = op.get_attr("epsilon").and_then(|v| v.as_f64()) {
                     inputs.insert(
                         "epsilon".to_string(),
                         Self::create_immediate_float(epsilon as f32),
@@ -1731,7 +1731,7 @@ impl CoremlMlProgramConverter {
                 }
 
                 // Add axis parameter
-                if let Some(axis) = op.attributes.get("axis").and_then(|v| v.as_u64()) {
+                if let Some(axis) = op.get_attr("axis").and_then(|v| v.as_u64()) {
                     inputs.insert("axis".to_string(), Self::create_immediate_int(axis as u32));
                 }
 
@@ -1747,7 +1747,7 @@ impl CoremlMlProgramConverter {
 
                 // Add starts (begin) parameter
                 // Note: Empty arrays are valid for no-op slices on 0D tensors
-                if let Some(starts) = op.attributes.get("starts").and_then(|v| v.as_array()) {
+                if let Some(starts) = op.get_attr("starts").and_then(|v| v.as_array().cloned()) {
                     let starts_u32: Vec<u32> = starts
                         .iter()
                         .filter_map(|v| v.as_u64().map(|u| u as u32))
@@ -1761,7 +1761,7 @@ impl CoremlMlProgramConverter {
 
                 // Add sizes parameter (required by CoreML)
                 // Note: Empty arrays are valid for no-op slices on 0D tensors
-                if let Some(sizes) = op.attributes.get("sizes").and_then(|v| v.as_array()) {
+                if let Some(sizes) = op.get_attr("sizes").and_then(|v| v.as_array().cloned()) {
                     let sizes_u32: Vec<u32> = sizes
                         .iter()
                         .filter_map(|v| v.as_u64().map(|u| u as u32))
@@ -1779,7 +1779,7 @@ impl CoremlMlProgramConverter {
                 // If reshape was added before this operation, use reshaped input name
                 //  Otherwise use original input
 
-                if let Some(new_shape) = op.attributes.get("newShape").and_then(|v| v.as_array()) {
+                if let Some(new_shape) = op.get_attr("newShape").and_then(|v| v.as_array().cloned()) {
                     let new_shape_u32: Vec<u32> = new_shape
                         .iter()
                         .filter_map(|v| v.as_u64().map(|u| u as u32))
@@ -1867,7 +1867,7 @@ impl CoremlMlProgramConverter {
                 }
 
                 // Add splits parameter (can be int or array)
-                if let Some(splits) = op.attributes.get("splits") {
+                if let Some(splits) = op.get_attr("splits") {
                     if let Some(count) = splits.as_u64() {
                         inputs.insert(
                             "num_splits".to_string(),
@@ -1888,7 +1888,7 @@ impl CoremlMlProgramConverter {
                 }
 
                 // Add axis parameter (defaults to 0)
-                if let Some(axis) = op.attributes.get("axis").and_then(|v| v.as_u64()) {
+                if let Some(axis) = op.get_attr("axis").and_then(|v| v.as_u64()) {
                     inputs.insert("axis".to_string(), Self::create_immediate_int(axis as u32));
                 }
             }
@@ -1909,7 +1909,7 @@ impl CoremlMlProgramConverter {
                 }
 
                 // Add padding parameter
-                if let Some(padding) = op.attributes.get("padding").and_then(|v| v.as_array()) {
+                if let Some(padding) = op.get_attr("padding").and_then(|v| v.as_array().cloned()) {
                     let padding_u32: Vec<u32> = padding
                         .iter()
                         .filter_map(|v| v.as_u64().map(|u| u as u32))
@@ -1928,7 +1928,7 @@ impl CoremlMlProgramConverter {
                 // Note: "edge" maps to "replicate", "reflection" and "symmetric" are similar
 
                 // Add constant value if present
-                if let Some(value) = op.attributes.get("value").and_then(|v| v.as_f64()) {
+                if let Some(value) = op.get_attr("value").and_then(|v| v.as_f64()) {
                     inputs.insert(
                         "constant_val".to_string(),
                         Self::create_immediate_float(value as f32),
@@ -1952,7 +1952,7 @@ impl CoremlMlProgramConverter {
                 }
 
                 // Add axes parameter if present
-                if let Some(axes) = op.attributes.get("axes").and_then(|v| v.as_array()) {
+                if let Some(axes) = op.get_attr("axes").and_then(|v| v.as_array().cloned()) {
                     let axes_u32: Vec<u32> = axes
                         .iter()
                         .filter_map(|v| v.as_u64().map(|u| u as u32))
@@ -1973,7 +1973,7 @@ impl CoremlMlProgramConverter {
                 }
 
                 // Add axes parameter (required for unsqueeze)
-                if let Some(axes) = op.attributes.get("axes").and_then(|v| v.as_array()) {
+                if let Some(axes) = op.get_attr("axes").and_then(|v| v.as_array().cloned()) {
                     let axes_u32: Vec<u32> = axes
                         .iter()
                         .filter_map(|v| v.as_u64().map(|u| u as u32))
@@ -1994,7 +1994,7 @@ impl CoremlMlProgramConverter {
                 }
 
                 // Add axis parameter (required)
-                if let Some(axis) = op.attributes.get("axis").and_then(|v| v.as_u64()) {
+                if let Some(axis) = op.get_attr("axis").and_then(|v| v.as_u64()) {
                     inputs.insert("axis".to_string(), Self::create_immediate_int(axis as u32));
                 }
 
@@ -2021,8 +2021,8 @@ impl CoremlMlProgramConverter {
 
                 // Add dtype parameter (required)
                 // CoreML expects dtype as a string, not an integer
-                if let Some(to_type) = op.attributes.get("to").and_then(|v| v.as_str()) {
-                    let dtype_string = match to_type {
+                if let Some(to_type) = op.get_attr("to").and_then(|v| v.as_str().map(String::from)) {
+                    let dtype_string = match to_type.as_str() {
                         "float32" => "fp32",
                         "float16" => "fp16",
                         "int32" => "int32",
@@ -2054,7 +2054,7 @@ impl CoremlMlProgramConverter {
                 }
 
                 // Add axis parameter
-                if let Some(axis) = op.attributes.get("axis").and_then(|v| v.as_i64()) {
+                if let Some(axis) = op.get_attr("axis").and_then(|v| v.as_i64()) {
                     inputs.insert("axis".to_string(), Self::create_immediate_int(axis as u32));
                 }
             }
@@ -2081,7 +2081,7 @@ impl CoremlMlProgramConverter {
                 }
 
                 // Add repetitions parameter
-                if let Some(reps) = op.attributes.get("repetitions").and_then(|v| v.as_array()) {
+                if let Some(reps) = op.get_attr("repetitions").and_then(|v| v.as_array().cloned()) {
                     let reps_u32: Vec<u32> = reps
                         .iter()
                         .filter_map(|v| v.as_u64().map(|u| u as u32))
@@ -2121,7 +2121,7 @@ impl CoremlMlProgramConverter {
                 let reverse = op
                     .attributes
                     .get("reverse")
-                    .or_else(|| op.attributes.get("reversed"))
+                    .or_else(|| op.get_attr("reversed"))
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
                 inputs.insert("reverse".to_string(), Self::create_immediate_bool(reverse));
@@ -2135,7 +2135,7 @@ impl CoremlMlProgramConverter {
 
                 // Default behavior: reverse all axes when options.axes is omitted.
                 let axes_u32: Vec<u32> =
-                    if let Some(axes) = op.attributes.get("axes").and_then(|v| v.as_array()) {
+                    if let Some(axes) = op.get_attr("axes").and_then(|v| v.as_array().cloned()) {
                         axes.iter()
                             .filter_map(|v| v.as_u64().map(|u| u as u32))
                             .collect()
@@ -2208,7 +2208,7 @@ impl CoremlMlProgramConverter {
                 }
 
                 // Add axes parameter (optional - if not specified, reduces over all dimensions)
-                if let Some(axes) = op.attributes.get("axes").and_then(|v| v.as_array()) {
+                if let Some(axes) = op.get_attr("axes").and_then(|v| v.as_array().cloned()) {
                     let axes_i32: Vec<i32> = axes
                         .iter()
                         .filter_map(|v| v.as_i64().map(|i| i as i32))
@@ -2369,7 +2369,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                 && op.input_operands.len() >= 2
             {
                 if let Some(filter_layout) =
-                    op.attributes.get("filterLayout").and_then(|v| v.as_str())
+                    op.get_attr("filterLayout").and_then(|v| v.as_str().map(String::from))
                 {
                     let expected_layout = if op_type_lower == "conv2d" {
                         "oihw"
@@ -2382,7 +2382,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
 
                         if let Some(filter_operand) = graph_info.operand(filter_operand_id) {
                             // Calculate transpose permutation
-                            let perm = match (op_type_lower.as_str(), filter_layout) {
+                            let perm = match (op_type_lower.as_str(), filter_layout.as_str()) {
                                 // Conv2d conversions to oihw [O, I, H, W]
                                 ("conv2d", "hwio") => vec![3, 2, 0, 1], // [H, W, I, O] -> [O, I, H, W]
                                 ("conv2d", "ohwi") => vec![0, 3, 1, 2], // [O, H, W, I] -> [O, I, H, W]
@@ -2450,7 +2450,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
 
                 // Also check for nhwc input layout that needs transposition
                 if let Some(input_layout) =
-                    op.attributes.get("inputLayout").and_then(|v| v.as_str())
+                    op.get_attr("inputLayout").and_then(|v| v.as_str().map(String::from))
                     && input_layout == "nhwc"
                     && !op.input_operands.is_empty()
                 {
@@ -2620,7 +2620,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                 if !op.input_operands.is_empty()
                     && let Some(input_operand) = graph_info.operand(op.input_operands[0])
                     && let Some(new_shape) =
-                        op.attributes.get("newShape").and_then(|v| v.as_array())
+                        op.get_attr("newShape").and_then(|v| v.as_array().cloned())
                 {
                     let input_shape = input_operand.descriptor.static_or_max_shape();
                     let input_rank = input_shape.len();
@@ -3198,7 +3198,7 @@ mod tests {
             input_operands: vec![0],
             output_operand: Some(1),
             output_operands: vec![],
-            attributes: serde_json::Value::Null,
+            attributes: OperatorOptions::default(),
             label: None,
         });
 
@@ -3389,7 +3389,7 @@ mod tests {
             input_operands: vec![0, 1],
             output_operand: Some(2),
             output_operands: vec![],
-            attributes: serde_json::Value::Null,
+            attributes: OperatorOptions::default(),
             label: None,
         });
 
@@ -3469,7 +3469,7 @@ mod tests {
             input_operands: vec![0],
             output_operand: Some(1),
             output_operands: vec![],
-            attributes: serde_json::Value::Null,
+            attributes: OperatorOptions::default(),
             label: None,
         });
 
@@ -3524,7 +3524,7 @@ mod tests {
             input_operands: vec![0],
             output_operand: Some(1),
             output_operands: vec![],
-            attributes: serde_json::Value::Null,
+            attributes: OperatorOptions::default(),
             label: None,
         });
 
@@ -3587,7 +3587,7 @@ mod tests {
             input_operands: vec![0],
             output_operand: Some(1),
             output_operands: vec![],
-            attributes: serde_json::Value::Null,
+            attributes: OperatorOptions::default(),
             label: None,
         });
 
@@ -3646,7 +3646,7 @@ mod tests {
             input_operands: vec![0],
             output_operand: Some(1),
             output_operands: vec![],
-            attributes: serde_json::Value::Null,
+            attributes: OperatorOptions::default(),
             label: None,
         });
 
@@ -3696,7 +3696,7 @@ mod tests {
             input_operands: vec![0],
             output_operand: Some(1),
             output_operands: vec![],
-            attributes: serde_json::Value::Null,
+            attributes: OperatorOptions::default(),
             label: None,
         });
 
@@ -3736,10 +3736,10 @@ mod tests {
                 input_operands: vec![0],
                 output_operand: Some(1),
                 output_operands: vec![],
-                attributes: serde_json::json!({
-                    "alpha": 2.0,
-                    "beta": -1.0
-                }),
+                attributes: crate::operator_options::OperatorOptions::from_json_with_op_type(
+                    "linear",
+                    &serde_json::json!({ "alpha": 2.0, "beta": -1.0 }),
+                ),
                 label: None,
             }],
             constant_operand_ids_to_handles: HashMap::new(),
@@ -3808,7 +3808,7 @@ mod tests {
                 input_operands: vec![0],
                 output_operand: Some(1),
                 output_operands: vec![],
-                attributes: serde_json::Value::Null,
+                attributes: OperatorOptions::default(),
                 label: None,
             }],
             constant_operand_ids_to_handles: HashMap::new(),
@@ -3870,7 +3870,7 @@ mod tests {
             input_operands: vec![0],
             output_operand: Some(1),
             output_operands: vec![],
-            attributes: serde_json::Value::Null,
+            attributes: OperatorOptions::default(),
             label: None,
         });
 
@@ -3934,7 +3934,7 @@ mod tests {
                 input_operands: vec![0],
                 output_operand: Some(1),
                 output_operands: vec![],
-                attributes: serde_json::json!({}),
+                attributes: OperatorOptions::default(),
                 label: None,
             }],
             constant_operand_ids_to_handles: HashMap::new(),
@@ -3985,11 +3985,10 @@ mod tests {
                 input_operands: vec![0],
                 output_operand: Some(1),
                 output_operands: vec![],
-                attributes: serde_json::json!({
-                    "axis": 1,
-                    "exclusive": true,
-                    "reversed": true
-                }),
+                attributes: crate::operator_options::OperatorOptions::from_json_with_op_type(
+                    "cumulativeSum",
+                    &serde_json::json!({ "axis": 1, "exclusive": true, "reversed": true }),
+                ),
                 label: None,
             }],
             constant_operand_ids_to_handles: HashMap::new(),
