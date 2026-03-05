@@ -1922,7 +1922,7 @@ impl CoremlMlProgramConverter {
                 }
             }
 
-            "argMax" | "argMin" => {
+            "argmax" | "argmin" => {
                 // reduce_argmax/reduce_argmin: x, axis, keep_dims
                 if !input_names.is_empty() {
                     inputs.insert("x".to_string(), Self::create_argument(&input_names[0]));
