@@ -1,9 +1,27 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Tarek Ziadé <tarek@ziade.org>
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 //! Convert WPT graph description to rustnn GraphInfo and prepare ONNX inputs.
 
 use rustnn::graph::{
     ConstantData, DataType, GraphInfo, Operand, OperandDescriptor, OperandKind, Operation,
     get_static_or_max_size, to_dimension_vector,
 };
+use rustnn::operator_options::OperatorOptions;
 #[cfg(feature = "onnx-runtime")]
 use rustnn::{OnnxInput, TensorData};
 use std::collections::HashMap;
@@ -493,7 +511,7 @@ pub fn wpt_graph_to_graph_info(graph: &WptGraph) -> Result<(GraphInfo, Vec<Strin
                     }
                 }
                 "outputPadding" => "outputPadding".to_string(),
-                "outputSizes" => "output_shape".to_string(),
+                "outputSizes" => "outputSizes".to_string(),
                 "strides" => "strides".to_string(),
                 "dilations" => "dilations".to_string(),
                 "groups" => "groups".to_string(),
@@ -511,13 +529,14 @@ pub fn wpt_graph_to_graph_info(graph: &WptGraph) -> Result<(GraphInfo, Vec<Strin
                 "beta" => "beta".to_string(),
                 "aTranspose" => "aTranspose".to_string(),
                 "bTranspose" => "bTranspose".to_string(),
-                "inputLayout" => "input_layout".to_string(),
-                "filterLayout" => "filter_layout".to_string(),
+                // Keep camelCase so OperatorOptions::from_json_with_op_type (MLConv2dOptions with rename_all = "camelCase") deserializes correctly.
+                "inputLayout" => "inputLayout".to_string(),
+                "filterLayout" => "filterLayout".to_string(),
                 "type" => {
                     if op_type == "cast" {
                         "to".to_string()
                     } else {
-                        "data_type".to_string()
+                        "dataType".to_string()
                     }
                 }
                 "to" => "to".to_string(),
@@ -584,9 +603,7 @@ pub fn wpt_graph_to_graph_info(graph: &WptGraph) -> Result<(GraphInfo, Vec<Strin
             }
         }
 
-        // batch_normalization: ONNX/TRTX expect fixed input_operands [input, mean, variance, scale?, bias?]
-        // with scale at index 3 and bias at index 4. If only one of scale/bias is provided, insert
-        // a default constant so converters always see 5 operands when scale or bias is used.
+        // batch_normalization: WebNN spec has only input, mean, variance as positional; scale/bias are in MLBatchNormalizationOptions.
         if op_type == "batch_normalization" {
             let order = ["input", "mean", "variance", "scale", "bias"];
             let ordered: Vec<u32> = order
@@ -597,8 +614,20 @@ pub fn wpt_graph_to_graph_info(graph: &WptGraph) -> Result<(GraphInfo, Vec<Strin
                         .and_then(|name| name_to_id.get(name).copied())
                 })
                 .collect();
-            if !ordered.is_empty() {
-                if ordered.len() == 4 {
+            if ordered.len() >= 3 {
+                input_ids = vec![ordered[0], ordered[1], ordered[2]];
+                let has_scale = args.get("scale").and_then(|v| v.as_str()).is_some();
+                let has_bias = args.get("bias").and_then(|v| v.as_str()).is_some();
+                if ordered.len() == 5 {
+                    attributes.insert(
+                        "scale".to_string(),
+                        serde_json::Value::Number(serde_json::Number::from(ordered[3] as u64)),
+                    );
+                    attributes.insert(
+                        "bias".to_string(),
+                        serde_json::Value::Number(serde_json::Number::from(ordered[4] as u64)),
+                    );
+                } else if ordered.len() == 4 {
                     let mean_id = ordered[1];
                     let mean_shape = operands
                         .get(mean_id as usize)
@@ -613,10 +642,7 @@ pub fn wpt_graph_to_graph_info(graph: &WptGraph) -> Result<(GraphInfo, Vec<Strin
                         .map(get_static_or_max_size)
                         .product::<u32>()
                         .max(1) as usize;
-                    let has_scale = args.get("scale").and_then(|v| v.as_str()).is_some();
-                    let has_bias = args.get("bias").and_then(|v| v.as_str()).is_some();
                     if has_bias && !has_scale {
-                        // Only bias provided: insert default scale (1.0) at index 3, then bias at 4
                         let scale_bytes: Vec<u8> = match data_type {
                             DataType::Float32 => {
                                 (0..n).flat_map(|_| (1.0f32).to_ne_bytes()).collect()
@@ -642,10 +668,16 @@ pub fn wpt_graph_to_graph_info(graph: &WptGraph) -> Result<(GraphInfo, Vec<Strin
                             },
                             name: Some("batch_norm_default_scale".to_string()),
                         });
-                        input_ids = vec![ordered[0], ordered[1], ordered[2], next_id, ordered[3]];
+                        attributes.insert(
+                            "scale".to_string(),
+                            serde_json::Value::Number(serde_json::Number::from(next_id as u64)),
+                        );
+                        attributes.insert(
+                            "bias".to_string(),
+                            serde_json::Value::Number(serde_json::Number::from(ordered[3] as u64)),
+                        );
                         next_id += 1;
                     } else if has_scale && !has_bias {
-                        // Only scale provided: insert default bias (0.0) at index 4
                         let bias_bytes: Vec<u8> = match data_type {
                             DataType::Float32 => {
                                 (0..n).flat_map(|_| (0.0f32).to_ne_bytes()).collect()
@@ -671,13 +703,16 @@ pub fn wpt_graph_to_graph_info(graph: &WptGraph) -> Result<(GraphInfo, Vec<Strin
                             },
                             name: Some("batch_norm_default_bias".to_string()),
                         });
-                        input_ids = vec![ordered[0], ordered[1], ordered[2], ordered[3], next_id];
+                        attributes.insert(
+                            "scale".to_string(),
+                            serde_json::Value::Number(serde_json::Number::from(ordered[3] as u64)),
+                        );
+                        attributes.insert(
+                            "bias".to_string(),
+                            serde_json::Value::Number(serde_json::Number::from(next_id as u64)),
+                        );
                         next_id += 1;
-                    } else {
-                        input_ids = ordered;
                     }
-                } else {
-                    input_ids = ordered;
                 }
             }
         }
@@ -769,7 +804,8 @@ pub fn wpt_graph_to_graph_info(graph: &WptGraph) -> Result<(GraphInfo, Vec<Strin
                 input_ids = ordered;
             }
         }
-        // instance_normalization: ONNX expects [input, scale?, bias?]
+        // instance_normalization: canonical order [input, scale?, bias?]. When only one optional
+        // is provided (2 operands), set hasScale/hasBias so the ONNX converter can disambiguate.
         if op_type == "instance_normalization" {
             let order = ["input", "scale", "bias"];
             let ordered: Vec<u32> = order
@@ -781,7 +817,13 @@ pub fn wpt_graph_to_graph_info(graph: &WptGraph) -> Result<(GraphInfo, Vec<Strin
                 })
                 .collect();
             if !ordered.is_empty() {
-                input_ids = ordered;
+                input_ids = ordered.clone();
+                if ordered.len() == 2 {
+                    let has_scale = args.get("scale").and_then(|v| v.as_str()).is_some();
+                    let has_bias = args.get("bias").and_then(|v| v.as_str()).is_some();
+                    attributes.insert("hasScale".to_string(), serde_json::Value::Bool(has_scale));
+                    attributes.insert("hasBias".to_string(), serde_json::Value::Bool(has_bias));
+                }
             }
         }
         // conv2d / conv_transpose2d: ONNX expects [input, filter, bias?]
@@ -876,12 +918,16 @@ pub fn wpt_graph_to_graph_info(graph: &WptGraph) -> Result<(GraphInfo, Vec<Strin
             "arg_min" => "argMin",
             _ => op_type.as_str(),
         };
+        let attrs_value = serde_json::Value::Object(attributes);
+        let attributes_opts =
+            OperatorOptions::from_json_with_op_type(&op_type_for_graph, &attrs_value)
+                .unwrap_or_default();
         operations.push(Operation {
             op_type: op_type_for_graph.to_string(),
             input_operands: input_ids,
             output_operand,
             output_operands,
-            attributes: serde_json::Value::Object(attributes),
+            attributes: attributes_opts,
             label: Some(format!("{}_op", op.name)),
         });
     }

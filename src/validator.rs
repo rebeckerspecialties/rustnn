@@ -465,6 +465,7 @@ impl<'a> GraphValidator<'a> {
 mod tests {
     use super::*;
     use crate::graph::{ConstantData, GraphInfo, Operand, Operation};
+    use crate::operator_options::OperatorOptions;
 
     fn s(shape: &[u32]) -> Vec<crate::graph::Dimension> {
         crate::graph::to_dimension_vector(shape)
@@ -540,7 +541,7 @@ mod tests {
             input_operands: vec![0, 1, 2],
             output_operand: Some(3),
             output_operands: Vec::new(),
-            attributes: serde_json::json!({}),
+            attributes: OperatorOptions::default(),
             label: None,
         };
 
@@ -601,7 +602,7 @@ mod tests {
                 input_operands: vec![0],
                 output_operand: Some(1),
                 output_operands: vec![],
-                attributes: serde_json::json!({}),
+                attributes: OperatorOptions::default(),
                 label: None,
             }],
             constant_operand_ids_to_handles: HashMap::new(),
@@ -755,7 +756,7 @@ mod tests {
             input_operands: vec![0],
             output_operand: Some(3),
             output_operands: vec![],
-            attributes: serde_json::json!({}),
+            attributes: OperatorOptions::default(),
             label: None,
         };
         let quantize = Operation {
@@ -763,7 +764,7 @@ mod tests {
             input_operands: vec![3, 1, 2],
             output_operand: Some(4),
             output_operands: vec![],
-            attributes: serde_json::json!({}),
+            attributes: OperatorOptions::default(),
             label: None,
         };
 
@@ -838,7 +839,7 @@ mod tests {
                 input_operands: vec![0],
                 output_operand: Some(1),
                 output_operands: vec![],
-                attributes: serde_json::json!({}),
+                attributes: OperatorOptions::default(),
                 label: None,
             }],
             constant_operand_ids_to_handles: HashMap::new(),
@@ -881,7 +882,7 @@ mod tests {
                 input_operands: vec![0],
                 output_operand: Some(1),
                 output_operands: vec![],
-                attributes: serde_json::json!({}),
+                attributes: OperatorOptions::default(),
                 label: None,
             }],
             constant_operand_ids_to_handles: HashMap::new(),
@@ -933,7 +934,7 @@ mod tests {
                 input_operands: vec![0, 1],
                 output_operand: Some(2),
                 output_operands: vec![],
-                attributes: serde_json::json!({}),
+                attributes: OperatorOptions::default(),
                 label: None,
             }],
             constant_operand_ids_to_handles: HashMap::new(),
@@ -986,7 +987,7 @@ mod tests {
                     input_operands: vec![0],
                     output_operand: Some(1),
                     output_operands: vec![],
-                    attributes: serde_json::json!({}),
+                    attributes: OperatorOptions::default(),
                     label: None,
                 },
                 Operation {
@@ -994,7 +995,7 @@ mod tests {
                     input_operands: vec![0],
                     output_operand: Some(2),
                     output_operands: vec![],
-                    attributes: serde_json::json!({}),
+                    attributes: OperatorOptions::default(),
                     label: None,
                 },
             ],
@@ -1047,7 +1048,7 @@ mod tests {
                 input_operands: vec![0, 1],
                 output_operand: Some(2),
                 output_operands: vec![],
-                attributes: serde_json::json!({}),
+                attributes: OperatorOptions::default(),
                 label: None,
             }],
             constant_operand_ids_to_handles: HashMap::new(), // Missing constant data
@@ -1110,7 +1111,7 @@ mod tests {
                 input_operands: vec![0, 1],
                 output_operand: Some(2),
                 output_operands: vec![],
-                attributes: serde_json::json!({}),
+                attributes: OperatorOptions::default(),
                 label: None,
             }],
             constant_operand_ids_to_handles: constants,
@@ -1158,7 +1159,7 @@ mod tests {
                 input_operands: vec![0],
                 output_operand: Some(1),
                 output_operands: vec![],
-                attributes: serde_json::json!({}),
+                attributes: OperatorOptions::default(),
                 label: None,
             }],
             constant_operand_ids_to_handles: HashMap::new(),
@@ -1201,7 +1202,7 @@ mod tests {
                 input_operands: vec![99], // Invalid operand ID
                 output_operand: Some(1),
                 output_operands: vec![],
-                attributes: serde_json::json!({}),
+                attributes: OperatorOptions::default(),
                 label: None,
             }],
             constant_operand_ids_to_handles: HashMap::new(),
@@ -1245,7 +1246,7 @@ mod tests {
                     input_operands: vec![0],
                     output_operand: Some(1),
                     output_operands: vec![],
-                    attributes: serde_json::json!({}),
+                    attributes: OperatorOptions::default(),
                     label: None,
                 },
                 Operation {
@@ -1253,7 +1254,7 @@ mod tests {
                     input_operands: vec![0],
                     output_operand: Some(1), // Same output produced twice
                     output_operands: vec![],
-                    attributes: serde_json::json!({}),
+                    attributes: OperatorOptions::default(),
                     label: None,
                 },
             ],
@@ -1306,7 +1307,7 @@ mod tests {
                 input_operands: vec![0],
                 output_operand: Some(2),
                 output_operands: vec![],
-                attributes: serde_json::json!({}),
+                attributes: OperatorOptions::default(),
                 label: None,
             }],
             constant_operand_ids_to_handles: HashMap::new(),
@@ -1357,7 +1358,7 @@ mod tests {
                 input_operands: vec![0],
                 output_operand: Some(1),
                 output_operands: vec![],
-                attributes: serde_json::json!({}),
+                attributes: OperatorOptions::default(),
                 label: None,
             }],
             constant_operand_ids_to_handles: HashMap::new(),

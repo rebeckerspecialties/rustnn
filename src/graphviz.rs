@@ -121,6 +121,7 @@ mod tests {
         DataType, GraphInfo, Operand, OperandDescriptor, OperandKind, Operation,
         to_dimension_vector,
     };
+    use crate::operator_options::OperatorOptions;
 
     #[test]
     fn exports_graphviz_with_operands_and_operations() {
@@ -161,7 +162,7 @@ mod tests {
                 input_operands: vec![0, 1],
                 output_operand: Some(2),
                 output_operands: Vec::new(),
-                attributes: serde_json::Value::Null,
+                attributes: OperatorOptions::default(),
                 label: None,
             }],
             constant_operand_ids_to_handles: Default::default(),
