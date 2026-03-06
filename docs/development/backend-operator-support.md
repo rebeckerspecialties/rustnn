@@ -86,7 +86,7 @@ Executor-level operator coverage follows converter coverage for this backend.
 - `asin`, `hardSwish`, `relu`
 - `asinh`, `identity`, `reshape`
 - `atan`, `instanceNormalization`, `reverse`
-- `atanh`, `layerNormalization`, `round`
+- `atanh`, `layerNormalization`, `roundEven`
 - `averagePool2d`, `leakyRelu`, `scatterElements`
 - `batchNormalization`, `lesser`, `scatterND`
 - `cast`, `lesserOrEqual`, `sigmoid`
@@ -122,7 +122,7 @@ Executor-level operator coverage follows converter coverage for this backend.
 - `asin`, `hardSwish`, `relu`
 - `asinh`, `identity`, `reshape`
 - `atan`, `instanceNormalization`, `reverse`
-- `atanh`, `layerNormalization`, `round`
+- `atanh`, `layerNormalization`, `roundEven`
 - `averagePool2d`, `leakyRelu`, `scatterElements`
 - `batchNormalization`, `lesser`, `scatterND`
 - `cast`, `lesserOrEqual`, `sigmoid`

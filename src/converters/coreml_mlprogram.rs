@@ -913,7 +913,7 @@ impl CoremlMlProgramConverter {
             "abs" => mil_ops::ABS,
             "ceil" => mil_ops::CEIL,
             "floor" => mil_ops::FLOOR,
-            "round" => mil_ops::ROUND,
+            "roundeven" => mil_ops::ROUND,
             "neg" => mil_ops::NEG,
             "identity" => mil_ops::IDENTITY,
             "exp" => mil_ops::EXP,
@@ -1122,7 +1122,7 @@ impl CoremlMlProgramConverter {
             }
 
             // Unary operations: x
-            "relu" | "sigmoid" | "tanh" | "abs" | "ceil" | "floor" | "round" | "sign"
+            "relu" | "sigmoid" | "tanh" | "abs" | "ceil" | "floor" | "roundeven" | "sign"
             | "identity" | "exp" | "sqrt" | "reciprocal" | "sin" | "cos" | "tan" | "asin"
             | "acos" | "atan" | "sinh" | "cosh" | "asinh" | "acosh" | "atanh" | "erf"
             | "logicalnot" | "softplus" | "softsign" => {
