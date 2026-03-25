@@ -20,7 +20,7 @@ use crate::converters::{ConvertedGraph, operand_name};
 use crate::debug_print;
 use crate::error::GraphError;
 use crate::graph::{DataType, Dimension, GraphInfo, OperandKind, get_static_or_max_size};
-use crate::operator_options::MLDimension;
+use crate::operator_options::{MLDimension, MLPool2dOptions, mldimensions_static_or_max};
 use crate::operators::Operation;
 use crate::protos::onnx::{
     AttributeProto, GraphProto, ModelProto, NodeProto, OperatorSetIdProto, TensorProto,
@@ -525,30 +525,6 @@ impl OnnxConverter {
 
         let mut inputs: Vec<String> = vec![normalized_input_name.clone()];
 
-        let (_has_scale, has_bias_norm) = match &op {
-            Operation::BatchNormalization { options, .. } => (
-                options.as_ref().and_then(|o| o.scale).is_some(),
-                options.as_ref().and_then(|o| o.bias).is_some(),
-            ),
-            Operation::InstanceNormalization { options, .. } => (
-                options.as_ref().and_then(|o| o.scale).is_some(),
-                options.as_ref().and_then(|o| o.bias).is_some(),
-            ),
-            Operation::LayerNormalization { options, .. } => {
-                let o = options.as_ref();
-                let scale_present = o.and_then(|x| x.scale).is_some();
-                let bias_present = o.and_then(|x| x.bias).is_some();
-                // Respect hasScale/hasBias when operands are omitted (WebNN 2-operand forms).
-                let scale_requested = !matches!(o.and_then(|x| x.has_scale), Some(false));
-                let bias_requested = !matches!(o.and_then(|x| x.has_bias), Some(false));
-                (
-                    scale_present || scale_requested,
-                    bias_present || bias_requested,
-                )
-            }
-            _ => (false, false),
-        };
-
         if is_layer_norm {
             let rank_ln = input_shape.len();
             let axes_raw: Option<Vec<serde_json::Value>> = match &op {
@@ -567,53 +543,43 @@ impl OnnxConverter {
                     op.output_operand()
                         .expect("Single-output operation expected"),
                 );
-                if has_bias_norm {
-                    let bias_id = match &op {
-                        Operation::LayerNormalization { options, .. } => {
-                            options.as_ref().and_then(|o| o.bias)
-                        }
-                        _ => None,
-                    };
-                    if let Some(id) = bias_id {
-                        nodes.push(NodeProto {
-                            input: vec![operand_name(graph, id)],
-                            output: vec![output_name],
-                            name: op_name.clone(),
-                            op_type: "Identity".to_string(),
-                            ..Default::default()
-                        });
-                    } else {
-                        let zero_name = format!("{}_zero", op_name);
-                        let shape_i64: Vec<i64> =
-                            normalized_input_shape.iter().map(|&d| d as i64).collect();
-                        if shape_i64.is_empty() {
-                            initializers.push(Self::create_scalar_initializer(
-                                zero_name.clone(),
-                                input_data_type,
-                                0.0,
-                            ));
-                        } else {
-                            initializers.push(Self::create_vector_initializer(
-                                zero_name.clone(),
-                                input_data_type,
-                                shape_i64,
-                                0.0,
-                            ));
-                        }
-                        nodes.push(NodeProto {
-                            input: vec![zero_name],
-                            output: vec![output_name],
-                            name: op_name.clone(),
-                            op_type: "Identity".to_string(),
-                            ..Default::default()
-                        });
+                let bias_id = match &op {
+                    Operation::LayerNormalization { options, .. } => {
+                        options.as_ref().and_then(|o| o.bias)
                     }
-                } else {
+                    _ => None,
+                };
+                if let Some(id) = bias_id {
                     nodes.push(NodeProto {
-                        input: vec![operand_name(graph, input_id), operand_name(graph, input_id)],
+                        input: vec![operand_name(graph, id)],
                         output: vec![output_name],
                         name: op_name.clone(),
-                        op_type: "Sub".to_string(),
+                        op_type: "Identity".to_string(),
+                        ..Default::default()
+                    });
+                } else {
+                    let zero_name = format!("{}_zero", op_name);
+                    let shape_i64: Vec<i64> =
+                        normalized_input_shape.iter().map(|&d| d as i64).collect();
+                    if shape_i64.is_empty() {
+                        initializers.push(Self::create_scalar_initializer(
+                            zero_name.clone(),
+                            input_data_type,
+                            0.0,
+                        ));
+                    } else {
+                        initializers.push(Self::create_vector_initializer(
+                            zero_name.clone(),
+                            input_data_type,
+                            shape_i64,
+                            0.0,
+                        ));
+                    }
+                    nodes.push(NodeProto {
+                        input: vec![zero_name],
+                        output: vec![output_name],
+                        name: op_name.clone(),
+                        op_type: "Identity".to_string(),
                         ..Default::default()
                     });
                 }
@@ -628,64 +594,53 @@ impl OnnxConverter {
                     op.output_operand()
                         .expect("Single-output operation expected"),
                 );
-                if has_bias_norm {
-                    let bias_id = match &op {
-                        Operation::LayerNormalization { options, .. } => {
-                            options.as_ref().and_then(|o| o.bias)
-                        }
-                        _ => None,
-                    };
-                    if let Some(id) = bias_id {
-                        let bias_name = operand_name(graph, id);
-                        let input_nm = operand_name(graph, input_id);
-                        let zero_like_name = format!("{}_zero_like", op_name);
-                        nodes.push(NodeProto {
-                            input: vec![input_nm.clone(), input_nm],
-                            output: vec![zero_like_name.clone()],
-                            name: format!("{}_zero_like_sub", op_name),
-                            op_type: "Sub".to_string(),
-                            ..Default::default()
-                        });
-                        nodes.push(NodeProto {
-                            input: vec![zero_like_name, bias_name],
-                            output: vec![output_name],
-                            name: op_name.clone(),
-                            op_type: "Add".to_string(),
-                            ..Default::default()
-                        });
-                    } else {
-                        let zero_name = format!("{}_zero", op_name);
-                        let shape_i64: Vec<i64> =
-                            normalized_input_shape.iter().map(|&d| d as i64).collect();
-                        if shape_i64.is_empty() {
-                            initializers.push(Self::create_scalar_initializer(
-                                zero_name.clone(),
-                                input_data_type,
-                                0.0,
-                            ));
-                        } else {
-                            initializers.push(Self::create_vector_initializer(
-                                zero_name.clone(),
-                                input_data_type,
-                                shape_i64,
-                                0.0,
-                            ));
-                        }
-                        nodes.push(NodeProto {
-                            input: vec![zero_name],
-                            output: vec![output_name],
-                            name: op_name.clone(),
-                            op_type: "Identity".to_string(),
-                            ..Default::default()
-                        });
+                let bias_id = match &op {
+                    Operation::LayerNormalization { options, .. } => {
+                        options.as_ref().and_then(|o| o.bias)
                     }
-                } else {
+                    _ => None,
+                };
+                if let Some(id) = bias_id {
+                    let bias_name = operand_name(graph, id);
                     let input_nm = operand_name(graph, input_id);
+                    let zero_like_name = format!("{}_zero_like", op_name);
                     nodes.push(NodeProto {
                         input: vec![input_nm.clone(), input_nm],
+                        output: vec![zero_like_name.clone()],
+                        name: format!("{}_zero_like_sub", op_name),
+                        op_type: "Sub".to_string(),
+                        ..Default::default()
+                    });
+                    nodes.push(NodeProto {
+                        input: vec![zero_like_name, bias_name],
                         output: vec![output_name],
                         name: op_name.clone(),
-                        op_type: "Sub".to_string(),
+                        op_type: "Add".to_string(),
+                        ..Default::default()
+                    });
+                } else {
+                    let zero_name = format!("{}_zero", op_name);
+                    let shape_i64: Vec<i64> =
+                        normalized_input_shape.iter().map(|&d| d as i64).collect();
+                    if shape_i64.is_empty() {
+                        initializers.push(Self::create_scalar_initializer(
+                            zero_name.clone(),
+                            input_data_type,
+                            0.0,
+                        ));
+                    } else {
+                        initializers.push(Self::create_vector_initializer(
+                            zero_name.clone(),
+                            input_data_type,
+                            shape_i64,
+                            0.0,
+                        ));
+                    }
+                    nodes.push(NodeProto {
+                        input: vec![zero_name],
+                        output: vec![output_name],
+                        name: op_name.clone(),
+                        op_type: "Identity".to_string(),
                         ..Default::default()
                     });
                 }
@@ -784,7 +739,7 @@ impl OnnxConverter {
                 _ => (None, None),
             };
             let ln_defaults_need_runtime = crate::graph::dynamic_inputs_enabled()
-                && (ln_scale_id.is_none() || has_bias_norm && ln_bias_id.is_none())
+                && (ln_scale_id.is_none() || ln_bias_id.is_none())
                 && input_operand.descriptor.has_dynamic_dimensions();
             let has_dynamic_norm_dims = match layernorm_axis_override {
                 Some(ln_axis) => {
@@ -950,7 +905,7 @@ impl OnnxConverter {
 
             if let Some(bias_input_id) = bias_input_id {
                 inputs.push(operand_name(graph, bias_input_id));
-            } else if !is_layer_norm || has_bias_norm {
+            } else {
                 let bias_name = if let Some(shape_vec) = &norm_dynamic_defaults_shape {
                     Self::create_runtime_filled_tensor(
                         &format!("{}_bias_default", op_name),
@@ -1341,15 +1296,13 @@ impl OnnxConverter {
         graph: &GraphInfo,
     ) -> Vec<AttributeProto> {
         let mut attributes = Vec::new();
+        let default_pool = MLPool2dOptions::default();
         let opts = match &op {
             Operation::AveragePool2d { options, .. }
             | Operation::MaxPool2d { options, .. }
             | Operation::L2Pool2d { options, .. }
             | Operation::GlobalAveragePool { options, .. }
-            | Operation::GlobalMaxPool { options, .. } => match options.as_ref() {
-                Some(o) => o,
-                None => return attributes,
-            },
+            | Operation::GlobalMaxPool { options, .. } => options.as_ref().unwrap_or(&default_pool),
             _ => return attributes,
         };
 
@@ -1743,10 +1696,10 @@ impl OnnxConverter {
         let mut attributes = Vec::new();
 
         let (axis_opt, keep_dims) = match &op {
-            Operation::ArgMin { options, .. } | Operation::ArgMax { options, .. } => options
-                .as_ref()
-                .map(|opts| (Some(opts.axis as i64), opts.keep_dimensions))
-                .unwrap_or((Some(0), false)),
+            Operation::ArgMin { axis, options, .. } | Operation::ArgMax { axis, options, .. } => (
+                Some(*axis as i64),
+                options.as_ref().map(|o| o.keep_dimensions).unwrap_or(false),
+            ),
             _ => (Some(0), false),
         };
 
@@ -1774,9 +1727,7 @@ impl OnnxConverter {
         let mut attributes = Vec::new();
 
         let axis = match &op {
-            Operation::Concat { options, .. } => {
-                options.as_ref().map(|o| o.axis as i64).unwrap_or(0)
-            }
+            Operation::Concat { axis, .. } => *axis as i64,
             _ => 0,
         };
         attributes.push(AttributeProto {
@@ -1793,10 +1744,7 @@ impl OnnxConverter {
         let mut attributes = Vec::new();
         // Axis is required by WebNN spec
         let axis = match &op {
-            Operation::Softmax { options, .. } => options
-                .as_ref()
-                .map(|o| o.axis as i64)
-                .expect("softmax operation must have options with axis"),
+            Operation::Softmax { axis, .. } => *axis as i64,
             _ => 0,
         };
         attributes.push(AttributeProto {
@@ -1852,12 +1800,10 @@ impl OnnxConverter {
     /// Create ONNX attributes for cast operation
     fn create_cast_attributes(op: &Operation) -> Vec<AttributeProto> {
         let mut attributes = Vec::new();
-        if let Operation::Cast {
-            options: Some(opts),
-            ..
-        } = &op
+        if let Operation::Cast { to, .. } = &op
+            && !to.is_empty()
         {
-            let to_type = opts.to.to_ascii_lowercase();
+            let to_type = to.to_ascii_lowercase();
             let type_code = match to_type.as_str() {
                 "float32" => ProtoDataType::Float as i64,
                 "float16" => ProtoDataType::Float16 as i64,
@@ -1961,27 +1907,8 @@ impl OnnxConverter {
     }
 
     /// Create ONNX attributes for hardSwish operation.
-    fn create_hardswish_attributes(op: &Operation) -> Vec<AttributeProto> {
-        let mut attributes = Vec::new();
-        if let Operation::HardSwish {
-            options: Some(opts),
-            ..
-        } = &op
-        {
-            attributes.push(AttributeProto {
-                name: "alpha".to_string(),
-                r#type: AttributeType::Float as i32,
-                f: opts.alpha as f32,
-                ..Default::default()
-            });
-            attributes.push(AttributeProto {
-                name: "beta".to_string(),
-                r#type: AttributeType::Float as i32,
-                f: opts.beta as f32,
-                ..Default::default()
-            });
-        }
-        attributes
+    fn create_hardswish_attributes(_op: &Operation) -> Vec<AttributeProto> {
+        Vec::new()
     }
 
     /// Create ONNX attributes for elu operation
@@ -2345,24 +2272,15 @@ impl crate::converters::GraphConverter for OnnxConverter {
                 {
                     type_overrides.insert(output_id, input_operand.descriptor.data_type);
 
-                    // Check for newShape from typed options first
-                    if let Operation::Expand {
-                        options: Some(opts),
-                        ..
-                    } = &op
+                    if let Operation::Expand { new_shape, .. } = &op
+                        && !new_shape.is_empty()
                     {
-                        let shape = opts.new_shape_static_or_max();
-                        if !shape.is_empty() {
-                            shape_overrides.insert(output_id, shape.clone());
-                            operand_shapes.insert(output_id, shape);
-                        }
-                    }
-                    // Fall back to shape from second input operand (if present)
-                    else if op.input_operands().len() >= 2
-                        && let Some(shape) = operand_shapes.get(&op.input_operands()[1])
-                    {
+                        let shape: Vec<u32> = new_shape
+                            .iter()
+                            .map(crate::operator_options::MLDimension::static_or_max)
+                            .collect();
                         shape_overrides.insert(output_id, shape.clone());
-                        operand_shapes.insert(output_id, shape.clone());
+                        operand_shapes.insert(output_id, shape);
                     }
                 }
             } else if matches!(&op, Operation::Shape { .. }) {
@@ -2404,6 +2322,8 @@ impl crate::converters::GraphConverter for OnnxConverter {
                     (op.input_operands().first(), op.output_operand())
                     && let Some(mut in_shape) = operand_shapes.get(&input_id).cloned()
                     && let Operation::Slice {
+                        starts: st,
+                        sizes: sz,
                         options: Some(opts),
                         ..
                     } = &op
@@ -2413,12 +2333,8 @@ impl crate::converters::GraphConverter for OnnxConverter {
                         type_overrides.insert(output_id, input_operand.descriptor.data_type);
                     }
                     // WebNN slice has starts, sizes, strides; derive ends as starts[i] + sizes[i] for default stride 1
-                    let starts: Vec<i64> = opts.starts.iter().map(|&u| u as i64).collect();
-                    let sizes: Vec<i64> = opts
-                        .sizes_static_or_max()
-                        .iter()
-                        .map(|&u| u as i64)
-                        .collect();
+                    let starts: Vec<i64> = st.iter().map(|&u| u as i64).collect();
+                    let sizes: Vec<i64> = sz.iter().map(|d| d.static_or_max() as i64).collect();
                     let strides: Vec<i64> = if opts.strides.is_empty() {
                         vec![1; starts.len()]
                     } else {
@@ -2635,9 +2551,7 @@ impl crate::converters::GraphConverter for OnnxConverter {
                         .unwrap_or("unknown");
 
                     let axis = match &op {
-                        Operation::Concat { options, .. } => {
-                            options.as_ref().map(|o| o.axis).unwrap_or(0)
-                        }
+                        Operation::Concat { axis, .. } => *axis,
                         _ => 0,
                     };
 
@@ -2725,13 +2639,10 @@ impl crate::converters::GraphConverter for OnnxConverter {
             // Reshape: if newShape is present, set output shape (static or max for dynamic)
             else if matches!(&op, Operation::Reshape { .. }) {
                 if let Some(output_id) = op.output_operand()
-                    && let Operation::Reshape {
-                        options: Some(opts),
-                        ..
-                    } = &op
-                    && !opts.new_shape.is_empty()
+                    && let Operation::Reshape { new_shape, .. } = &op
+                    && !new_shape.is_empty()
                 {
-                    let shape = opts.new_shape_static_or_max();
+                    let shape = mldimensions_static_or_max(new_shape);
                     shape_overrides.insert(output_id, shape.clone());
                     operand_shapes.insert(output_id, shape);
                 }
@@ -4963,7 +4874,10 @@ impl crate::converters::GraphConverter for OnnxConverter {
                     Operation::CumulativeSum { options, .. } => options.as_ref(),
                     _ => None,
                 };
-                let axis = opts.map(|o| o.axis as i64).unwrap_or(0);
+                let axis = match &op {
+                    Operation::CumulativeSum { axis, .. } => *axis as i64,
+                    _ => 0,
+                };
                 if rank > 0 && axis >= rank {
                     return Err(GraphError::ConversionFailed {
                         format: "onnx".to_string(),
@@ -5050,11 +4964,11 @@ impl crate::converters::GraphConverter for OnnxConverter {
                     Operation::Gru { options, .. } => options.as_ref(),
                     _ => None,
                 };
-                let hidden_size = gru_opts
-                    .and_then(|o| o.hidden_size.map(|u| u as u64))
-                    .or_else(|| {
+                let hidden_size = match &op {
+                    Operation::Gru { hidden_size, .. } if *hidden_size > 0 => *hidden_size as u64,
+                    Operation::Gru { .. } => {
                         let shape = &weight_operand.descriptor.static_or_max_shape();
-                        if !shape.is_empty() {
+                        let from_shape = if !shape.is_empty() {
                             let dim = get_static_or_max_size(&weight_operand.descriptor.shape[0]);
                             if dim > 0 && dim.is_multiple_of(3) {
                                 Some((dim / 3) as u64)
@@ -5063,13 +4977,21 @@ impl crate::converters::GraphConverter for OnnxConverter {
                             }
                         } else {
                             None
-                        }
-                    })
-                    .ok_or_else(|| GraphError::ConversionFailed {
-                        format: "onnx".to_string(),
-                        reason: "gru missing hiddenSize or weight shape not [3*hidden_size, ...]"
-                            .to_string(),
-                    })?;
+                        };
+                        from_shape.ok_or_else(|| GraphError::ConversionFailed {
+                            format: "onnx".to_string(),
+                            reason:
+                                "gru missing hiddenSize or weight shape not [3*hidden_size, ...]"
+                                    .to_string(),
+                        })?
+                    }
+                    _ => {
+                        return Err(GraphError::ConversionFailed {
+                            format: "onnx".to_string(),
+                            reason: "internal: expected Gru operation".to_string(),
+                        });
+                    }
+                };
 
                 let input_dtype = Self::data_type_code(weight_operand.descriptor.data_type);
                 let gate_layout = gru_opts
@@ -6460,20 +6382,29 @@ impl crate::converters::GraphConverter for OnnxConverter {
                     Operation::GruCell { options, .. } => options.as_ref(),
                     _ => None,
                 };
-                let hidden_size = gru_cell_opts
-                    .and_then(|o| o.hidden_size.map(|u| u as u64))
-                    .or_else(|| {
-                        graph.operand(output_id).and_then(|o| {
+                let hidden_size = match &op {
+                    Operation::GruCell { hidden_size, .. } if *hidden_size > 0 => {
+                        *hidden_size as u64
+                    }
+                    Operation::GruCell { .. } => graph
+                        .operand(output_id)
+                        .and_then(|o| {
                             o.descriptor
                                 .shape
                                 .last()
                                 .map(|d| get_static_or_max_size(d) as u64)
                         })
-                    })
-                    .ok_or_else(|| GraphError::ConversionFailed {
-                        format: "onnx".to_string(),
-                        reason: "gruCell missing hiddenSize/hidden_size attribute".to_string(),
-                    })?;
+                        .ok_or_else(|| GraphError::ConversionFailed {
+                            format: "onnx".to_string(),
+                            reason: "gruCell missing hiddenSize/hidden_size attribute".to_string(),
+                        })?,
+                    _ => {
+                        return Err(GraphError::ConversionFailed {
+                            format: "onnx".to_string(),
+                            reason: "internal: expected gruCell operation".to_string(),
+                        });
+                    }
+                };
 
                 let hidden_state_operand = graph.operand(hidden_state_id).ok_or_else(|| {
                     Self::invalid_operand(
@@ -6806,10 +6737,9 @@ impl crate::converters::GraphConverter for OnnxConverter {
 
                 // Repeats come from typed options or attribute. repetitions=[] or all 1s => no-op (Identity).
                 let repeats: Vec<i64> = match &op {
-                    Operation::Tile { options, .. } => options
-                        .as_ref()
-                        .map(|o| o.repetitions.iter().map(|&u| u as i64).collect())
-                        .unwrap_or_default(),
+                    Operation::Tile { repetitions, .. } => {
+                        repetitions.iter().map(|&u| u as i64).collect()
+                    }
                     _ => vec![],
                 };
 
@@ -7013,14 +6943,13 @@ impl crate::converters::GraphConverter for OnnxConverter {
                     .map(|id| operand_name(graph, *id))
                     .collect();
 
-                // Handle newShape from typed options - can be array (static/dynamic), string (operand reference), or missing
+                // Handle newShape from the operation - can be array (static/dynamic), string (operand reference), or missing
                 let new_shape_attr = match &op {
-                    Operation::Reshape { options, .. } => {
-                        options.as_ref().filter(|o| !o.new_shape.is_empty())
-                    }
+                    Operation::Reshape { new_shape, .. } => (!new_shape.is_empty())
+                        .then(|| serde_json::to_value(new_shape).ok())
+                        .flatten(),
                     _ => None,
-                }
-                .and_then(|o| serde_json::to_value(&o.new_shape).ok());
+                };
                 if let Some(new_shape_attr) = new_shape_attr {
                     if let Some(shape_dims) = Self::parse_dimension_array(&new_shape_attr) {
                         // Case 1: newShape is an array (static or dynamic)
@@ -7121,67 +7050,22 @@ impl crate::converters::GraphConverter for OnnxConverter {
                     attribute: vec![], // No attributes for Reshape
                     ..Default::default()
                 });
-            } else if matches!(&op, Operation::Expand { .. }) {
-                // WebNN expand has two variants:
-                // 1. With 'axes' - adds dimensions (maps to ONNX Unsqueeze)
-                // 2. With 'newShape' - expands shape (maps to ONNX Expand or Reshape)
-
+            } else if let Operation::Expand { new_shape, .. } = &op {
                 debug_print!("[DEBUG] Processing WebNN expand operation:");
                 debug_print!("  Op name: {}", op_name);
-                if let Operation::Expand {
-                    options: Some(o), ..
-                } = &op
-                {
-                    debug_print!("  axes: {:?}, new_shape: {:?}", o.axes, o.new_shape);
+                debug_print!("  new_shape: {:?}", new_shape);
+
+                if new_shape.is_empty() {
+                    return Err(GraphError::ConversionFailed {
+                        format: "onnx".to_string(),
+                        reason: format!(
+                            "Expand requires non-empty newShape (method argument) in operation {}",
+                            op_name
+                        ),
+                    });
                 }
 
-                if let Operation::Expand {
-                    options: Some(opts),
-                    ..
-                } = &op
-                    && !opts.axes.is_empty()
-                {
-                    // WebNN expand with axes -> ONNX Unsqueeze
-                    // In ONNX opset 13+, axes must be provided as an input tensor, not attribute
-                    let axes_values: Vec<i64> = opts.axes.iter().map(|&u| u as i64).collect();
-
-                    let mut inputs: Vec<String> = op
-                        .input_operands()
-                        .iter()
-                        .map(|id| operand_name(graph, *id))
-                        .collect();
-
-                    // Create axes tensor name and add as second input
-                    let axes_name = format!("{}_axes", op_name);
-                    inputs.push(axes_name.clone());
-
-                    // Add axes as an initializer (constant tensor)
-                    initializers.push(TensorProto {
-                        name: axes_name,
-                        data_type: ProtoDataType::Int64 as i32,
-                        dims: vec![axes_values.len() as i64], // 1D tensor
-                        int64_data: axes_values,
-                        ..Default::default()
-                    });
-
-                    nodes.push(NodeProto {
-                        input: inputs,
-                        output: vec![operand_name(
-                            graph,
-                            op.output_operand()
-                                .expect("Single-output operation expected"),
-                        )],
-                        name: op_name.clone(),
-                        op_type: "Unsqueeze".to_string(),
-                        attribute: vec![], // No attributes for Unsqueeze in opset 13+
-                        ..Default::default()
-                    });
-                } else if let Some(new_shape_value) = match &op {
-                    Operation::Expand {
-                        options: Some(o), ..
-                    } if !o.new_shape.is_empty() => serde_json::to_value(&o.new_shape).ok(),
-                    _ => None,
-                } {
+                if let Some(new_shape_value) = serde_json::to_value(new_shape).ok() {
                     // WebNN expand with newShape can be either:
                     // 1. ONNX Expand (broadcasting-compatible shapes)
                     // 2. ONNX Reshape (arbitrary shape changes)
@@ -7364,7 +7248,7 @@ impl crate::converters::GraphConverter for OnnxConverter {
                     return Err(GraphError::ConversionFailed {
                         format: "onnx".to_string(),
                         reason: format!(
-                            "Expand operation requires either 'axes' or 'newShape' attribute in operation {}",
+                            "Expand newShape serialization failed in operation {}",
                             op_name
                         ),
                     });
@@ -7562,15 +7446,22 @@ impl crate::converters::GraphConverter for OnnxConverter {
                     });
                     continue;
                 }
-                let pad_opts = match &op {
-                    Operation::Pad { options, .. } => {
+                let (beginning_padding, ending_padding, pad_opts) = match &op {
+                    Operation::Pad {
+                        beginning_padding,
+                        ending_padding,
+                        options,
+                        ..
+                    } => (
+                        beginning_padding,
+                        ending_padding,
                         options
                             .as_ref()
                             .ok_or_else(|| GraphError::ConversionFailed {
                                 format: "onnx".to_string(),
                                 reason: "pad operation requires typed options".to_string(),
-                            })?
-                    }
+                            })?,
+                    ),
                     _ => {
                         return Err(GraphError::ConversionFailed {
                             format: "onnx".to_string(),
@@ -7578,19 +7469,15 @@ impl crate::converters::GraphConverter for OnnxConverter {
                         });
                     }
                 };
-                let pads_data: Vec<i64> = if !pad_opts.beginning_padding.is_empty()
-                    && !pad_opts.ending_padding.is_empty()
-                {
-                    let mut combined: Vec<i64> = pad_opts
-                        .beginning_padding
-                        .iter()
-                        .map(|&u| u as i64)
-                        .collect();
-                    combined.extend(pad_opts.ending_padding.iter().map(|&u| u as i64));
-                    combined
-                } else {
-                    vec![0; input_rank.saturating_mul(2)]
-                };
+                let pads_data: Vec<i64> =
+                    if !beginning_padding.is_empty() && !ending_padding.is_empty() {
+                        let mut combined: Vec<i64> =
+                            beginning_padding.iter().map(|&u| u as i64).collect();
+                        combined.extend(ending_padding.iter().map(|&u| u as i64));
+                        combined
+                    } else {
+                        vec![0; input_rank.saturating_mul(2)]
+                    };
 
                 let pads_name = format!("{}_pads", op_name);
                 initializers.push(TensorProto {
@@ -7996,10 +7883,9 @@ impl crate::converters::GraphConverter for OnnxConverter {
 
                     let mut attrs = Vec::new();
                     if let Some(batch_dims) = match &op {
-                        Operation::Gather { options, .. }
-                        | Operation::GatherElements { options, .. } => {
-                            options.as_ref().and_then(|o| o.batch_dimensions)
-                        }
+                        Operation::GatherElements {
+                            batch_dimensions, ..
+                        } => *batch_dimensions,
                         _ => None,
                     } {
                         attrs.push(AttributeProto {
@@ -8040,16 +7926,23 @@ impl crate::converters::GraphConverter for OnnxConverter {
                     .map(|id| operand_name(graph, *id))
                     .collect();
 
-                // Slice requires typed options (attributes deprecated).
-                let o = match &op {
-                    Operation::Slice { options, .. } => {
+                // Slice requires typed options (strides); starts/sizes are on the operation.
+                let (starts_u32, sizes_ml, o) = match &op {
+                    Operation::Slice {
+                        starts,
+                        sizes,
+                        options,
+                        ..
+                    } => (
+                        starts,
+                        sizes,
                         options
                             .as_ref()
                             .ok_or_else(|| GraphError::ConversionFailed {
                                 format: "onnx".to_string(),
                                 reason: "slice operation requires typed options".to_string(),
-                            })?
-                    }
+                            })?,
+                    ),
                     _ => {
                         return Err(GraphError::ConversionFailed {
                             format: "onnx".to_string(),
@@ -8057,9 +7950,9 @@ impl crate::converters::GraphConverter for OnnxConverter {
                         });
                     }
                 };
-                let starts: Vec<i64> = o.starts.iter().map(|&u| u as i64).collect();
+                let starts: Vec<i64> = starts_u32.iter().map(|&u| u as i64).collect();
                 let sizes_max: Vec<i64> =
-                    o.sizes_static_or_max().iter().map(|&u| u as i64).collect();
+                    sizes_ml.iter().map(|d| d.static_or_max() as i64).collect();
                 let steps: Option<Vec<i64>> = if o.strides.is_empty() {
                     None
                 } else {
@@ -8067,8 +7960,9 @@ impl crate::converters::GraphConverter for OnnxConverter {
                 };
 
                 // Check if any size is dynamic
-                let has_dynamic_sizes =
-                    o.sizes.iter().any(|s| matches!(s, MLDimension::Dynamic(_)));
+                let has_dynamic_sizes = sizes_ml
+                    .iter()
+                    .any(|s| matches!(s, MLDimension::Dynamic(_)));
 
                 // Special case: 0D tensor (scalar) cannot be sliced
                 if is_0d {
@@ -8104,8 +7998,7 @@ impl crate::converters::GraphConverter for OnnxConverter {
                     // Convert sizes to end dimensions: end[i] = start[i] + size[i]
                     // For dynamic sizes, adjust the name to include the start offset.
                     use crate::graph::DynamicDimension as GraphDynDim;
-                    let end_dims: Vec<Dimension> = o
-                        .sizes
+                    let end_dims: Vec<Dimension> = sizes_ml
                         .iter()
                         .enumerate()
                         .map(|(i, sd)| {
@@ -8249,14 +8142,11 @@ impl crate::converters::GraphConverter for OnnxConverter {
                 };
 
                 let split_sizes: Vec<i64> = match &op {
-                    Operation::Split {
-                        options: Some(opts),
-                        ..
-                    } => {
-                        if opts.splits.is_empty() {
-                            equal_sizes()
+                    Operation::Split { splits, .. } => {
+                        if !splits.is_empty() {
+                            splits.iter().map(|&u| u as i64).collect()
                         } else {
-                            opts.splits.iter().map(|&u| u as i64).collect()
+                            equal_sizes()
                         }
                     }
                     _ => equal_sizes(),
@@ -9511,10 +9401,10 @@ impl crate::converters::GraphConverter for OnnxConverter {
                             .output_operand()
                             .expect("Single-output operation expected");
                         let type_code: i64 = match match &op {
-                            Operation::Cast { options, .. } => options
-                                .as_ref()
-                                .map(|o| o.to.to_ascii_lowercase())
-                                .filter(|s| !s.is_empty()),
+                            Operation::Cast { to, .. } => {
+                                let t = to.to_ascii_lowercase();
+                                if t.is_empty() { None } else { Some(t) }
+                            }
                             _ => None,
                         } {
                             Some(s) => match s.as_str() {
@@ -9777,6 +9667,7 @@ mod tests {
     use crate::graph::{
         DataType, Dimension, DynamicDimension, GraphInfo, Operand, OperandDescriptor, OperandKind,
     };
+    #[cfg(feature = "dynamic-inputs")]
     use crate::operator_options::OperatorOptions;
     use crate::operators::Operation;
     use crate::protos::onnx::tensor_proto::DataType as ProtoDataType;
@@ -9832,6 +9723,56 @@ mod tests {
     fn test_max_min_map_to_onnx() {
         assert_eq!(OnnxConverter::onnx_op_type("max"), "Max");
         assert_eq!(OnnxConverter::onnx_op_type("min"), "Min");
+    }
+
+    #[test]
+    fn test_average_pool2d_null_attributes_onnx_has_kernel_shape() {
+        let operands = vec![
+            Operand {
+                kind: OperandKind::Input,
+                descriptor: OperandDescriptor {
+                    data_type: DataType::Float32,
+                    shape: s(&[1, 3, 4, 4]),
+                    pending_permutation: vec![],
+                },
+                name: Some("input".to_string()),
+            },
+            Operand {
+                kind: OperandKind::Output,
+                descriptor: OperandDescriptor {
+                    data_type: DataType::Float32,
+                    shape: s(&[1, 3, 1, 1]),
+                    pending_permutation: vec![],
+                },
+                name: Some("output".to_string()),
+            },
+        ];
+        let op =
+            Operation::from_json_attributes("averagePool2d", &[0], &[1], &serde_json::Value::Null)
+                .expect("averagePool2d from null attrs");
+        let graph = GraphInfo {
+            operands,
+            input_operands: vec![0],
+            output_operands: vec![1],
+            operations: vec![op],
+            constant_operand_ids_to_handles: HashMap::new(),
+            id_to_constant_tensor_operand_map: HashMap::new(),
+            quantized: false,
+        };
+        let converted = OnnxConverter.convert(&graph).expect("convert");
+        let model = ModelProto::decode(converted.data.as_slice()).expect("decode");
+        let graph_proto = model.graph.expect("graph");
+        let node = graph_proto
+            .node
+            .iter()
+            .find(|n| n.op_type == "AveragePool")
+            .expect("AveragePool node");
+        let ks = node
+            .attribute
+            .iter()
+            .find(|a| a.name == "kernel_shape")
+            .expect("kernel_shape attr");
+        assert_eq!(ks.ints, vec![4_i64, 4]);
     }
 
     #[test]
@@ -10219,12 +10160,10 @@ mod tests {
             name: Some("output".to_string()),
         });
 
-        let attrs =
-            OperatorOptions::from_json_with_op_type("cast", &serde_json::json!({ "to": "int4" }))
-                .unwrap_or_default();
         let operator = Operation::Cast {
             input: 0,
-            options: attrs.as_cast().cloned(),
+            to: "int4".to_string(),
+            options: None,
             outputs: vec![1],
         };
         operations.push(operator);
@@ -10410,20 +10349,13 @@ mod tests {
             },
         ];
 
-        let attrs = OperatorOptions::from_json_with_op_type(
-            "cumulativeSum",
-            &serde_json::json!({
-                "axis": 1,
-                "exclusive": true,
-                "reversed": true
-            }),
-        )
-        .unwrap_or_default();
-        let operator = Operation::CumulativeSum {
-            input: 0,
-            options: attrs.as_cumulative_sum().cloned(),
-            outputs: vec![1],
-        };
+        let attrs_val = serde_json::json!({
+            "axis": 1,
+            "exclusive": true,
+            "reversed": true
+        });
+        let operator = Operation::from_json_attributes("cumulativeSum", &[0], &[1], &attrs_val)
+            .expect("cumulativeSum from JSON");
         let operations = vec![operator];
 
         let graph = GraphInfo {
@@ -10539,27 +10471,17 @@ mod tests {
             },
         ];
 
-        let attrs = OperatorOptions::from_json_with_op_type(
-            "gruCell",
-            &serde_json::json!({
-                "hiddenSize": 4,
-                "layout": "rzn",
-                "resetAfter": false,
-                "activations": ["relu", "relu"]
-            }),
-        )
-        .unwrap_or_default();
-        let mut gru_opts = attrs.as_gru_cell().cloned().unwrap_or_default();
-        gru_opts.bias = Some(4);
-        gru_opts.recurrent_bias = Some(5);
-        let operator = Operation::GruCell {
-            input: 0,
-            weight: 1,
-            recurrence: 2,
-            hidden_state: 3,
-            options: Some(gru_opts),
-            outputs: vec![6],
-        };
+        let attrs_val = serde_json::json!({
+            "hiddenSize": 4,
+            "layout": "rzn",
+            "resetAfter": false,
+            "activations": ["relu", "relu"],
+            "bias": 4,
+            "recurrentBias": 5
+        });
+        let operator =
+            Operation::from_json_attributes("gruCell", &[0, 1, 2, 3, 4, 5], &[6], &attrs_val)
+                .expect("gruCell from JSON");
         let operations = vec![operator];
 
         let graph = GraphInfo {
@@ -10650,8 +10572,10 @@ mod tests {
             },
         ];
 
-        let attrs = OperatorOptions::from_json_with_op_type(
+        let operator = Operation::from_json_attributes(
             "reshape",
+            &[0],
+            &[1],
             &serde_json::json!({
                 "newShape": [
                     { "name": "batch", "maxSize": 8 },
@@ -10659,12 +10583,7 @@ mod tests {
                 ]
             }),
         )
-        .unwrap_or_default();
-        let operator = Operation::Reshape {
-            input: 0,
-            options: attrs.as_reshape().cloned(),
-            outputs: vec![1],
-        };
+        .expect("reshape from_json_attributes");
         let operations = vec![operator];
 
         let graph = GraphInfo {
@@ -10723,8 +10642,10 @@ mod tests {
             },
         ];
 
-        let attrs = OperatorOptions::from_json_with_op_type(
+        let operator = Operation::from_json_attributes(
             "expand",
+            &[0],
+            &[1],
             &serde_json::json!({
                 "newShape": [
                     { "name": "batch", "maxSize": 8 },
@@ -10732,12 +10653,7 @@ mod tests {
                 ]
             }),
         )
-        .unwrap_or_default();
-        let operator = Operation::Expand {
-            input: 0,
-            options: attrs.as_expand().cloned(),
-            outputs: vec![1],
-        };
+        .expect("expand from_json_attributes");
         let operations = vec![operator];
 
         let graph = GraphInfo {
@@ -10834,18 +10750,6 @@ mod tests {
             &serde_json::json!({ "axes": [1] }),
         )
         .unwrap_or_default();
-        let exp_attrs = OperatorOptions::from_json_with_op_type(
-            "expand",
-            &serde_json::json!({
-                "newShape": [
-                    { "name": "batch_size", "maxSize": 8 },
-                    1,
-                    { "name": "sequence_length", "maxSize": 4096 },
-                    { "name": "past_sequence_length + 1", "maxSize": 4096 }
-                ]
-            }),
-        )
-        .unwrap_or_default();
         let operations = vec![
             Operation::Unsqueeze {
                 input: 0,
@@ -10857,11 +10761,20 @@ mod tests {
                 options: u1_attrs.as_unsqueeze().cloned(),
                 outputs: vec![2],
             },
-            Operation::Expand {
-                input: 2,
-                options: exp_attrs.as_expand().cloned(),
-                outputs: vec![3],
-            },
+            Operation::from_json_attributes(
+                "expand",
+                &[2],
+                &[3],
+                &serde_json::json!({
+                    "newShape": [
+                        { "name": "batch_size", "maxSize": 8 },
+                        1,
+                        { "name": "sequence_length", "maxSize": 4096 },
+                        { "name": "past_sequence_length + 1", "maxSize": 4096 }
+                    ]
+                }),
+            )
+            .expect("expand from_json_attributes"),
         ];
 
         let graph = GraphInfo {
@@ -10972,18 +10885,6 @@ mod tests {
             },
         ];
 
-        let exp_attrs = OperatorOptions::from_json_with_op_type(
-            "expand",
-            &serde_json::json!({
-                "newShape": [
-                    { "name": "batch_size", "maxSize": 8 },
-                    1,
-                    { "name": "sequence_length", "maxSize": 4096 },
-                    { "name": "past_sequence_length + 1", "maxSize": 4096 }
-                ]
-            }),
-        )
-        .unwrap_or_default();
         let operations = vec![
             Operation::Where {
                 condition: 0,
@@ -10992,11 +10893,20 @@ mod tests {
                 options: None,
                 outputs: vec![3],
             },
-            Operation::Expand {
-                input: 3,
-                options: exp_attrs.as_expand().cloned(),
-                outputs: vec![4],
-            },
+            Operation::from_json_attributes(
+                "expand",
+                &[3],
+                &[4],
+                &serde_json::json!({
+                    "newShape": [
+                        { "name": "batch_size", "maxSize": 8 },
+                        1,
+                        { "name": "sequence_length", "maxSize": 4096 },
+                        { "name": "past_sequence_length + 1", "maxSize": 4096 }
+                    ]
+                }),
+            )
+            .expect("expand from_json_attributes"),
         ];
 
         let graph = GraphInfo {
@@ -11160,8 +11070,6 @@ mod tests {
             "layerNormalization",
             &serde_json::json!({
                 "axes": [1],
-                "hasScale": false,
-                "hasBias": true,
                 "epsilon": 1e-5
             }),
         )

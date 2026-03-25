@@ -29,6 +29,7 @@ use super::{ConvertedGraph, GraphConverter};
 use crate::error::GraphError;
 use crate::executors::trtx::{create_trtx_logger, ensure_trtx_loaded};
 use crate::graph::{DataType, GraphInfo, OperandKind, get_static_or_max_size};
+use crate::operator_options::MLDimension;
 use crate::operators::Operation;
 use trtx::network::Layer;
 use trtx::{
@@ -3234,19 +3235,21 @@ impl TrtxConverter {
             vec![1]
         };
 
-        // Classify optional operands by name: WPT can pass [input, bias] or [input, scale] or [input, scale, bias].
-        let mut scale_id: Option<u32> = None;
-        let mut bias_id: Option<u32> = None;
-        for &operand_id in &operation.input_operands()[1..] {
-            let name = graph
-                .operand(operand_id)
-                .and_then(|o| o.name.as_deref())
-                .unwrap_or("");
-            let name_lower = name.to_lowercase();
-            if name_lower.contains("scale") {
-                scale_id = Some(operand_id);
-            } else if name_lower.contains("bias") {
-                bias_id = Some(operand_id);
+        // Scale/bias operand indices (WebNN MLInstanceNormalizationOptions); optional extras on legacy graphs.
+        let mut scale_id = opts.and_then(|o| o.scale);
+        let mut bias_id = opts.and_then(|o| o.bias);
+        if scale_id.is_none() || bias_id.is_none() {
+            for &operand_id in &operation.input_operands()[1..] {
+                let name = graph
+                    .operand(operand_id)
+                    .and_then(|o| o.name.as_deref())
+                    .unwrap_or("");
+                let name_lower = name.to_lowercase();
+                if scale_id.is_none() && name_lower.contains("scale") {
+                    scale_id = Some(operand_id);
+                } else if bias_id.is_none() && name_lower.contains("bias") {
+                    bias_id = Some(operand_id);
+                }
             }
         }
 
@@ -4509,15 +4512,31 @@ impl TrtxConverter {
                 reason: format!("Input operand {} not found", operation.input_operands()[0]),
             })?;
 
-        let attrs = operation.attributes();
-        let opts = attrs
-            .as_slice()
-            .ok_or_else(|| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: "Slice operation missing options".to_string(),
-            })?;
+        let (starts_u32, sizes_ml, opts) = match operation {
+            Operation::Slice {
+                starts,
+                sizes,
+                options,
+                ..
+            } => (
+                starts,
+                sizes,
+                options
+                    .as_ref()
+                    .ok_or_else(|| GraphError::ConversionFailed {
+                        format: "trtx".to_string(),
+                        reason: "Slice operation missing options".to_string(),
+                    })?,
+            ),
+            _ => {
+                return Err(GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: "expected Slice operation".to_string(),
+                });
+            }
+        };
         // Empty starts/sizes: no-op (identity), e.g. 0D tensor with empty slices.
-        if opts.starts.is_empty() || opts.sizes.is_empty() {
+        if starts_u32.is_empty() || sizes_ml.is_empty() {
             let id_layer =
                 network
                     .add_identity(input)
@@ -4535,12 +4554,8 @@ impl TrtxConverter {
             tensor_map.insert(output_id, output);
             return Ok(());
         }
-        let starts: Vec<i32> = opts.starts.iter().map(|&u| u as i32).collect();
-        let sizes: Vec<i32> = opts
-            .sizes_static_or_max()
-            .iter()
-            .map(|&u| u as i32)
-            .collect();
+        let starts: Vec<i32> = starts_u32.iter().map(|&u| u as i32).collect();
+        let sizes: Vec<i32> = sizes_ml.iter().map(|d| d.static_or_max() as i32).collect();
         let strides: Vec<i32> = if opts.strides.is_empty() {
             vec![1; starts.len()]
         } else {
@@ -4618,7 +4633,16 @@ impl TrtxConverter {
         }
         axis = axis.max(0).min((ndim.saturating_sub(1)) as i32);
 
-        let splits: Vec<i32> = if opts.splits.is_empty() {
+        let split_sizes = match operation {
+            Operation::Split { splits, .. } => splits.as_slice(),
+            _ => {
+                return Err(GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: "expected Split operation".to_string(),
+                });
+            }
+        };
+        let splits: Vec<i32> = if split_sizes.is_empty() {
             let n = operation.output_operands_slice().len();
             if n == 0 {
                 return Err(GraphError::ConversionFailed {
@@ -4631,7 +4655,7 @@ impl TrtxConverter {
             let rem = (dim % n as i32) as usize;
             (0..n).map(|i| base + if i < rem { 1 } else { 0 }).collect()
         } else {
-            opts.splits.iter().map(|&u| u as i32).collect()
+            split_sizes.iter().map(|&u| u as i32).collect()
         };
 
         // One slice per split; start along axis advances by previous split sizes.
@@ -4802,18 +4826,18 @@ impl TrtxConverter {
                 reason: format!("Input operand {} not found", operation.input_operands()[0]),
             })?;
 
-        let attrs = operation.attributes();
-        let opts = attrs
-            .as_expand()
-            .ok_or_else(|| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: "Expand operation missing options".to_string(),
-            })?;
-        let new_shape: Vec<i32> = opts
-            .new_shape_static_or_max()
-            .into_iter()
-            .map(|u| u as i32)
-            .collect();
+        let new_shape: Vec<i32> = match operation {
+            Operation::Expand { new_shape, .. } => new_shape
+                .iter()
+                .map(|d| MLDimension::static_or_max(d) as i32)
+                .collect(),
+            _ => {
+                return Err(GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: "Internal error: add_expand_op called for non-expand".to_string(),
+                });
+            }
+        };
 
         if new_shape.is_empty() {
             return Err(GraphError::ConversionFailed {
@@ -4895,14 +4919,15 @@ impl TrtxConverter {
         tensor_map: &mut HashMap<u32, trtx::Tensor>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
-        let attrs = operation.attributes();
-        let opts = attrs
-            .as_tile()
-            .ok_or_else(|| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: "Tile operation missing options".to_string(),
-            })?;
-        let repetitions = opts.repetitions.clone();
+        let repetitions = match operation {
+            Operation::Tile { repetitions, .. } => repetitions.clone(),
+            _ => {
+                return Err(GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: "Tile operation expected".to_string(),
+                });
+            }
+        };
         if repetitions.is_empty() {
             return Err(GraphError::ConversionFailed {
                 format: "trtx".to_string(),
@@ -5578,10 +5603,18 @@ impl TrtxConverter {
                 reason: format!("Input operand {} not found", operation.input_operands()[0]),
             })?;
 
-        let attrs = operation.attributes();
-        let opts = attrs.as_arg_min_max();
-        let axis = opts.map(|o| o.axis).unwrap_or(0);
-        let keep_dims = opts.map(|o| o.keep_dimensions).unwrap_or(false);
+        let (axis, keep_dims) = match operation {
+            Operation::ArgMax { axis, options, .. } => (
+                *axis,
+                options.as_ref().map(|o| o.keep_dimensions).unwrap_or(false),
+            ),
+            _ => {
+                return Err(GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: "expected ArgMax operation".to_string(),
+                });
+            }
+        };
 
         // TopK operation: 0=kMAX, 1=kMIN
         let layer = network
@@ -5642,10 +5675,18 @@ impl TrtxConverter {
                 reason: format!("Input operand {} not found", operation.input_operands()[0]),
             })?;
 
-        let attrs = operation.attributes();
-        let opts = attrs.as_arg_min_max();
-        let axis = opts.map(|o| o.axis).unwrap_or(0);
-        let keep_dims = opts.map(|o| o.keep_dimensions).unwrap_or(false);
+        let (axis, keep_dims) = match operation {
+            Operation::ArgMin { axis, options, .. } => (
+                *axis,
+                options.as_ref().map(|o| o.keep_dimensions).unwrap_or(false),
+            ),
+            _ => {
+                return Err(GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: "expected ArgMin operation".to_string(),
+                });
+            }
+        };
 
         // TopK operation: 0=kMAX, 1=kMIN
         let layer = network
@@ -6150,13 +6191,31 @@ impl TrtxConverter {
                 reason: format!("Input operand {} not found", operation.input_operands()[0]),
             })?;
 
-        let attrs = operation.attributes();
-        let opts = attrs.as_pad().ok_or_else(|| GraphError::ConversionFailed {
-            format: "trtx".to_string(),
-            reason: "Pad operation missing options".to_string(),
-        })?;
-        let pre_padding: Vec<i32> = opts.beginning_padding.iter().map(|&u| u as i32).collect();
-        let post_padding: Vec<i32> = opts.ending_padding.iter().map(|&u| u as i32).collect();
+        let (beginning_padding, ending_padding, opts) = match operation {
+            Operation::Pad {
+                beginning_padding,
+                ending_padding,
+                options,
+                ..
+            } => (
+                beginning_padding,
+                ending_padding,
+                options
+                    .as_ref()
+                    .ok_or_else(|| GraphError::ConversionFailed {
+                        format: "trtx".to_string(),
+                        reason: "Pad operation missing options".to_string(),
+                    })?,
+            ),
+            _ => {
+                return Err(GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: "expected Pad operation".to_string(),
+                });
+            }
+        };
+        let pre_padding: Vec<i32> = beginning_padding.iter().map(|&u| u as i32).collect();
+        let post_padding: Vec<i32> = ending_padding.iter().map(|&u| u as i32).collect();
         if pre_padding.is_empty() || post_padding.is_empty() {
             return Err(GraphError::ConversionFailed {
                 format: "trtx".to_string(),
@@ -7734,14 +7793,15 @@ impl TrtxConverter {
             })?;
 
         // Axis is required by WebNN spec (unsigned long)
-        let positive_axis = operation
-            .attributes()
-            .as_softmax()
-            .ok_or_else(|| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: "softmax operation must have options with axis".to_string(),
-            })?
-            .axis;
+        let positive_axis = match operation {
+            Operation::Softmax { axis, .. } => *axis,
+            _ => {
+                return Err(GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: "expected Softmax operation".to_string(),
+                });
+            }
+        };
 
         // TensorRT uses a bitmask where bit N represents axis N
 
@@ -7796,18 +7856,15 @@ impl TrtxConverter {
                     reason: format!("Failed to add concatenation: {}", e),
                 })?;
 
-        // WebNN axis (default 0 per spec); use typed options when available
-        let axis_raw = operation
-            .attributes()
-            .as_concat()
-            .map(|opts| opts.axis as i64)
-            .or_else(|| {
-                operation
-                    .attributes()
-                    .get("axis")
-                    .and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|u| u as i64)))
-            })
-            .unwrap_or(0);
+        // WebNN `axis` is a concat() method parameter (see spec).
+        let axis_raw = match operation {
+            Operation::Concat { axis, .. } => *axis as i64,
+            _ => operation
+                .attributes()
+                .get("axis")
+                .and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|u| u as i64)))
+                .unwrap_or(0),
+        };
         let ndim = inputs[0]
             .dimensions()
             .map_err(|e| GraphError::ConversionFailed {
@@ -7928,19 +7985,25 @@ impl TrtxConverter {
                 reason: format!("Input operand {} not found", operation.input_operands()[0]),
             })?;
 
-        // Parse newShape attribute
-        let new_shape = operation
-            .attributes()
-            .get("newShape")
-            .and_then(|v| v.as_array().cloned())
-            .ok_or_else(|| GraphError::ConversionFailed {
+        let new_shape = match operation {
+            Operation::Reshape { new_shape, .. } => new_shape,
+            _ => {
+                return Err(GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: "reshape operation expected".to_string(),
+                });
+            }
+        };
+        if new_shape.is_empty() {
+            return Err(GraphError::ConversionFailed {
                 format: "trtx".to_string(),
-                reason: "reshape operation missing 'newShape' attribute".to_string(),
-            })?;
+                reason: "reshape operation missing 'newShape'".to_string(),
+            });
+        }
 
-        let dims: Vec<i32> = new_shape
-            .iter()
-            .map(|v| v.as_i64().unwrap_or(0) as i32)
+        let dims: Vec<i32> = crate::operator_options::mldimensions_static_or_max(new_shape)
+            .into_iter()
+            .map(|u| u as i32)
             .collect();
 
         // Use shuffle layer for reshape
@@ -8469,9 +8532,11 @@ impl TrtxConverter {
                 reason: format!("Input operand {} not found", operation.input_operands()[0]),
             })?;
 
-        let attrs = operation.attributes();
-        let cum_opts = attrs.as_cumulative_sum();
-        let axis = cum_opts.map(|o| o.axis as usize).unwrap_or(0);
+        let cum_opts = operation.attributes().as_cumulative_sum();
+        let axis = match operation {
+            Operation::CumulativeSum { axis, .. } => *axis as usize,
+            _ => 0,
+        };
         let exclusive = cum_opts.map(|o| o.exclusive).unwrap_or(false);
         let reverse = cum_opts.map(|o| o.reversed).unwrap_or(false);
 

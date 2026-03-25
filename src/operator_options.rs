@@ -21,8 +21,7 @@
 //! [Web Neural Network API](https://www.w3.org/TR/webnn/) are represented
 //! as an enum: each variant holds the corresponding options struct.
 
-use serde::de::Error;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 
 /// Operand reference (graph operand index). Used in option structs for MLOperand fields.
 pub type OperandIndex = u32;
@@ -58,11 +57,173 @@ impl MLDimension {
     }
 }
 
+/// Static size or dynamic `maxSize` for each `MLDimension` (shape hints, CoreML, TRT static paths).
+#[inline]
+pub fn mldimensions_static_or_max(dims: &[MLDimension]) -> Vec<u32> {
+    dims.iter().map(MLDimension::static_or_max).collect()
+}
+
+/// Scalar and sequence parameters that belong on the WebNN graph builder operation
+/// (method arguments) rather than in the options dictionary, as extracted from interchange JSON.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct OperationExtras {
+    pub axis: Option<u32>,
+    pub to_data_type: Option<String>,
+    pub batch_dimensions: Option<u32>,
+    pub steps: Option<u32>,
+    pub hidden_size: Option<u32>,
+    pub beginning_padding: Vec<u32>,
+    pub ending_padding: Vec<u32>,
+    pub starts: Vec<u32>,
+    pub sizes: Vec<MLDimension>,
+    pub splits: Vec<u32>,
+    pub split_equal_parts: Option<u32>,
+    /// `expand()` method argument `newShape` (not part of MLOperatorOptions).
+    pub expand_new_shape: Vec<MLDimension>,
+    /// `tile()` method argument `repetitions` (not part of MLOperatorOptions).
+    pub repetitions: Vec<u32>,
+    /// `reshape()` method argument `newShape` (not part of MLOperatorOptions).
+    pub reshape_new_shape: Vec<MLDimension>,
+}
+
+impl OperationExtras {
+    /// Remove operation-level keys from `v` (must be a JSON object) and return their values.
+    pub fn extract_and_strip(op_type: &str, v: &mut serde_json::Value) -> Self {
+        let mut out = Self::default();
+        let Some(obj) = v.as_object_mut() else {
+            return out;
+        };
+        let op = op_type.trim();
+        fn remove_u32(
+            obj: &mut serde_json::Map<String, serde_json::Value>,
+            key: &str,
+        ) -> Option<u32> {
+            obj.remove(key).and_then(|x| x.as_u64().map(|n| n as u32))
+        }
+        fn remove_u32_vec(
+            obj: &mut serde_json::Map<String, serde_json::Value>,
+            key: &str,
+        ) -> Vec<u32> {
+            obj.remove(key)
+                .and_then(|x| serde_json::from_value::<Vec<u32>>(x).ok())
+                .unwrap_or_default()
+        }
+        match op {
+            "argMin" | "argMax" => {
+                out.axis = remove_u32(obj, "axis");
+            }
+            "cast" => {
+                if let Some(s) = obj
+                    .remove("to")
+                    .and_then(|x| x.as_str().map(|s| s.to_string()))
+                {
+                    out.to_data_type = Some(s);
+                } else if let Some(s) = obj
+                    .remove("dataType")
+                    .and_then(|x| x.as_str().map(|s| s.to_string()))
+                {
+                    out.to_data_type = Some(s);
+                }
+            }
+            "concat" => {
+                out.axis = remove_u32(obj, "axis");
+            }
+            "expand" => {
+                let _ = obj.remove("axes");
+                if let Some(s) = obj.remove("newShape").or_else(|| obj.remove("new_shape")) {
+                    if let Ok(parsed) = serde_json::from_value::<Vec<MLDimension>>(s) {
+                        out.expand_new_shape = parsed;
+                    }
+                }
+            }
+            "cumulativeSum" => {
+                out.axis = remove_u32(obj, "axis");
+            }
+            "gather" | "gatherElements" => {
+                out.batch_dimensions = remove_u32(obj, "batchDimensions")
+                    .or_else(|| remove_u32(obj, "batch_dimensions"));
+            }
+            "gru" => {
+                out.steps = remove_u32(obj, "steps");
+                out.hidden_size =
+                    remove_u32(obj, "hiddenSize").or_else(|| remove_u32(obj, "hidden_size"));
+            }
+            "gruCell" => {
+                out.hidden_size =
+                    remove_u32(obj, "hiddenSize").or_else(|| remove_u32(obj, "hidden_size"));
+            }
+            "instanceNormalization" => {
+                // Legacy interchange; not part of MLInstanceNormalizationOptions.
+                let _ = obj.remove("hasScale");
+                let _ = obj.remove("hasBias");
+                let _ = obj.remove("has_scale");
+                let _ = obj.remove("has_bias");
+            }
+            "layerNormalization" => {
+                let _ = obj.remove("hasScale");
+                let _ = obj.remove("hasBias");
+                let _ = obj.remove("has_scale");
+                let _ = obj.remove("has_bias");
+            }
+            "pad" => {
+                out.beginning_padding = remove_u32_vec(obj, "beginningPadding");
+                if out.beginning_padding.is_empty() {
+                    out.beginning_padding = remove_u32_vec(obj, "beginning_padding");
+                }
+                out.ending_padding = remove_u32_vec(obj, "endingPadding");
+                if out.ending_padding.is_empty() {
+                    out.ending_padding = remove_u32_vec(obj, "ending_padding");
+                }
+            }
+            "softmax" => {
+                out.axis = remove_u32(obj, "axis");
+            }
+            "slice" => {
+                out.starts = remove_u32_vec(obj, "starts");
+                if let Some(s) = obj.remove("sizes") {
+                    if let Ok(parsed) = serde_json::from_value::<Vec<MLDimension>>(s) {
+                        out.sizes = parsed;
+                    }
+                }
+            }
+            "split" => {
+                if let Some(sv) = obj.remove("splits") {
+                    match sv {
+                        serde_json::Value::Number(n) => {
+                            out.split_equal_parts = n.as_u64().map(|u| u as u32);
+                        }
+                        serde_json::Value::Array(_) => {
+                            if let Ok(parsed) = serde_json::from_value::<Vec<u32>>(sv) {
+                                out.splits = parsed;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "tile" => {
+                out.repetitions = remove_u32_vec(obj, "repetitions");
+            }
+            "reshape" => {
+                if let Some(s) = obj.remove("newShape").or_else(|| obj.remove("new_shape")) {
+                    if let Ok(parsed) = serde_json::from_value::<Vec<MLDimension>>(s) {
+                        out.reshape_new_shape = parsed;
+                    }
+                }
+            }
+            _ => {}
+        }
+        out
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Base: MLOperatorOptions
 // ---------------------------------------------------------------------------
 
 /// MLOperatorOptions. Base type for all operator options (label only).
+///
+/// WebNN: <https://www.w3.org/TR/webnn/#dictdef-mloperatoroptions>
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct MLOperatorOptions {
@@ -74,14 +235,14 @@ pub struct MLOperatorOptions {
 // Dictionaries extending MLOperatorOptions (spec order)
 // ---------------------------------------------------------------------------
 
-/// MLArgMinMaxOptions. argMin / argMax.
+/// MLArgMinMaxOptions. argMin / argMax (axis is a builder method parameter, not in this dictionary).
+///
+/// WebNN: <https://www.w3.org/TR/webnn/#dictdef-mlargminmaxoptions>
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct MLArgMinMaxOptions {
     #[serde(default)]
     pub label: String,
-    #[serde(default)]
-    pub axis: u32,
     #[serde(default)]
     pub keep_dimensions: bool,
     #[serde(default)]
@@ -97,6 +258,8 @@ fn default_batch_norm_epsilon() -> f64 {
 }
 
 /// MLBatchNormalizationOptions. batchNormalization.
+///
+/// WebNN: <https://www.w3.org/TR/webnn/#dictdef-mlbatchnormalizationoptions>
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct MLBatchNormalizationOptions {
@@ -122,23 +285,15 @@ impl Default for MLBatchNormalizationOptions {
     }
 }
 
-/// MLCastOptions. cast.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct MLCastOptions {
-    #[serde(default)]
-    pub label: String,
-    /// Target data type (e.g. "float32", "int32").
-    #[serde(default)]
-    pub to: String,
-}
-
 /// MLClampOptions. clamp.
+///
+/// WebNN: <https://www.w3.org/TR/webnn/#dictdef-mlclampoptions>
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct MLClampOptions {
     #[serde(default)]
     pub label: String,
+    // TODO MTAX MLNumber is an union of any floating point or integral type
     pub min_value: Option<serde_json::Value>, // MLNumber
     pub max_value: Option<serde_json::Value>, // MLNumber
 }
@@ -148,6 +303,8 @@ fn default_conv_groups() -> u32 {
 }
 
 /// MLConv2dOptions. conv2d.
+///
+/// WebNN: <https://www.w3.org/TR/webnn/#dictdef-mlconv2doptions>
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct MLConv2dOptions {
@@ -197,7 +354,6 @@ pub struct MLConvTranspose2dOptions {
     pub dilations: Vec<u32>,
     #[serde(default)]
     pub output_padding: Vec<u32>,
-    /// Output spatial shape [H, W]. WebNN camelCase: outputSizes.
     pub output_sizes: Option<Vec<u32>>,
     #[serde(default = "default_conv_groups")]
     pub groups: u32,
@@ -226,6 +382,9 @@ impl Default for MLConvTranspose2dOptions {
 }
 
 /// MLConstantOptions. constant (interchange: init, data, dataType, shape).
+///
+/// Not an IDL dictionary; closest normative API is [`MLGraphBuilder`](https://www.w3.org/TR/webnn/#dom-mlgraphbuilder) (`constant()` methods).
+// TODO MTAX non-existing struct. defer removal for now since it's not like any other operation.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct MLConstantOptions {
@@ -239,51 +398,18 @@ pub struct MLConstantOptions {
     pub shape: Vec<u32>,
 }
 
-/// MLConcatOptions. concat.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct MLConcatOptions {
-    #[serde(default)]
-    pub label: String,
-    #[serde(default)]
-    pub axis: u32,
-}
-
-/// MLCumulativeSumOptions. cumulativeSum.
+/// MLCumulativeSumOptions. cumulativeSum (axis is a builder method parameter).
+///
+/// WebNN: <https://www.w3.org/TR/webnn/#dictdef-mlcumulativesumoptions>
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct MLCumulativeSumOptions {
     #[serde(default)]
     pub label: String,
     #[serde(default)]
-    pub axis: u32,
-    #[serde(default)]
     pub exclusive: bool,
     #[serde(default)]
     pub reversed: bool,
-}
-
-/// MLExpandOptions. expand (newShape or axes from attributes for interchange).
-/// newShape uses MLDimension (static or dynamic) per WebNN IDL.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct MLExpandOptions {
-    #[serde(default)]
-    pub label: String,
-    #[serde(default, rename = "newShape")]
-    pub new_shape: Vec<MLDimension>,
-    #[serde(default)]
-    pub axes: Vec<u32>,
-}
-
-impl MLExpandOptions {
-    /// Returns each dimension as u32 (static value or dynamic maxSize).
-    pub fn new_shape_static_or_max(&self) -> Vec<u32> {
-        self.new_shape
-            .iter()
-            .map(MLDimension::static_or_max)
-            .collect()
-    }
 }
 
 fn default_elu_alpha() -> f64 {
@@ -291,6 +417,8 @@ fn default_elu_alpha() -> f64 {
 }
 
 /// MLEluOptions. elu.
+///
+/// WebNN: <https://www.w3.org/TR/webnn/#dictdef-mleluoptions>
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct MLEluOptions {
@@ -309,7 +437,9 @@ impl Default for MLEluOptions {
     }
 }
 
-/// MLGatherOptions. gather / gatherElements.
+/// MLGatherOptions. gather / gatherElements (batchDimensions is a gatherElements parameter in WebNN).
+///
+/// WebNN: <https://www.w3.org/TR/webnn/#dictdef-mlgatheroptions>
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct MLGatherOptions {
@@ -317,8 +447,6 @@ pub struct MLGatherOptions {
     pub label: String,
     #[serde(default)]
     pub axis: u32,
-    /// gatherElements: batchDimensions (optional).
-    pub batch_dimensions: Option<u32>,
 }
 
 fn default_gemm_alpha() -> f64 {
@@ -330,6 +458,8 @@ fn default_gemm_beta() -> f64 {
 }
 
 /// MLGemmOptions. gemm.
+///
+/// WebNN: <https://www.w3.org/TR/webnn/#dictdef-mlgemmoptions>
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct MLGemmOptions {
@@ -360,6 +490,8 @@ impl Default for MLGemmOptions {
 }
 
 /// MLGruOptions. gru.
+///
+/// WebNN: <https://www.w3.org/TR/webnn/#dictdef-mlgruoptions>
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct MLGruOptions {
@@ -377,10 +509,11 @@ pub struct MLGruOptions {
     #[serde(default)]
     pub layout: String, // "zrn" | "rzn"
     pub activations: Option<Vec<String>>, // MLRecurrentNetworkActivation
-    pub hidden_size: Option<u32>,
 }
 
 /// MLGruCellOptions. gruCell.
+///
+/// WebNN: <https://www.w3.org/TR/webnn/#dictdef-mlgrucelloptions>
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct MLGruCellOptions {
@@ -393,7 +526,6 @@ pub struct MLGruCellOptions {
     #[serde(default)]
     pub layout: String,
     pub activations: Option<Vec<String>>,
-    pub hidden_size: Option<u32>,
 }
 
 fn default_hard_sigmoid_alpha() -> f64 {
@@ -405,6 +537,8 @@ fn default_hard_sigmoid_beta() -> f64 {
 }
 
 /// MLHardSigmoidOptions. hardSigmoid.
+///
+/// WebNN: <https://www.w3.org/TR/webnn/#dictdef-mlhardsigmoidoptions>
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct MLHardSigmoidOptions {
@@ -426,41 +560,13 @@ impl Default for MLHardSigmoidOptions {
     }
 }
 
-fn default_hard_swish_alpha() -> f64 {
-    1.0 / 6.0
-}
-
-fn default_hard_swish_beta() -> f64 {
-    0.5
-}
-
-/// MLHardSwishOptions. hardSwish (optional alpha/beta for interchange).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct MLHardSwishOptions {
-    #[serde(default)]
-    pub label: String,
-    #[serde(default = "default_hard_swish_alpha")]
-    pub alpha: f64,
-    #[serde(default = "default_hard_swish_beta")]
-    pub beta: f64,
-}
-
-impl Default for MLHardSwishOptions {
-    fn default() -> Self {
-        Self {
-            label: String::new(),
-            alpha: default_hard_swish_alpha(),
-            beta: default_hard_swish_beta(),
-        }
-    }
-}
-
 fn default_instance_norm_epsilon() -> f64 {
     1e-5
 }
 
 /// MLInstanceNormalizationOptions. instanceNormalization.
+///
+/// WebNN: <https://www.w3.org/TR/webnn/#dictdef-mlinstancenormalizationoptions>
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct MLInstanceNormalizationOptions {
@@ -468,12 +574,6 @@ pub struct MLInstanceNormalizationOptions {
     pub label: String,
     pub scale: Option<OperandIndex>,
     pub bias: Option<OperandIndex>,
-    /// When exactly one of scale/bias is provided (2 operands), disambiguates so converters
-    /// know which optional is present. Omitted when 1 or 3 operands.
-    #[serde(default)]
-    pub has_scale: Option<bool>,
-    #[serde(default)]
-    pub has_bias: Option<bool>,
     #[serde(default = "default_instance_norm_epsilon")]
     pub epsilon: f64,
     #[serde(default)]
@@ -486,10 +586,8 @@ impl Default for MLInstanceNormalizationOptions {
             label: String::new(),
             scale: None,
             bias: None,
-            has_scale: None,
-            has_bias: None,
             epsilon: default_instance_norm_epsilon(),
-            layout: String::new(),
+            layout: String::new(), // TODO TMAX the default is "nchw"
         }
     }
 }
@@ -500,6 +598,8 @@ fn default_layer_norm_epsilon() -> f64 {
 
 /// MLLayerNormalizationOptions. layerNormalization.
 /// `axes`: None = key omitted (spec default [1..rank)); Some(v) = use v (Some(vec![]) = reduce over no axes).
+///
+/// WebNN: <https://www.w3.org/TR/webnn/#dictdef-mllayernormalizationoptions>
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct MLLayerNormalizationOptions {
@@ -507,12 +607,6 @@ pub struct MLLayerNormalizationOptions {
     pub label: String,
     pub scale: Option<OperandIndex>,
     pub bias: Option<OperandIndex>,
-    /// When exactly one of scale/bias is provided (2 operands), disambiguates for converters.
-    #[serde(default)]
-    pub has_scale: Option<bool>,
-    #[serde(default)]
-    pub has_bias: Option<bool>,
-    /// Omitted in JSON => None => use spec default [1..rank). Present (including []) => use as-is.
     pub axes: Option<Vec<u32>>,
     #[serde(default = "default_layer_norm_epsilon")]
     pub epsilon: f64,
@@ -524,8 +618,6 @@ impl Default for MLLayerNormalizationOptions {
             label: String::new(),
             scale: None,
             bias: None,
-            has_scale: None,
-            has_bias: None,
             axes: None,
             epsilon: default_layer_norm_epsilon(),
         }
@@ -537,6 +629,8 @@ fn default_leaky_relu_alpha() -> f64 {
 }
 
 /// MLLeakyReluOptions. leakyRelu.
+///
+/// WebNN: <https://www.w3.org/TR/webnn/#dictdef-mlleakyreluoptions>
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct MLLeakyReluOptions {
@@ -564,6 +658,8 @@ fn default_linear_beta() -> f64 {
 }
 
 /// MLLinearOptions. linear.
+///
+/// WebNN: <https://www.w3.org/TR/webnn/#dictdef-mllinearoptions>
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct MLLinearOptions {
@@ -586,6 +682,8 @@ impl Default for MLLinearOptions {
 }
 
 /// MLLstmOptions. lstm.
+///
+/// WebNN: <https://www.w3.org/TR/webnn/#dictdef-mllstmoptions>
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct MLLstmOptions {
@@ -606,6 +704,8 @@ pub struct MLLstmOptions {
 }
 
 /// MLLstmCellOptions. lstmCell.
+///
+/// WebNN: <https://www.w3.org/TR/webnn/#dictdef-mllstmcelloptions>
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct MLLstmCellOptions {
@@ -614,100 +714,89 @@ pub struct MLLstmCellOptions {
     pub bias: Option<OperandIndex>,
     pub recurrent_bias: Option<OperandIndex>,
     pub peephole_weight: Option<OperandIndex>,
+    // TODO TMAX verify default
     #[serde(default)]
     pub layout: String,
     pub activations: Option<Vec<String>>,
 }
 
-/// MLPadOptions. pad.
-/// Note: In WebNN, padding lengths are MLOperands; we also support serializing them as
-/// beginning_padding/ending_padding arrays for graph interchange.
+/// MLPadOptions. pad (beginning/ending padding are builder method parameters).
+///
+/// WebNN: <https://www.w3.org/TR/webnn/#dictdef-mlpadoptions>
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct MLPadOptions {
     #[serde(default)]
     pub label: String,
+    // TODO MTAX mode is an enum of type MLPaddingMode
     #[serde(default)]
     pub mode: String, // "constant" | "edge" | "reflection"
     pub value: Option<serde_json::Value>, // MLNumber
-    #[serde(default, rename = "beginningPadding")]
-    pub beginning_padding: Vec<u32>,
-    #[serde(default, rename = "endingPadding")]
-    pub ending_padding: Vec<u32>,
 }
 
 /// MLPool2dOptions. averagePool2d / l2Pool2d / maxPool2d.
+///
+/// WebNN: <https://www.w3.org/TR/webnn/#dictdef-mlpool2doptions>
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct MLPool2dOptions {
     #[serde(default)]
     pub label: String,
     pub window_dimensions: Option<Vec<u32>>,
+    // TODO MTAX check default value
     #[serde(default)]
     pub padding: Vec<u32>,
     #[serde(default)]
     pub strides: Vec<u32>,
     #[serde(default)]
     pub dilations: Vec<u32>,
+    // TODO MTAX layout is enum MLInputOperandLayout
     #[serde(default)]
     pub layout: String,
-    /// "floor" | "ceil". WebNN spec and WPT use "roundingType"; we accept both keys.
-    #[serde(default, alias = "roundingType")]
+    // TODO MTAX enum MLRoundingType
+    #[serde(default)]
     pub output_shape_rounding: String,
     pub output_sizes: Option<Vec<u32>>,
 }
 
 /// MLReduceOptions. reduceL1, reduceL2, reduceLogSum, etc.
 /// `axes`: None = key omitted (spec default: all axes); Some(v) = use v (Some(vec![]) = reduce over no axes).
+///
+/// WebNN: <https://www.w3.org/TR/webnn/#dictdef-mlreduceoptions>
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct MLReduceOptions {
     #[serde(default)]
     pub label: String,
-    /// Omitted in JSON => None => reduce over all axes. Present (including []) => use as-is ([] = no reduction).
     pub axes: Option<Vec<u32>>,
     #[serde(default)]
     pub keep_dimensions: bool,
 }
 
-/// MLReshapeOptions. reshape (newShape from attributes for interchange).
-/// newShape uses MLDimension (static or dynamic) per WebNN IDL.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct MLReshapeOptions {
-    #[serde(default)]
-    pub label: String,
-    #[serde(default, rename = "newShape")]
-    pub new_shape: Vec<MLDimension>,
-}
-
-impl MLReshapeOptions {
-    /// Returns each dimension as u32 (static value or dynamic maxSize).
-    pub fn new_shape_static_or_max(&self) -> Vec<u32> {
-        self.new_shape
-            .iter()
-            .map(MLDimension::static_or_max)
-            .collect()
-    }
-}
-
 /// MLResample2dOptions. resample2d.
+///
+/// WebNN: <https://www.w3.org/TR/webnn/#dictdef-mlresample2doptions>
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct MLResample2dOptions {
     #[serde(default)]
     pub label: String,
+    // TODO MTAX enum MLInterpolationMode
     #[serde(default)]
     pub mode: String, // "nearest-neighbor" | "linear"
     #[serde(default)]
     pub scales: Vec<f32>,
+    #[serde(default)]
     pub sizes: Option<Vec<u32>>,
+
     #[serde(default)]
     pub axes: Vec<u32>,
 }
 
 /// MLReverseOptions. reverse.
 /// axes: omitted => reverse all dimensions; present and [] => reverse none (identity); present and [..] => reverse those axes.
+///
+/// WebNN: <https://www.w3.org/TR/webnn/#dictdef-mlreverseoptions>
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct MLReverseOptions {
@@ -717,17 +806,9 @@ pub struct MLReverseOptions {
     pub axes: Option<Vec<u32>>,
 }
 
-/// MLSoftmaxOptions. softmax.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct MLSoftmaxOptions {
-    #[serde(default)]
-    pub label: String,
-    #[serde(default)]
-    pub axis: u32,
-}
-
-/// MLScatterOptions. scatterElements.
+/// MLScatterOptions. scatterElements / scatterND.
+///
+/// WebNN: <https://www.w3.org/TR/webnn/#dictdef-mlscatteroptions>
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct MLScatterOptions {
@@ -737,58 +818,21 @@ pub struct MLScatterOptions {
     pub axis: u32,
 }
 
-/// MLSliceOptions. slice.
-/// In WebNN, starts/sizes are MLOperands; we also support them as arrays for interchange.
-/// `sizes` uses MLDimension (static or dynamic) per WebNN IDL.
+/// MLSliceOptions. slice (starts and sizes are builder method parameters).
+///
+/// WebNN: <https://www.w3.org/TR/webnn/#dictdef-mlsliceoptions>
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct MLSliceOptions {
     #[serde(default)]
     pub label: String,
     #[serde(default)]
-    pub starts: Vec<u32>,
-    #[serde(default)]
-    pub sizes: Vec<MLDimension>,
-    #[serde(default)]
     pub strides: Vec<u32>,
 }
 
-impl MLSliceOptions {
-    /// Returns each size dimension as u32 (static value or dynamic maxSize).
-    pub fn sizes_static_or_max(&self) -> Vec<u32> {
-        self.sizes.iter().map(MLDimension::static_or_max).collect()
-    }
-}
-
-/// Deserialize splits as either a number (equal-split count; store empty vec, TRTX uses output count)
-/// or an array of sizes.
-fn deserialize_splits<'de, D>(d: D) -> Result<Vec<u32>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let v = serde_json::Value::deserialize(d)?;
-    match v {
-        serde_json::Value::Number(n) => {
-            let _ = n
-                .as_u64()
-                .ok_or_else(|| D::Error::custom("splits number out of range"))?;
-            Ok(Vec::new())
-        }
-        serde_json::Value::Array(arr) => arr
-            .iter()
-            .map(|e| {
-                e.as_u64()
-                    .ok_or_else(|| D::Error::custom("splits array element not u64"))
-                    .map(|u| u as u32)
-            })
-            .collect::<Result<Vec<u32>, _>>(),
-        serde_json::Value::Null => Ok(Vec::new()),
-        _ => Err(D::Error::custom("splits must be number or array")),
-    }
-}
-
-/// MLSplitOptions. split.
-/// Splits array from attributes for interchange (WebNN also has splits as MLOperand or number).
+/// MLSplitOptions. split (splits is a builder method parameter).
+///
+/// WebNN: <https://www.w3.org/TR/webnn/#dictdef-mlsplitoptions>
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct MLSplitOptions {
@@ -796,11 +840,11 @@ pub struct MLSplitOptions {
     pub label: String,
     #[serde(default)]
     pub axis: u32,
-    #[serde(default, deserialize_with = "deserialize_splits")]
-    pub splits: Vec<u32>,
 }
 
 /// MLTransposeOptions. transpose.
+///
+/// WebNN: <https://www.w3.org/TR/webnn/#dictdef-mltransposeoptions>
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct MLTransposeOptions {
@@ -816,7 +860,11 @@ pub struct MLTransposeOptions {
 // § 11 Operation Emulation and can be implemented via reshape().
 // ---------------------------------------------------------------------------
 
+// TODO TMAX remove the unofficial ops!
+
 /// MLSqueezeOptions. squeeze (emulation-only; not in WebNN IDL).
+///
+/// WebNN emulation: <https://www.w3.org/TR/webnn/#squeeze>
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct MLSqueezeOptions {
@@ -827,6 +875,8 @@ pub struct MLSqueezeOptions {
 }
 
 /// MLUnsqueezeOptions. unsqueeze (emulation-only; not in WebNN IDL).
+///
+/// WebNN emulation: <https://www.w3.org/TR/webnn/#unsqueeze>
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct MLUnsqueezeOptions {
@@ -836,24 +886,15 @@ pub struct MLUnsqueezeOptions {
     pub axes: Vec<u32>,
 }
 
-/// MLTileOptions. tile (repetitions from attributes for interchange).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct MLTileOptions {
-    #[serde(default)]
-    pub label: String,
-    #[serde(default)]
-    pub repetitions: Vec<u32>,
-}
-
 /// MLTriangularOptions. triangular.
 /// WebNN: when "upper" is not present, default is true (keep upper triangular).
+///
+/// WebNN: <https://www.w3.org/TR/webnn/#dictdef-mltriangularoptions>
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct MLTriangularOptions {
     #[serde(default)]
     pub label: String,
-    /// None = not present => default true (upper). Some(b) => use b.
     pub upper: Option<bool>,
     #[serde(default)]
     pub diagonal: i32,
@@ -879,9 +920,6 @@ pub enum OperatorOptions {
     /// MLBatchNormalizationOptions.
     BatchNormalization(MLBatchNormalizationOptions),
 
-    /// MLCastOptions.
-    Cast(MLCastOptions),
-
     /// MLClampOptions.
     Clamp(MLClampOptions),
 
@@ -894,14 +932,8 @@ pub enum OperatorOptions {
     /// MLConvTranspose2dOptions.
     ConvTranspose2d(MLConvTranspose2dOptions),
 
-    /// MLConcatOptions.
-    Concat(MLConcatOptions),
-
     /// MLCumulativeSumOptions.
     CumulativeSum(MLCumulativeSumOptions),
-
-    /// MLExpandOptions.
-    Expand(MLExpandOptions),
 
     /// MLEluOptions.
     Elu(MLEluOptions),
@@ -920,9 +952,6 @@ pub enum OperatorOptions {
 
     /// MLHardSigmoidOptions.
     HardSigmoid(MLHardSigmoidOptions),
-
-    /// MLHardSwishOptions.
-    HardSwish(MLHardSwishOptions),
 
     /// MLInstanceNormalizationOptions.
     InstanceNormalization(MLInstanceNormalizationOptions),
@@ -951,9 +980,6 @@ pub enum OperatorOptions {
     /// MLReduceOptions.
     Reduce(MLReduceOptions),
 
-    /// MLReshapeOptions.
-    Reshape(MLReshapeOptions),
-
     /// MLResample2dOptions.
     Resample2d(MLResample2dOptions),
 
@@ -962,9 +988,6 @@ pub enum OperatorOptions {
 
     /// MLScatterOptions.
     ScatterElements(MLScatterOptions),
-
-    /// MLSoftmaxOptions.
-    Softmax(MLSoftmaxOptions),
 
     /// MLSliceOptions.
     Slice(MLSliceOptions),
@@ -980,9 +1003,6 @@ pub enum OperatorOptions {
     Squeeze(MLSqueezeOptions),
     /// MLUnsqueezeOptions. unsqueeze.
     Unsqueeze(MLUnsqueezeOptions),
-
-    /// MLTileOptions.
-    Tile(MLTileOptions),
 
     /// MLTriangularOptions.
     Triangular(MLTriangularOptions),
@@ -1014,21 +1034,21 @@ impl OperatorOptions {
             match normalized {
                 "argMin" | "argMax" => try_opt!(MLArgMinMaxOptions, ArgMinMax),
                 "batchNormalization" => try_opt!(MLBatchNormalizationOptions, BatchNormalization),
-                "cast" => try_opt!(MLCastOptions, Cast),
+                "cast" => try_opt!(MLOperatorOptions, Operator),
                 "clamp" => try_opt!(MLClampOptions, Clamp),
                 "conv2d" => try_opt!(MLConv2dOptions, Conv2d),
                 "convTranspose2d" => try_opt!(MLConvTranspose2dOptions, ConvTranspose2d),
-                "concat" => try_opt!(MLConcatOptions, Concat),
+                "concat" => try_opt!(MLOperatorOptions, Operator),
                 "constant" => try_opt!(MLConstantOptions, Constant),
                 "cumulativeSum" => try_opt!(MLCumulativeSumOptions, CumulativeSum),
-                "expand" => try_opt!(MLExpandOptions, Expand),
+                "expand" => try_opt!(MLOperatorOptions, Operator),
                 "elu" => try_opt!(MLEluOptions, Elu),
                 "gather" | "gatherElements" => try_opt!(MLGatherOptions, Gather),
                 "gemm" => try_opt!(MLGemmOptions, Gemm),
                 "gru" => try_opt!(MLGruOptions, Gru),
                 "gruCell" => try_opt!(MLGruCellOptions, GruCell),
                 "hardSigmoid" => try_opt!(MLHardSigmoidOptions, HardSigmoid),
-                "hardSwish" => try_opt!(MLHardSwishOptions, HardSwish),
+                "hardSwish" => try_opt!(MLOperatorOptions, Operator),
                 "instanceNormalization" => {
                     try_opt!(MLInstanceNormalizationOptions, InstanceNormalization)
                 }
@@ -1038,23 +1058,24 @@ impl OperatorOptions {
                 "lstm" => try_opt!(MLLstmOptions, Lstm),
                 "lstmCell" => try_opt!(MLLstmCellOptions, LstmCell),
                 "pad" => try_opt!(MLPadOptions, Pad),
-                "averagePool2d" | "maxPool2d" | "l2Pool2d" => try_opt!(MLPool2dOptions, Pool2d),
+                "averagePool2d" | "maxPool2d" | "l2Pool2d" | "globalAveragePool"
+                | "globalMaxPool" => try_opt!(MLPool2dOptions, Pool2d),
                 "reduceSum" | "reduceMean" | "reduceMax" | "reduceMin" | "reduceProduct"
                 | "reduceL1" | "reduceL2" | "reduceLogSum" | "reduceLogSumExp"
                 | "reduceSumSquare" => {
                     try_opt!(MLReduceOptions, Reduce)
                 }
-                "reshape" => try_opt!(MLReshapeOptions, Reshape),
+                "reshape" => try_opt!(MLOperatorOptions, Operator),
                 "resample2d" => try_opt!(MLResample2dOptions, Resample2d),
                 "reverse" => try_opt!(MLReverseOptions, Reverse),
                 "scatterElements" => try_opt!(MLScatterOptions, ScatterElements),
-                "softmax" => try_opt!(MLSoftmaxOptions, Softmax),
+                "softmax" => try_opt!(MLOperatorOptions, Operator),
                 "slice" => try_opt!(MLSliceOptions, Slice),
                 "split" => try_opt!(MLSplitOptions, Split),
                 "transpose" => try_opt!(MLTransposeOptions, Transpose),
                 "squeeze" => try_opt!(MLSqueezeOptions, Squeeze),
                 "unsqueeze" => try_opt!(MLUnsqueezeOptions, Unsqueeze),
-                "tile" => try_opt!(MLTileOptions, Tile),
+                "tile" => try_opt!(MLOperatorOptions, Operator),
                 "triangular" => try_opt!(MLTriangularOptions, Triangular),
                 _ => {}
             }
@@ -1064,6 +1085,21 @@ impl OperatorOptions {
             None
         };
         try_from(value).or_else(|| Some(OperatorOptions::Operator(MLOperatorOptions::default())))
+    }
+
+    /// Like [`Self::from_json_with_op_type`], but strips operation-level fields into [`OperationExtras`]
+    /// (axis, cast target type, padding lengths, etc.) before deserializing the options dictionary.
+    ///
+    /// For building an [`crate::operators::Operation`], prefer [`crate::operators::Operation::from_json_attributes`],
+    /// which calls this and [`crate::operators::Operation::from_operator_options`] in one step.
+    pub fn from_json_with_op_type_and_extras(
+        op_type: &str,
+        value: &serde_json::Value,
+    ) -> (Self, OperationExtras) {
+        let mut v = value.clone();
+        let extras = OperationExtras::extract_and_strip(op_type, &mut v);
+        let opts = Self::from_json_with_op_type(op_type, &v).unwrap_or_default();
+        (opts, extras)
     }
 
     /// Return attributes as a JSON value (for code that expects a `serde_json::Value`).
@@ -1100,12 +1136,6 @@ impl OperatorOptions {
             _ => None,
         }
     }
-    pub fn as_cast(&self) -> Option<&MLCastOptions> {
-        match self {
-            OperatorOptions::Cast(o) => Some(o),
-            _ => None,
-        }
-    }
     pub fn as_clamp(&self) -> Option<&MLClampOptions> {
         match self {
             OperatorOptions::Clamp(o) => Some(o),
@@ -1115,12 +1145,6 @@ impl OperatorOptions {
     pub fn as_conv2d(&self) -> Option<&MLConv2dOptions> {
         match self {
             OperatorOptions::Conv2d(o) => Some(o),
-            _ => None,
-        }
-    }
-    pub fn as_concat(&self) -> Option<&MLConcatOptions> {
-        match self {
-            OperatorOptions::Concat(o) => Some(o),
             _ => None,
         }
     }
@@ -1178,12 +1202,6 @@ impl OperatorOptions {
             _ => None,
         }
     }
-    pub fn as_hard_swish(&self) -> Option<&MLHardSwishOptions> {
-        match self {
-            OperatorOptions::HardSwish(o) => Some(o),
-            _ => None,
-        }
-    }
     pub fn as_instance_normalization(&self) -> Option<&MLInstanceNormalizationOptions> {
         match self {
             OperatorOptions::InstanceNormalization(o) => Some(o),
@@ -1238,12 +1256,6 @@ impl OperatorOptions {
             _ => None,
         }
     }
-    pub fn as_reshape(&self) -> Option<&MLReshapeOptions> {
-        match self {
-            OperatorOptions::Reshape(o) => Some(o),
-            _ => None,
-        }
-    }
     pub fn as_resample2d(&self) -> Option<&MLResample2dOptions> {
         match self {
             OperatorOptions::Resample2d(o) => Some(o),
@@ -1259,12 +1271,6 @@ impl OperatorOptions {
     pub fn as_scatter_elements(&self) -> Option<&MLScatterOptions> {
         match self {
             OperatorOptions::ScatterElements(o) => Some(o),
-            _ => None,
-        }
-    }
-    pub fn as_softmax(&self) -> Option<&MLSoftmaxOptions> {
-        match self {
-            OperatorOptions::Softmax(o) => Some(o),
             _ => None,
         }
     }
@@ -1298,21 +1304,9 @@ impl OperatorOptions {
             _ => None,
         }
     }
-    pub fn as_tile(&self) -> Option<&MLTileOptions> {
-        match self {
-            OperatorOptions::Tile(o) => Some(o),
-            _ => None,
-        }
-    }
     pub fn as_triangular(&self) -> Option<&MLTriangularOptions> {
         match self {
             OperatorOptions::Triangular(o) => Some(o),
-            _ => None,
-        }
-    }
-    pub fn as_expand(&self) -> Option<&MLExpandOptions> {
-        match self {
-            OperatorOptions::Expand(o) => Some(o),
             _ => None,
         }
     }

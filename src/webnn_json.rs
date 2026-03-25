@@ -376,19 +376,12 @@ pub fn from_graph_json(graph_json: &GraphJson) -> Result<GraphInfo, GraphError> 
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        // Convert options to attributes (tagged union) and build operator
         let attrs_value = serde_json::Value::Object(node.options.clone());
-        let attributes = crate::operator_options::OperatorOptions::from_json_with_op_type(
-            &node.op,
-            &attrs_value,
-        )
-        .unwrap_or_default();
-
-        let operator = Operation::from_operator_options(
+        let operator = Operation::from_json_attributes(
             &node.op,
             &input_operands,
-            &attributes,
             &output_operand_ids,
+            &attrs_value,
         )
         .expect("unknown op type in JSON");
 
@@ -509,8 +502,8 @@ fn infer_output_shapes(graph: &mut GraphInfo) -> Result<(), GraphError> {
             // Normalize tile inputs: if shape rank is missing, set to repeats length (filled with 1s)
             if op_type == "tile"
                 && let Some(repeats_len) = match &op {
-                    Operation::Tile { options, .. } => {
-                        options.as_ref().map(|o| o.repetitions.len())
+                    Operation::Tile { repetitions, .. } => {
+                        (!repetitions.is_empty()).then_some(repetitions.len())
                     }
                     _ => None,
                 }
@@ -571,8 +564,8 @@ fn infer_output_shapes(graph: &mut GraphInfo) -> Result<(), GraphError> {
                         Some(hidden_state_shape.clone())
                     } else if let Some(input_shape) = input_shapes.first() {
                         let hidden_size = match &op {
-                            Operation::GruCell { options, .. } => {
-                                options.as_ref().and_then(|o| o.hidden_size)
+                            Operation::GruCell { hidden_size, .. } => {
+                                (*hidden_size > 0).then_some(*hidden_size)
                             }
                             _ => None,
                         };
@@ -586,110 +579,42 @@ fn infer_output_shapes(graph: &mut GraphInfo) -> Result<(), GraphError> {
                     }
                 }
 
-                // Concat
                 "concat" => {
-                    let axis_u32 = {
-                        let axis_i64 = match &op {
-                            Operation::Concat { options, .. } => {
-                                options.as_ref().map(|o| o.axis as i64)
-                            }
-                            _ => None,
-                        };
-                        if let Some(axis) = axis_i64 {
-                            // Convert to u32, handling negative indices
-                            if axis < 0 {
-                                // Negative index: convert relative to rank
-                                if !input_shapes.is_empty() {
-                                    let rank = input_shapes[0].len() as i64;
-                                    if axis + rank >= 0 {
-                                        Some((axis + rank) as u32)
-                                    } else {
-                                        None // Invalid negative index
-                                    }
-                                } else {
-                                    None
-                                }
-                            } else {
-                                Some(axis as u32)
-                            }
-                        } else {
-                            None
-                        }
+                    let axis_val = match &op {
+                        Operation::Concat { axis, .. } => *axis,
+                        _ => 0,
                     };
-
-                    if let Some(axis_val) = axis_u32 {
-                        if input_shapes.iter().all(|s| s.is_empty()) && axis_val == 0 {
-                            Some(vec![Dimension::Static(input_shapes.len() as u32)])
-                        } else {
-                            infer_concat_shape_dimensions(&input_shapes, axis_val).ok()
-                        }
+                    if input_shapes.iter().all(|s| s.is_empty()) && axis_val == 0 {
+                        Some(vec![Dimension::Static(input_shapes.len() as u32)])
                     } else {
-                        None
+                        infer_concat_shape_dimensions(&input_shapes, axis_val).ok()
                     }
                 }
 
-                // Expand: use axes for unsqueeze-style or newShape for broadcast
-                // Only use axes path when axes is non-empty; otherwise use newShape (default axes is []).
+                // Expand: `newShape` is a method argument (see expand() in the WebNN spec).
                 "expand" => {
                     if input_shapes.len() == 1 {
-                        let (axes_opt, new_shape_opt) = match &op {
-                            Operation::Expand { options, .. } => options
-                                .as_ref()
-                                .map(|o| {
-                                    let axes: Vec<i64> = o.axes.iter().map(|&u| u as i64).collect();
-                                    let new_shape: Vec<Dimension> = o
-                                        .new_shape
-                                        .iter()
-                                        .map(|d| Dimension::from(d.clone()))
-                                        .collect();
-                                    (
-                                        if axes.is_empty() { None } else { Some(axes) },
-                                        if new_shape.is_empty() {
-                                            None
-                                        } else {
-                                            Some(new_shape)
-                                        },
-                                    )
-                                })
-                                .unwrap_or((None, None)),
-                            _ => (None, None),
+                        let new_shape_opt: Option<Vec<Dimension>> = match &op {
+                            Operation::Expand { new_shape, .. } if !new_shape.is_empty() => Some(
+                                new_shape
+                                    .iter()
+                                    .map(|d| Dimension::from(d.clone()))
+                                    .collect(),
+                            ),
+                            _ => None,
                         };
-                        if let Some(axes) = axes_opt
-                            && !axes.is_empty()
-                        {
-                            let rank = input_shapes[0].len() as i64;
-                            let mut normalized = Vec::with_capacity(axes.len());
-                            let mut valid = true;
-                            for axis in axes {
-                                let mut axis = axis;
-                                if axis < 0 {
-                                    axis += rank + 1;
-                                }
-                                if axis < 0 || axis > rank {
-                                    valid = false;
-                                    break;
-                                }
-                                normalized.push(axis as u32);
-                            }
-                            if valid {
-                                infer_unsqueeze_shape_dimensions(&input_shapes[0], &normalized).ok()
-                            } else {
-                                None
-                            }
-                        } else if let Some(new_shape) = new_shape_opt {
+                        new_shape_opt.and_then(|new_shape| {
                             infer_expand_shape_dimensions(&input_shapes[0], &new_shape).ok()
-                        } else {
-                            None
-                        }
+                        })
                     } else {
                         None
                     }
                 }
 
-                // Reshape - use newShape from operator options if available
+                // Reshape - use newShape from the operation (builder method argument).
                 "reshape" => match &op {
-                    Operation::Reshape { options, .. } => options.as_ref().map(|o| {
-                        o.new_shape
+                    Operation::Reshape { new_shape, .. } => (!new_shape.is_empty()).then(|| {
+                        new_shape
                             .iter()
                             .map(|d| Dimension::from(d.clone()))
                             .collect::<Vec<_>>()
@@ -845,26 +770,25 @@ fn infer_output_shapes(graph: &mut GraphInfo) -> Result<(), GraphError> {
                     }
                 }
 
-                // Slice: use starts/sizes from operator options (WebNN slice has no axes/ends/steps)
+                // Slice: starts/sizes are operation parameters (not MLSliceOptions).
                 "slice" => {
                     if let Some(input_shape) = input_shapes.first() {
                         match &op {
-                            Operation::Slice { options, .. } => options.as_ref().and_then(|opts| {
-                                if opts.starts.is_empty() || opts.sizes.is_empty() {
-                                    return None;
-                                }
-                                let sizes_u32 = opts.sizes_static_or_max();
-                                if opts.starts.len() != sizes_u32.len() {
-                                    return None;
-                                }
-                                let mut output = input_shape.clone();
-                                for (i, &sz) in sizes_u32.iter().enumerate() {
-                                    if i < output.len() {
-                                        output[i] = Dimension::Static(sz);
+                            Operation::Slice { starts, sizes, .. } => {
+                                if starts.is_empty() || sizes.is_empty() {
+                                    None
+                                } else if starts.len() != sizes.len() {
+                                    None
+                                } else {
+                                    let mut output = input_shape.clone();
+                                    for (i, sz) in sizes.iter().enumerate() {
+                                        if i < output.len() {
+                                            output[i] = Dimension::Static(sz.static_or_max());
+                                        }
                                     }
+                                    Some(output)
                                 }
-                                Some(output)
-                            }),
+                            }
                             _ => None,
                         }
                     } else {
@@ -918,9 +842,13 @@ fn infer_output_shapes(graph: &mut GraphInfo) -> Result<(), GraphError> {
                         _ => None,
                     },
                     "cast" => match &op {
-                        Operation::Cast { options, .. } => options
-                            .as_ref()
-                            .and_then(|o| parse_dtype(&serde_json::Value::String(o.to.clone()))),
+                        Operation::Cast { to, .. } => {
+                            if to.is_empty() {
+                                None
+                            } else {
+                                parse_dtype(&serde_json::Value::String(to.clone()))
+                            }
+                        }
                         _ => None,
                     },
                     "dequantizelinear" => input_types.get(1).cloned().or(Some(DataType::Float32)),

@@ -17,15 +17,13 @@
  */
 //! Convert WPT graph description to rustnn GraphInfo and prepare ONNX inputs.
 //!
-//! Operations are built as [`rustnn::operators::Operation`] with [`rustnn::operator_options::OperatorOptions`]:
-//! options are deserialized via [`OperatorOptions::from_json_with_op_type`], then operands are wired with
-//! [`Operation::from_operator_options`] (WebNN camelCase op names, as in JSON).
+//! Operations are built with [`rustnn::operators::Operation::from_json_attributes`]: one JSON attributes
+//! object per op (WebNN camelCase names) plus operand wiring.
 
 use rustnn::graph::{
     ConstantData, DataType, GraphInfo, Operand, OperandDescriptor, OperandKind,
     get_static_or_max_size, to_dimension_vector,
 };
-use rustnn::operator_options::OperatorOptions;
 use rustnn::operators::Operation;
 #[cfg(feature = "onnx-runtime")]
 use rustnn::{OnnxInput, TensorData};
@@ -33,32 +31,6 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use super::wpt_types::{WptGraph, WptOperator, WptTensorSpec};
-
-/// Build an [`Operation`] from WebNN JSON op name (camelCase), ordered operand ids, typed options,
-/// and output operand ids for this operation.
-fn operator_from_wpt_parts(
-    webnn_op_type: &str,
-    operand_ids: &[u32],
-    operator_options: &OperatorOptions,
-    output_ids: &[u32],
-) -> Result<Operation, String> {
-    Operation::from_operator_options(webnn_op_type, operand_ids, operator_options, output_ids)
-        .ok_or_else(|| {
-            format!(
-                "unsupported WPT op or operand layout for Operation::from_operator_options: {webnn_op_type} (operands: {operand_ids:?})"
-            )
-        })
-}
-
-/// Deserialize attributes map using the WebNN camelCase operation name expected by
-/// [`rustnn::operator_options::OperatorOptions`].
-fn operator_options_from_wpt_attrs(
-    webnn_op_type: &str,
-    attributes: serde_json::Map<String, serde_json::Value>,
-) -> OperatorOptions {
-    let attrs_value = serde_json::Value::Object(attributes);
-    OperatorOptions::from_json_with_op_type(webnn_op_type, &attrs_value).unwrap_or_default()
-}
 
 /// WPT camelCase operation name to rustnn snake_case op_type (matches Python method_name_map).
 fn wpt_op_name_to_rustnn(name: &str) -> String {
@@ -874,13 +846,6 @@ pub fn wpt_graph_to_graph_info(graph: &WptGraph) -> Result<(GraphInfo, Vec<Strin
             if !ordered.is_empty() {
                 input_ids = ordered;
             }
-            // When exactly one of scale/bias is provided, set hasScale/hasBias for converter disambiguation.
-            let has_scale = args.get("scale").and_then(|v| v.as_str()).is_some();
-            let has_bias = args.get("bias").and_then(|v| v.as_str()).is_some();
-            if has_scale ^ has_bias {
-                attributes.insert("hasScale".to_string(), serde_json::Value::Bool(has_scale));
-                attributes.insert("hasBias".to_string(), serde_json::Value::Bool(has_bias));
-            }
         }
         // conv2d / conv_transpose2d: only input and filter are positional; bias is in options.
         if op_type == "conv2d" || op_type == "conv_transpose2d" {
@@ -929,8 +894,8 @@ pub fn wpt_graph_to_graph_info(graph: &WptGraph) -> Result<(GraphInfo, Vec<Strin
             output_ids.push(id);
         }
 
-        // WebNN JSON / OperatorOptions::from_json_with_op_type expect camelCase op names.
-        // Internal control flow uses snake_case `op_type`; map back for typed options + Operation.
+        // WebNN JSON / Operation::from_json_attributes expect camelCase op names.
+        // Internal control flow uses snake_case `op_type`; map back for deserialization.
         let webnn_op_type = match op_type.as_str() {
             "batch_normalization" => "batchNormalization",
             "instance_normalization" => "instanceNormalization",
@@ -971,9 +936,13 @@ pub fn wpt_graph_to_graph_info(graph: &WptGraph) -> Result<(GraphInfo, Vec<Strin
             "label".to_string(),
             serde_json::Value::String(format!("{}_op", op.name)),
         );
-        let operator_options = operator_options_from_wpt_attrs(webnn_op_type, attributes);
-        let operator =
-            operator_from_wpt_parts(webnn_op_type, &input_ids, &operator_options, &output_ids)?;
+        let attrs_value = serde_json::Value::Object(attributes);
+        let operator = Operation::from_json_attributes(webnn_op_type, &input_ids, &output_ids, &attrs_value)
+            .ok_or_else(|| {
+                format!(
+                    "unsupported WPT op or operand layout for Operation::from_json_attributes: {webnn_op_type} (operands: {input_ids:?})"
+                )
+            })?;
         operations.push(operator);
     }
 
