@@ -6191,7 +6191,7 @@ impl TrtxConverter {
                 reason: format!("Input operand {} not found", operation.input_operands()[0]),
             })?;
 
-        let (beginning_padding, ending_padding, opts) = match operation {
+        let (beginning_padding, ending_padding, _opts) = match operation {
             Operation::Pad {
                 beginning_padding,
                 ending_padding,
@@ -8532,7 +8532,8 @@ impl TrtxConverter {
                 reason: format!("Input operand {} not found", operation.input_operands()[0]),
             })?;
 
-        let cum_opts = operation.attributes().as_cumulative_sum();
+        let attrs = operation.attributes();
+        let cum_opts = attrs.as_cumulative_sum();
         let axis = match operation {
             Operation::CumulativeSum { axis, .. } => *axis as usize,
             _ => 0,
