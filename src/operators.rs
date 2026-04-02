@@ -1303,10 +1303,8 @@ impl Operation {
                 obj.insert("axis".to_string(), serde_json::json!(axis));
             }
             Operation::Expand { new_shape, .. } => {
-                if !new_shape.is_empty() {
-                    if let Ok(v) = serde_json::to_value(new_shape) {
-                        obj.insert("newShape".to_string(), v);
-                    }
+                if !new_shape.is_empty() && let Ok(v) = serde_json::to_value(new_shape) {
+                    obj.insert("newShape".to_string(), v);
                 }
             }
             Operation::Gather {
@@ -1366,10 +1364,8 @@ impl Operation {
                 }
             }
             Operation::Reshape { new_shape, .. } => {
-                if !new_shape.is_empty() {
-                    if let Ok(val) = serde_json::to_value(new_shape) {
-                        obj.insert("newShape".to_string(), val);
-                    }
+                if !new_shape.is_empty() && let Ok(val) = serde_json::to_value(new_shape) {
+                    obj.insert("newShape".to_string(), val);
                 }
             }
             _ => {}

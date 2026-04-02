@@ -10,8 +10,8 @@
 mod tests {
     use rustnn::converters::{GraphConverter, TrtxConverter};
     use rustnn::graph::{
-        get_static_or_max_size, to_dimension_vector, ConstantData, DataType, GraphInfo, Operand,
-        OperandDescriptor, OperandKind,
+        ConstantData, DataType, GraphInfo, Operand, OperandDescriptor, OperandKind,
+        get_static_or_max_size, to_dimension_vector,
     };
     use rustnn::operator_options::MLConv2dOptions;
     use rustnn::operators::Operation;

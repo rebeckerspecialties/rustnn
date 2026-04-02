@@ -775,9 +775,10 @@ fn infer_output_shapes(graph: &mut GraphInfo) -> Result<(), GraphError> {
                     if let Some(input_shape) = input_shapes.first() {
                         match &op {
                             Operation::Slice { starts, sizes, .. } => {
-                                if starts.is_empty() || sizes.is_empty() {
-                                    None
-                                } else if starts.len() != sizes.len() {
+                                if starts.is_empty()
+                                    || sizes.is_empty()
+                                    || starts.len() != sizes.len()
+                                {
                                     None
                                 } else {
                                     let mut output = input_shape.clone();
