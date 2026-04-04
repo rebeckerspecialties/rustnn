@@ -31,10 +31,11 @@ use crate::executors::trtx::{create_trtx_logger, ensure_trtx_loaded};
 use crate::graph::{DataType, GraphInfo, OperandKind, get_static_or_max_size};
 use crate::operator_options::MLDimension;
 use crate::operators::Operation;
-use trtx::network::Layer;
+use crate::shape_inference::infer_arg_reduce_shape;
 use trtx::{
-    ActivationType, DataType as TrtDataType, ElementWiseOperation, PoolingType, ReduceOperation,
-    ResizeMode, ScatterMode, UnaryOperation,
+    ActivationType, Axes, DataType as TrtDataType, ElementWiseOperation, MatrixOperation,
+    OwnedConvWeights, OwnedWeights, PoolingType, ReduceOperation, ResizeMode, ScatterMode,
+    TopKOperation, UnaryOperation,
 };
 
 /// TensorRT native converter
@@ -44,6 +45,11 @@ impl TrtxConverter {
     /// Create a new TrtxConverter
     pub fn new() -> Self {
         TrtxConverter
+    }
+
+    #[inline]
+    fn trtx_dims_i64(dims: &[i32]) -> Vec<i64> {
+        dims.iter().map(|&d| d as i64).collect()
     }
 
     /// Map WebNN DataType to TensorRT DataType enum.
@@ -222,10 +228,10 @@ impl TrtxConverter {
     }
 
     /// Cast Float32 tensor to BOOL (0.0 → false, non-zero → true)
-    fn cast_to_bool(
-        network: &mut trtx::NetworkDefinition,
-        input: &trtx::Tensor,
-    ) -> Result<trtx::Tensor, GraphError> {
+    fn cast_to_bool<'a>(
+        network: &mut trtx::NetworkDefinition<'a>,
+        input: &trtx::Tensor<'a>,
+    ) -> Result<trtx::Tensor<'a>, GraphError> {
         let layer = network.add_cast(input, TrtDataType::kBOOL).map_err(|e| {
             GraphError::ConversionFailed {
                 format: "trtx".to_string(),
@@ -233,7 +239,7 @@ impl TrtxConverter {
             }
         })?;
         layer
-            .get_output(0)
+            .get_output(&*network, 0)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get cast output: {}", e),
@@ -241,10 +247,10 @@ impl TrtxConverter {
     }
 
     /// Cast BOOL tensor to Float32 (false → 0.0, true → 1.0)
-    fn cast_to_float32(
-        network: &mut trtx::NetworkDefinition,
-        input: &trtx::Tensor,
-    ) -> Result<trtx::Tensor, GraphError> {
+    fn cast_to_float32<'a>(
+        network: &mut trtx::NetworkDefinition<'a>,
+        input: &trtx::Tensor<'a>,
+    ) -> Result<trtx::Tensor<'a>, GraphError> {
         let layer = network.add_cast(input, TrtDataType::kFLOAT).map_err(|e| {
             GraphError::ConversionFailed {
                 format: "trtx".to_string(),
@@ -252,7 +258,7 @@ impl TrtxConverter {
             }
         })?;
         layer
-            .get_output(0)
+            .get_output(&*network, 0)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get cast output: {}", e),
@@ -260,10 +266,10 @@ impl TrtxConverter {
     }
 
     /// Cast tensor to Float16 (e.g. after float32 reduction to avoid float16 overflow).
-    fn cast_to_float16(
-        network: &mut trtx::NetworkDefinition,
-        input: &trtx::Tensor,
-    ) -> Result<trtx::Tensor, GraphError> {
+    fn cast_to_float16<'a>(
+        network: &mut trtx::NetworkDefinition<'a>,
+        input: &trtx::Tensor<'a>,
+    ) -> Result<trtx::Tensor<'a>, GraphError> {
         let layer = network.add_cast(input, TrtDataType::kHALF).map_err(|e| {
             GraphError::ConversionFailed {
                 format: "trtx".to_string(),
@@ -271,7 +277,7 @@ impl TrtxConverter {
             }
         })?;
         layer
-            .get_output(0)
+            .get_output(&*network, 0)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get cast output: {}", e),
@@ -279,10 +285,10 @@ impl TrtxConverter {
     }
 
     /// Cast INT32 tensor to Float32
-    fn cast_int32_to_float32(
-        network: &mut trtx::NetworkDefinition,
-        input: &trtx::Tensor,
-    ) -> Result<trtx::Tensor, GraphError> {
+    fn cast_int32_to_float32<'a>(
+        network: &mut trtx::NetworkDefinition<'a>,
+        input: &trtx::Tensor<'a>,
+    ) -> Result<trtx::Tensor<'a>, GraphError> {
         let layer = network.add_cast(input, TrtDataType::kFLOAT).map_err(|e| {
             GraphError::ConversionFailed {
                 format: "trtx".to_string(),
@@ -290,21 +296,21 @@ impl TrtxConverter {
             }
         })?;
         layer
-            .get_output(0)
+            .get_output(&*network, 0)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get cast output: {}", e),
             })
     }
 
-    /// Build TensorRT network from WebNN graph
-    /// Returns temporary weight storage that must be kept alive until engine is serialized
-    fn build_network(
-        graph: &GraphInfo,
-        network: &mut trtx::NetworkDefinition,
-    ) -> Result<Vec<Vec<u8>>, GraphError> {
-        let mut tensor_map: HashMap<u32, trtx::Tensor> = HashMap::new();
-        let mut temp_weights: Vec<Vec<u8>> = Vec::new(); // Storage for temporary constants
+    /// Build TensorRT network from WebNN graph.
+    /// `temp_weights` must be supplied by the caller and kept alive until engine serialization completes.
+    fn build_network<'a>(
+        graph: &'a GraphInfo,
+        network: &mut trtx::NetworkDefinition<'a>,
+        temp_weights: &mut Vec<Vec<u8>>,
+    ) -> Result<(), GraphError> {
+        let mut tensor_map: HashMap<u32, trtx::Tensor<'a>> = HashMap::new();
         let promoted_constants: HashSet<u32> = HashSet::new();
         let constants_stored_flat: HashSet<u32> = HashSet::new();
 
@@ -312,15 +318,15 @@ impl TrtxConverter {
         for (operand_id, operand) in graph.operands.iter().enumerate() {
             if operand.kind == OperandKind::Input {
                 let dtype = Self::webnn_to_trt_dtype(operand.descriptor.data_type)?;
-                let dims: Vec<i32> = operand
+                let dims: Vec<i64> = operand
                     .descriptor
                     .shape
                     .iter()
-                    .map(|d| get_static_or_max_size(d) as i32)
+                    .map(|d| get_static_or_max_size(d) as i64)
                     .collect();
                 let name = operand.name.as_deref().unwrap_or("input");
 
-                let mut tensor = network.add_input(name, dtype, &dims).map_err(|e| {
+                let tensor = network.add_input(name, dtype, &dims).map_err(|e| {
                     GraphError::ConversionFailed {
                         format: "trtx".to_string(),
                         reason: format!("Failed to add input {}: {}", name, e),
@@ -328,7 +334,7 @@ impl TrtxConverter {
                 })?;
 
                 tensor
-                    .set_name(name)
+                    .set_name(network, name)
                     .map_err(|e| GraphError::ConversionFailed {
                         format: "trtx".to_string(),
                         reason: format!("Failed to set input name: {}", e),
@@ -388,44 +394,36 @@ impl TrtxConverter {
                 // TensorRT add_constant does not support kINT64; convert Int64 constants to Int32.
                 let promote_int64 = operand.descriptor.data_type == DataType::Int64;
 
-                let (trt_dtype, data_to_use, add_dims): (TrtDataType, &[u8], Vec<i32>) =
-                    if use_int8_constant {
-                        // Pass raw bytes; type kINT8 (Uint8 same bits for 0/1, no conversion)
-                        (TrtDataType::kINT8, data, dims.clone())
-                    } else if promote_int64 {
-                        let int32_bytes: Vec<u8> = data
-                            .chunks_exact(8)
-                            .flat_map(|chunk| {
-                                (i64::from_le_bytes(chunk.try_into().unwrap()) as i32).to_le_bytes()
-                            })
-                            .collect();
-                        temp_weights.push(int32_bytes);
-                        (
-                            TrtDataType::kINT32,
-                            temp_weights.last().unwrap().as_slice(),
-                            dims.clone(),
-                        )
-                    } else {
-                        (
-                            Self::webnn_to_trt_dtype(operand.descriptor.data_type)?,
-                            data,
-                            dims.clone(),
-                        )
-                    };
+                let add_dims: Vec<i64> = dims.iter().map(|&d| d as i64).collect();
+                let layer = if use_int8_constant {
+                    network.add_small_constant_copied(&add_dims, data, TrtDataType::kINT8)
+                } else if promote_int64 {
+                    let int32_bytes: Vec<u8> = data
+                        .chunks_exact(8)
+                        .flat_map(|chunk| {
+                            (i64::from_le_bytes(chunk.try_into().unwrap()) as i32).to_le_bytes()
+                        })
+                        .collect();
+                    network.add_small_constant_copied(&add_dims, &int32_bytes, TrtDataType::kINT32)
+                } else {
+                    network.add_constant(
+                        &add_dims,
+                        data,
+                        Self::webnn_to_trt_dtype(operand.descriptor.data_type)?,
+                    )
+                }
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to add constant (operand {}): {}", operand_id, e),
+                })?;
 
-                let layer = network
-                    .add_constant(&add_dims, data_to_use, trt_dtype)
-                    .map_err(|e| GraphError::ConversionFailed {
-                        format: "trtx".to_string(),
-                        reason: format!("Failed to add constant (operand {}): {}", operand_id, e),
-                    })?;
-
-                let tensor = layer
-                    .get_output(0)
-                    .map_err(|e| GraphError::ConversionFailed {
-                        format: "trtx".to_string(),
-                        reason: format!("Failed to get constant layer output: {}", e),
-                    })?;
+                let tensor =
+                    layer
+                        .get_output(&*network, 0)
+                        .map_err(|e| GraphError::ConversionFailed {
+                            format: "trtx".to_string(),
+                            reason: format!("Failed to get constant layer output: {}", e),
+                        })?;
 
                 tensor_map.insert(operand_id as u32, tensor);
             }
@@ -437,7 +435,7 @@ impl TrtxConverter {
                 graph,
                 network,
                 &mut tensor_map,
-                &mut temp_weights,
+                temp_weights,
                 &promoted_constants,
                 &constants_stored_flat,
                 operation,
@@ -456,30 +454,21 @@ impl TrtxConverter {
 
                 // Set the output tensor name if available
                 if let Some(name) = &operand.name {
-                    let _ = tensor.set_name(name); // Ignore error if name setting fails
+                    let _ = tensor.set_name(network, name); // Ignore error if name setting fails
                 }
 
-                network
-                    .mark_output(tensor)
-                    .map_err(|e| GraphError::ConversionFailed {
-                        format: "trtx".to_string(),
-                        reason: format!(
-                            "Failed to mark output {}: {}",
-                            operand.name.as_deref().unwrap_or("unnamed"),
-                            e
-                        ),
-                    })?;
+                network.mark_output(tensor);
             }
         }
 
-        Ok(temp_weights)
+        Ok(())
     }
 
     /// Add a single operation to the network
-    fn add_operation(
-        graph: &GraphInfo,
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+    fn add_operation<'a>(
+        graph: &'a GraphInfo,
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         temp_weights: &mut Vec<Vec<u8>>,
         promoted_constants: &HashSet<u32>,
         constants_stored_flat: &HashSet<u32>,
@@ -611,9 +600,9 @@ impl TrtxConverter {
             "gemm" => Self::add_gemm_op(graph, network, tensor_map, temp_weights, operation)?,
 
             // Convolution operations
-            "conv2d" => Self::add_conv2d_op(graph, network, tensor_map, temp_weights, operation)?,
+            "conv2d" => Self::add_conv2d_op(graph, network, tensor_map, operation)?,
             "convTranspose2d" => {
-                Self::add_conv_transpose2d_op(graph, network, tensor_map, temp_weights, operation)?
+                Self::add_conv_transpose2d_op(graph, network, tensor_map, operation)?
             }
 
             // Pooling operations
@@ -734,8 +723,8 @@ impl TrtxConverter {
             "gatherND" => Self::add_gather_nd_op(network, tensor_map, operation)?,
             "scatterElements" => Self::add_scatter_elements_op(network, tensor_map, operation)?,
             "scatterND" => Self::add_scatter_nd_op(network, tensor_map, operation)?,
-            "argMax" => Self::add_arg_max_op(network, tensor_map, operation)?,
-            "argMin" => Self::add_arg_min_op(network, tensor_map, operation)?,
+            "argMax" => Self::add_arg_max_op(graph, network, tensor_map, operation)?,
+            "argMin" => Self::add_arg_min_op(graph, network, tensor_map, operation)?,
 
             // Other operations
             "clamp" => Self::add_clamp_op(graph, network, tensor_map, operation, temp_weights)?,
@@ -745,17 +734,13 @@ impl TrtxConverter {
             "softmax" => Self::add_softmax_op(network, tensor_map, operation)?,
             "concat" => Self::add_concat_op(network, tensor_map, operation)?,
             "isNaN" => Self::add_is_nan_op(network, tensor_map, operation)?,
-            "isInfinite" => Self::add_is_infinite_op(network, tensor_map, operation, temp_weights)?,
+            "isInfinite" => Self::add_is_infinite_op(network, tensor_map, operation)?,
             "roundEven" => Self::add_round_even_op(network, tensor_map, operation)?,
             "gatherElements" => Self::add_gather_elements_op(network, tensor_map, operation)?,
             "l2Pool2d" => Self::add_l2_pool2d_op(network, tensor_map, operation)?,
             "reverse" => Self::add_reverse_op(graph, network, tensor_map, operation)?,
-            "cumulativeSum" => {
-                Self::add_cumulative_sum_op(graph, network, tensor_map, operation, temp_weights)?
-            }
-            "triangular" => {
-                Self::add_triangular_op(graph, network, tensor_map, operation, temp_weights)?
-            }
+            "cumulativeSum" => Self::add_cumulative_sum_op(graph, network, tensor_map, operation)?,
+            "triangular" => Self::add_triangular_op(graph, network, tensor_map, operation)?,
             "transpose" => Self::add_transpose_op(graph, network, tensor_map, operation)?,
             "reshape" => Self::add_reshape_op(graph, network, tensor_map, operation)?,
             "resample2d" => Self::add_resample2d_op(network, tensor_map, operation)?,
@@ -775,15 +760,15 @@ impl TrtxConverter {
 
     /// Helper to ensure two tensors have compatible shapes for elementwise operations
     /// Returns potentially reshaped tensors that are guaranteed to be broadcast-compatible
-    fn ensure_broadcast_compatible(
-        network: &mut trtx::NetworkDefinition,
-        tensor0: &trtx::Tensor,
-        tensor1: &trtx::Tensor,
+    fn ensure_broadcast_compatible<'a>(
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor0: &trtx::Tensor<'a>,
+        tensor1: &trtx::Tensor<'a>,
         op_name: &str,
-    ) -> Result<(trtx::Tensor, trtx::Tensor), GraphError> {
+    ) -> Result<(trtx::Tensor<'a>, trtx::Tensor<'a>), GraphError> {
         // Get dimensions of both tensors
         let dims0 = tensor0
-            .dimensions()
+            .dimensions(&*network)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!(
@@ -793,7 +778,7 @@ impl TrtxConverter {
             })?;
 
         let dims1 = tensor1
-            .dimensions()
+            .dimensions(&*network)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!(
@@ -812,7 +797,7 @@ impl TrtxConverter {
                     reason: format!("Failed to clone tensor0: {}", e),
                 })?;
             let t0 = id0
-                .get_output(0)
+                .get_output(&*network, 0)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("Failed to get identity output: {}", e),
@@ -825,7 +810,7 @@ impl TrtxConverter {
                     reason: format!("Failed to clone tensor1: {}", e),
                 })?;
             let t1 = id1
-                .get_output(0)
+                .get_output(&*network, 0)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("Failed to get identity output: {}", e),
@@ -864,7 +849,7 @@ impl TrtxConverter {
                             reason: format!("Failed to clone tensor0: {}", e),
                         })?;
                 let t0 = id0
-                    .get_output(0)
+                    .get_output(&*network, 0)
                     .map_err(|e| GraphError::ConversionFailed {
                         format: "trtx".to_string(),
                         reason: format!("Failed to get identity output: {}", e),
@@ -878,7 +863,7 @@ impl TrtxConverter {
                             reason: format!("Failed to clone tensor1: {}", e),
                         })?;
                 let t1 = id1
-                    .get_output(0)
+                    .get_output(&*network, 0)
                     .map_err(|e| GraphError::ConversionFailed {
                         format: "trtx".to_string(),
                         reason: format!("Failed to get identity output: {}", e),
@@ -903,15 +888,10 @@ impl TrtxConverter {
                             reason: format!("Failed to add resize layer for tensor0: {}", e),
                         })?;
 
-                resize_layer.set_output_dimensions(&dims1).map_err(|e| {
-                    GraphError::ConversionFailed {
-                        format: "trtx".to_string(),
-                        reason: format!("Failed to set output dimensions: {}", e),
-                    }
-                })?;
+                resize_layer.set_output_dimensions(network, &dims1);
 
                 resize_layer
-                    .get_output(0)
+                    .get_output(&*network, 0)
                     .map_err(|e| GraphError::ConversionFailed {
                         format: "trtx".to_string(),
                         reason: format!("Failed to get resize output: {}", e),
@@ -924,10 +904,11 @@ impl TrtxConverter {
                             format: "trtx".to_string(),
                             reason: format!("Failed to clone tensor0: {}", e),
                         })?;
-                id.get_output(0).map_err(|e| GraphError::ConversionFailed {
-                    format: "trtx".to_string(),
-                    reason: format!("Failed to get identity output: {}", e),
-                })?
+                id.get_output(&*network, 0)
+                    .map_err(|e| GraphError::ConversionFailed {
+                        format: "trtx".to_string(),
+                        reason: format!("Failed to get identity output: {}", e),
+                    })?
             };
 
             let t1 = if dims1
@@ -944,15 +925,10 @@ impl TrtxConverter {
                             reason: format!("Failed to add resize layer for tensor1: {}", e),
                         })?;
 
-                resize_layer.set_output_dimensions(&dims0).map_err(|e| {
-                    GraphError::ConversionFailed {
-                        format: "trtx".to_string(),
-                        reason: format!("Failed to set output dimensions: {}", e),
-                    }
-                })?;
+                resize_layer.set_output_dimensions(network, &dims0);
 
                 resize_layer
-                    .get_output(0)
+                    .get_output(&*network, 0)
                     .map_err(|e| GraphError::ConversionFailed {
                         format: "trtx".to_string(),
                         reason: format!("Failed to get resize output: {}", e),
@@ -965,10 +941,11 @@ impl TrtxConverter {
                             format: "trtx".to_string(),
                             reason: format!("Failed to clone tensor1: {}", e),
                         })?;
-                id.get_output(0).map_err(|e| GraphError::ConversionFailed {
-                    format: "trtx".to_string(),
-                    reason: format!("Failed to get identity output: {}", e),
-                })?
+                id.get_output(&*network, 0)
+                    .map_err(|e| GraphError::ConversionFailed {
+                        format: "trtx".to_string(),
+                        reason: format!("Failed to get identity output: {}", e),
+                    })?
             };
 
             return Ok((t0, t1));
@@ -982,22 +959,24 @@ impl TrtxConverter {
             (tensor1, tensor0, false)
         };
 
-        let reshape_dims = to_reshape
-            .dimensions()
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get reshape dims: {}", e),
-            })?;
-        let target_dims = to_keep
-            .dimensions()
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get target dims: {}", e),
-            })?;
+        let reshape_dims =
+            to_reshape
+                .dimensions(&*network)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get reshape dims: {}", e),
+                })?;
+        let target_dims =
+            to_keep
+                .dimensions(&*network)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get target dims: {}", e),
+                })?;
 
         // Pad smaller tensor with leading 1s
         let rank_diff = target_dims.len() - reshape_dims.len();
-        let mut new_shape: Vec<i32> = vec![1; rank_diff];
+        let mut new_shape: Vec<i64> = vec![1i64; rank_diff];
         new_shape.extend_from_slice(&reshape_dims);
 
         let mut shuffle_layer =
@@ -1009,18 +988,19 @@ impl TrtxConverter {
                 })?;
 
         shuffle_layer
-            .set_reshape_dimensions(&new_shape)
+            .set_reshape_dimensions(network, &new_shape)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to set reshape dimensions: {}", e),
             })?;
 
-        let reshaped = shuffle_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get reshape output: {}", e),
-            })?;
+        let reshaped =
+            shuffle_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get reshape output: {}", e),
+                })?;
 
         // Clone the other tensor with identity
         let id_keep = network
@@ -1030,7 +1010,7 @@ impl TrtxConverter {
                 reason: format!("Failed to clone kept tensor: {}", e),
             })?;
         let kept = id_keep
-            .get_output(0)
+            .get_output(&*network, 0)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get identity output: {}", e),
@@ -1045,10 +1025,10 @@ impl TrtxConverter {
     }
 
     /// Add elementwise operation
-    fn add_elementwise_op(
+    fn add_elementwise_op<'a>(
         _graph: &GraphInfo,
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
         op_code: ElementWiseOperation,
     ) -> Result<(), GraphError> {
@@ -1079,7 +1059,7 @@ impl TrtxConverter {
 
         // Extract output tensor from layer
         let output = layer
-            .get_output(0)
+            .get_output(&*network, 0)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get layer output: {}", e),
@@ -1092,10 +1072,10 @@ impl TrtxConverter {
     }
 
     /// Add comparison operation (outputs BOOL, cast to Float32)
-    fn add_comparison_op(
+    fn add_comparison_op<'a>(
         _graph: &GraphInfo,
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
         op_code: ElementWiseOperation,
     ) -> Result<(), GraphError> {
@@ -1125,12 +1105,13 @@ impl TrtxConverter {
                 reason: format!("Failed to add comparison operation: {}", e),
             })?;
 
-        let bool_output = layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get layer output: {}", e),
-            })?;
+        let bool_output =
+            layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get layer output: {}", e),
+                })?;
 
         // Cast BOOL to Float32 for WebNN compatibility
         let output = Self::cast_to_float32(network, &bool_output)?;
@@ -1142,10 +1123,10 @@ impl TrtxConverter {
     }
 
     /// Add logical operation (cast Float32 to BOOL, perform operation, cast back to Float32)
-    fn add_logical_binary_op(
+    fn add_logical_binary_op<'a>(
         _graph: &GraphInfo,
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
         op_code: ElementWiseOperation,
     ) -> Result<(), GraphError> {
@@ -1179,12 +1160,13 @@ impl TrtxConverter {
                 reason: format!("Failed to add logical operation: {}", e),
             })?;
 
-        let bool_output = layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get layer output: {}", e),
-            })?;
+        let bool_output =
+            layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get layer output: {}", e),
+                })?;
 
         // Cast BOOL output back to Float32
         let output = Self::cast_to_float32(network, &bool_output)?;
@@ -1198,12 +1180,12 @@ impl TrtxConverter {
     /// Add logical NOT operation. TensorRT Unary(kNOT) requires Bool input.
     /// Quantized constants (kINT8) may only feed DQ/plugin; for UInt8/Int8 constant, add a kBOOL
     /// constant (0 -> false, non-zero -> true) and feed it directly to kNOT so no extra Cast is needed.
-    fn add_logical_not_op(
+    fn add_logical_not_op<'a>(
         graph: &GraphInfo,
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
-        temp_weights: &mut Vec<Vec<u8>>,
+        _temp_weights: &mut Vec<Vec<u8>>,
     ) -> Result<(), GraphError> {
         let input_id = operation.input_operands()[0];
         let input = tensor_map
@@ -1226,11 +1208,11 @@ impl TrtxConverter {
             match operand.descriptor.data_type {
                 DataType::Uint8 | DataType::Int8 => {
                     let data = Self::get_constant_data(graph, input_id)?;
-                    let shape: Vec<i32> = operand
+                    let shape: Vec<i64> = operand
                         .descriptor
                         .shape
                         .iter()
-                        .map(|d| get_static_or_max_size(d) as i32)
+                        .map(|d| get_static_or_max_size(d) as i64)
                         .collect();
                     let n: usize = operand
                         .descriptor
@@ -1243,20 +1225,18 @@ impl TrtxConverter {
                         .take(n)
                         .map(|&b| if b == 0 { 0u8 } else { 1u8 })
                         .collect();
-                    temp_weights.push(bool_bytes);
-                    let ref_bytes = temp_weights.last().unwrap().as_slice();
                     let const_layer = network
-                        .add_constant(&shape, ref_bytes, TrtDataType::kBOOL)
+                        .add_small_constant_copied(&shape, &bool_bytes, TrtDataType::kBOOL)
                         .map_err(|e| GraphError::ConversionFailed {
                             format: "trtx".to_string(),
                             reason: format!("LogicalNot: failed to add BOOL constant: {}", e),
                         })?;
-                    const_layer
-                        .get_output(0)
-                        .map_err(|e| GraphError::ConversionFailed {
+                    const_layer.get_output(&*network, 0).map_err(|e| {
+                        GraphError::ConversionFailed {
                             format: "trtx".to_string(),
                             reason: format!("LogicalNot: BOOL constant output: {}", e),
-                        })?
+                        }
+                    })?
                 }
                 _ => Self::cast_to_bool(network, input)?,
             }
@@ -1271,12 +1251,13 @@ impl TrtxConverter {
                 reason: format!("Failed to add logical NOT: {}", e),
             })?;
 
-        let not_output = layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get layer output: {}", e),
-            })?;
+        let not_output =
+            layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get layer output: {}", e),
+                })?;
 
         let output = Self::cast_to_float32(network, &not_output)?;
 
@@ -1287,9 +1268,9 @@ impl TrtxConverter {
     }
 
     /// Add activation operation
-    fn add_activation_op(
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+    fn add_activation_op<'a>(
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
         activation_type: ActivationType,
     ) -> Result<(), GraphError> {
@@ -1309,7 +1290,7 @@ impl TrtxConverter {
 
         // Extract output tensor from layer
         let output = layer
-            .get_output(0)
+            .get_output(&*network, 0)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get layer output: {}", e),
@@ -1324,12 +1305,12 @@ impl TrtxConverter {
     /// Add ELU activation: ELU(x) = x if x > 0, else alpha * (exp(x) - 1)
     /// TensorRT kELU uses alpha=1; for custom alpha we decompose as:
     /// relu(x) + alpha * min(0, exp(x) - 1)
-    fn add_elu_op(
+    fn add_elu_op<'a>(
         graph: &GraphInfo,
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
-        temp_weights: &mut Vec<Vec<u8>>,
+        _temp_weights: &mut Vec<Vec<u8>>,
     ) -> Result<(), GraphError> {
         let input = tensor_map
             .get(&operation.input_operands()[0])
@@ -1360,7 +1341,7 @@ impl TrtxConverter {
         }
 
         let num_dims = input_operand.descriptor.shape.len();
-        let broadcast_shape: Vec<i32> = vec![1; num_dims];
+        let broadcast_shape: Vec<i64> = vec![1i64; num_dims];
         let (trt_dtype, one_bytes, zero_bytes, alpha_bytes) = match input_dtype {
             DataType::Float16 => {
                 let one: Vec<u8> = f16::from_f32(1.0).to_bits().to_le_bytes().to_vec();
@@ -1383,12 +1364,13 @@ impl TrtxConverter {
                 format: "trtx".to_string(),
                 reason: format!("Failed to add relu for elu: {}", e),
             })?;
-        let relu_output = relu_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get relu output: {}", e),
-            })?;
+        let relu_output =
+            relu_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get relu output: {}", e),
+                })?;
 
         let exp_layer = network
             .add_unary(input, UnaryOperation::kEXP)
@@ -1396,30 +1378,27 @@ impl TrtxConverter {
                 format: "trtx".to_string(),
                 reason: format!("Failed to add exp for elu: {}", e),
             })?;
-        let exp_output = exp_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get exp output: {}", e),
-            })?;
+        let exp_output =
+            exp_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get exp output: {}", e),
+                })?;
 
-        temp_weights.push(one_bytes);
         let one_const = network
-            .add_constant(
-                &broadcast_shape,
-                temp_weights.last().unwrap(),
-                trt_dtype.clone(),
-            )
+            .add_small_constant_copied(&broadcast_shape, &one_bytes, trt_dtype.clone())
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to create one constant for elu: {}", e),
             })?;
-        let one_tensor = one_const
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get one constant output: {}", e),
-            })?;
+        let one_tensor =
+            one_const
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get one constant output: {}", e),
+                })?;
 
         let (bc_exp, bc_one) =
             Self::ensure_broadcast_compatible(network, &exp_output, &one_tensor, "elu_exp_sub")?;
@@ -1432,29 +1411,25 @@ impl TrtxConverter {
             })?;
         let exp_minus_1 =
             exp_minus_1_layer
-                .get_output(0)
+                .get_output(&*network, 0)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("Failed to get exp-1 output: {}", e),
                 })?;
 
-        temp_weights.push(zero_bytes);
         let zero_const = network
-            .add_constant(
-                &broadcast_shape,
-                temp_weights.last().unwrap(),
-                trt_dtype.clone(),
-            )
+            .add_small_constant_copied(&broadcast_shape, &zero_bytes, trt_dtype.clone())
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to create zero constant for elu: {}", e),
             })?;
-        let zero_tensor = zero_const
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get zero constant output: {}", e),
-            })?;
+        let zero_tensor =
+            zero_const
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get zero constant output: {}", e),
+                })?;
 
         let (bc_em1, bc_zero) =
             Self::ensure_broadcast_compatible(network, &exp_minus_1, &zero_tensor, "elu_min")?;
@@ -1465,30 +1440,27 @@ impl TrtxConverter {
                 format: "trtx".to_string(),
                 reason: format!("Failed to add min for elu: {}", e),
             })?;
-        let neg_part = neg_part_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get neg part output: {}", e),
-            })?;
+        let neg_part =
+            neg_part_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get neg part output: {}", e),
+                })?;
 
-        temp_weights.push(alpha_bytes);
         let alpha_const = network
-            .add_constant(
-                &broadcast_shape,
-                temp_weights.last().unwrap(),
-                trt_dtype.clone(),
-            )
+            .add_small_constant_copied(&broadcast_shape, &alpha_bytes, trt_dtype.clone())
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to create alpha constant for elu: {}", e),
             })?;
-        let alpha_tensor = alpha_const
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get alpha constant output: {}", e),
-            })?;
+        let alpha_tensor =
+            alpha_const
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get alpha constant output: {}", e),
+                })?;
 
         let (bc_neg, bc_alpha) =
             Self::ensure_broadcast_compatible(network, &neg_part, &alpha_tensor, "elu_scale")?;
@@ -1501,7 +1473,7 @@ impl TrtxConverter {
             })?;
         let scaled_neg =
             scaled_neg_layer
-                .get_output(0)
+                .get_output(&*network, 0)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("Failed to get scaled neg output: {}", e),
@@ -1516,12 +1488,13 @@ impl TrtxConverter {
                 format: "trtx".to_string(),
                 reason: format!("Failed to add elu parts: {}", e),
             })?;
-        let output = final_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get elu output: {}", e),
-            })?;
+        let output =
+            final_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get elu output: {}", e),
+                })?;
 
         let output_ids = operation.output_operands_slice();
         let output_id = output_ids[0];
@@ -1530,9 +1503,9 @@ impl TrtxConverter {
     }
 
     /// Add unary operation (element-wise mathematical operations)
-    fn add_unary_op(
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+    fn add_unary_op<'a>(
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
         unary_op: UnaryOperation,
     ) -> Result<(), GraphError> {
@@ -1553,7 +1526,7 @@ impl TrtxConverter {
 
         // Extract output tensor from layer
         let output = layer
-            .get_output(0)
+            .get_output(&*network, 0)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get layer output: {}", e),
@@ -1568,12 +1541,12 @@ impl TrtxConverter {
     /// Add leaky ReLU activation
     /// LeakyReLU(x) = max(alpha * x, x) = x if x >= 0, else alpha * x
     /// Implemented as: max(0, x) + alpha * min(0, x) so alpha is respected (including negative).
-    fn add_leaky_relu_op(
+    fn add_leaky_relu_op<'a>(
         graph: &GraphInfo,
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
-        temp_weights: &mut Vec<Vec<u8>>,
+        _temp_weights: &mut Vec<Vec<u8>>,
     ) -> Result<(), GraphError> {
         let input = tensor_map
             .get(&operation.input_operands()[0])
@@ -1598,7 +1571,7 @@ impl TrtxConverter {
                 ),
             })?;
         let num_dims = input_operand.descriptor.shape.len();
-        let broadcast_shape: Vec<i32> = vec![1; num_dims];
+        let broadcast_shape: Vec<i64> = vec![1i64; num_dims];
 
         let (alpha_bytes, alpha_dtype) = match input_operand.descriptor.data_type {
             DataType::Float16 => (
@@ -1607,21 +1580,19 @@ impl TrtxConverter {
             ),
             _ => (alpha.to_le_bytes().to_vec(), TrtDataType::kFLOAT),
         };
-        temp_weights.push(alpha_bytes);
-        let alpha_ref = temp_weights.last().unwrap().as_slice();
-
         let alpha_const = network
-            .add_constant(&broadcast_shape, alpha_ref, alpha_dtype)
+            .add_small_constant_copied(&broadcast_shape, &alpha_bytes, alpha_dtype)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("LeakyReLU: failed to add alpha constant: {}", e),
             })?;
-        let alpha_tensor = alpha_const
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("LeakyReLU: alpha const output: {}", e),
-            })?;
+        let alpha_tensor =
+            alpha_const
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("LeakyReLU: alpha const output: {}", e),
+                })?;
 
         // max(0, x) = relu(x)
         let relu_layer = network
@@ -1630,12 +1601,13 @@ impl TrtxConverter {
                 format: "trtx".to_string(),
                 reason: format!("Failed to add relu for leaky relu: {}", e),
             })?;
-        let relu_output = relu_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get relu output: {}", e),
-            })?;
+        let relu_output =
+            relu_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get relu output: {}", e),
+                })?;
 
         // min(0, x) = x - relu(x)
         let neg_part_layer = network
@@ -1644,12 +1616,13 @@ impl TrtxConverter {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get min(0,x) for leaky relu: {}", e),
             })?;
-        let neg_part = neg_part_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get neg part output: {}", e),
-            })?;
+        let neg_part =
+            neg_part_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get neg part output: {}", e),
+                })?;
 
         // alpha * min(0, x)
         let scaled_neg_layer = network
@@ -1660,7 +1633,7 @@ impl TrtxConverter {
             })?;
         let scaled_neg =
             scaled_neg_layer
-                .get_output(0)
+                .get_output(&*network, 0)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("Failed to get scaled neg output: {}", e),
@@ -1674,12 +1647,13 @@ impl TrtxConverter {
                 reason: format!("Failed to add leaky relu parts: {}", e),
             })?;
 
-        let output = final_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get leaky relu output: {}", e),
-            })?;
+        let output =
+            final_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get leaky relu output: {}", e),
+                })?;
 
         let output_ids = operation.output_operands_slice();
         let output_id = output_ids[0];
@@ -1688,9 +1662,9 @@ impl TrtxConverter {
     }
 
     /// Add PReLU activation
-    fn add_prelu_op(
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+    fn add_prelu_op<'a>(
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
         let input = tensor_map
@@ -1717,12 +1691,13 @@ impl TrtxConverter {
                 format: "trtx".to_string(),
                 reason: format!("Failed to add relu for prelu: {}", e),
             })?;
-        let relu_output = relu_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get relu output: {}", e),
-            })?;
+        let relu_output =
+            relu_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get relu output: {}", e),
+                })?;
 
         // Negative part: min(0, x)
         let zero_layer = network
@@ -1731,12 +1706,13 @@ impl TrtxConverter {
                 format: "trtx".to_string(),
                 reason: format!("Failed to add second relu: {}", e),
             })?;
-        let zero_output = zero_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get zero output: {}", e),
-            })?;
+        let zero_output =
+            zero_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get zero output: {}", e),
+                })?;
 
         // x - relu(x) = min(0, x)
         let neg_part_layer = network
@@ -1745,12 +1721,13 @@ impl TrtxConverter {
                 format: "trtx".to_string(),
                 reason: format!("Failed to subtract for prelu: {}", e),
             })?;
-        let neg_part = neg_part_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get negative part: {}", e),
-            })?;
+        let neg_part =
+            neg_part_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get negative part: {}", e),
+                })?;
 
         // slope * min(0, x)
         let scaled_neg_layer = network
@@ -1761,7 +1738,7 @@ impl TrtxConverter {
             })?;
         let scaled_neg =
             scaled_neg_layer
-                .get_output(0)
+                .get_output(&*network, 0)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("Failed to get scaled negative: {}", e),
@@ -1775,12 +1752,13 @@ impl TrtxConverter {
                 reason: format!("Failed to add prelu parts: {}", e),
             })?;
 
-        let output = final_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get prelu output: {}", e),
-            })?;
+        let output =
+            final_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get prelu output: {}", e),
+                })?;
 
         let output_ids = operation.output_operands_slice();
         let output_id = output_ids[0];
@@ -1791,12 +1769,12 @@ impl TrtxConverter {
     /// Add hard sigmoid activation
     /// HardSigmoid(x) = clamp(alpha * x + beta, 0, 1)
     /// Uses built-in kHARD_SIGMOID when alpha=0.2 and beta=0.5; otherwise decomposes with elementwise ops.
-    fn add_hard_sigmoid_op(
+    fn add_hard_sigmoid_op<'a>(
         graph: &GraphInfo,
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
-        temp_weights: &mut Vec<Vec<u8>>,
+        _temp_weights: &mut Vec<Vec<u8>>,
     ) -> Result<(), GraphError> {
         let input = tensor_map
             .get(&operation.input_operands()[0])
@@ -1817,12 +1795,13 @@ impl TrtxConverter {
                     format: "trtx".to_string(),
                     reason: format!("Failed to add hard sigmoid: {}", e),
                 })?;
-            let output = layer
-                .get_output(0)
-                .map_err(|e| GraphError::ConversionFailed {
-                    format: "trtx".to_string(),
-                    reason: format!("Failed to get layer output: {}", e),
-                })?;
+            let output =
+                layer
+                    .get_output(&*network, 0)
+                    .map_err(|e| GraphError::ConversionFailed {
+                        format: "trtx".to_string(),
+                        reason: format!("Failed to get layer output: {}", e),
+                    })?;
             let output_ids = operation.output_operands_slice();
             tensor_map.insert(output_ids[0], output);
             return Ok(());
@@ -1838,12 +1817,12 @@ impl TrtxConverter {
                 ),
             })?;
         let input_dims = input
-            .dimensions()
+            .dimensions(&*network)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("HardSigmoid: failed to get input dimensions: {}", e),
             })?;
-        let broadcast_shape: Vec<i32> = vec![1; input_dims.len()];
+        let broadcast_shape: Vec<i64> = vec![1i64; input_dims.len()];
         let input_dtype = input_operand.descriptor.data_type;
 
         let (alpha_bytes, beta_bytes, zero_bytes, one_bytes, trt_dtype) = match input_dtype {
@@ -1862,65 +1841,59 @@ impl TrtxConverter {
                 trtx::DataType::kFLOAT,
             ),
         };
-        temp_weights.push(alpha_bytes);
-        temp_weights.push(beta_bytes);
-        temp_weights.push(zero_bytes);
-        temp_weights.push(one_bytes);
-        let idx = temp_weights.len();
-        let alpha_ref = temp_weights[idx - 4].as_slice();
-        let beta_ref = temp_weights[idx - 3].as_slice();
-        let zero_ref = temp_weights[idx - 2].as_slice();
-        let one_ref = temp_weights[idx - 1].as_slice();
-
         let alpha_const = network
-            .add_constant(&broadcast_shape, alpha_ref, trt_dtype.clone())
+            .add_small_constant_copied(&broadcast_shape, &alpha_bytes, trt_dtype.clone())
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("HardSigmoid: failed to add alpha constant: {}", e),
             })?;
         let beta_const = network
-            .add_constant(&broadcast_shape, beta_ref, trt_dtype.clone())
+            .add_small_constant_copied(&broadcast_shape, &beta_bytes, trt_dtype.clone())
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("HardSigmoid: failed to add beta constant: {}", e),
             })?;
         let zero_const = network
-            .add_constant(&broadcast_shape, zero_ref, trt_dtype.clone())
+            .add_small_constant_copied(&broadcast_shape, &zero_bytes, trt_dtype.clone())
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("HardSigmoid: failed to add zero constant: {}", e),
             })?;
         let one_const = network
-            .add_constant(&broadcast_shape, one_ref, trt_dtype)
+            .add_small_constant_copied(&broadcast_shape, &one_bytes, trt_dtype)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("HardSigmoid: failed to add one constant: {}", e),
             })?;
 
-        let alpha_out = alpha_const
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("HardSigmoid: alpha const output: {}", e),
-            })?;
-        let beta_out = beta_const
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("HardSigmoid: beta const output: {}", e),
-            })?;
-        let zero_out = zero_const
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("HardSigmoid: zero const output: {}", e),
-            })?;
-        let one_out = one_const
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("HardSigmoid: one const output: {}", e),
-            })?;
+        let alpha_out =
+            alpha_const
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("HardSigmoid: alpha const output: {}", e),
+                })?;
+        let beta_out =
+            beta_const
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("HardSigmoid: beta const output: {}", e),
+                })?;
+        let zero_out =
+            zero_const
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("HardSigmoid: zero const output: {}", e),
+                })?;
+        let one_out =
+            one_const
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("HardSigmoid: one const output: {}", e),
+                })?;
 
         // linear = alpha * x + beta
         let ax = network
@@ -1929,10 +1902,12 @@ impl TrtxConverter {
                 format: "trtx".to_string(),
                 reason: format!("HardSigmoid: alpha*x: {}", e),
             })?;
-        let linear = ax.get_output(0).map_err(|e| GraphError::ConversionFailed {
-            format: "trtx".to_string(),
-            reason: format!("HardSigmoid: linear get output: {}", e),
-        })?;
+        let linear = ax
+            .get_output(&*network, 0)
+            .map_err(|e| GraphError::ConversionFailed {
+                format: "trtx".to_string(),
+                reason: format!("HardSigmoid: linear get output: {}", e),
+            })?;
         let linear_plus_beta = network
             .add_elementwise(&linear, &beta_out, ElementWiseOperation::kSUM)
             .map_err(|e| GraphError::ConversionFailed {
@@ -1941,7 +1916,7 @@ impl TrtxConverter {
             })?;
         let linear_out =
             linear_plus_beta
-                .get_output(0)
+                .get_output(&*network, 0)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("HardSigmoid: linear_out: {}", e),
@@ -1955,7 +1930,7 @@ impl TrtxConverter {
                 reason: format!("HardSigmoid: min(1, linear): {}", e),
             })?;
         let min1_out = min1
-            .get_output(0)
+            .get_output(&*network, 0)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("HardSigmoid: min1 output: {}", e),
@@ -1966,12 +1941,13 @@ impl TrtxConverter {
                 format: "trtx".to_string(),
                 reason: format!("HardSigmoid: max(0, ...): {}", e),
             })?;
-        let output = output_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("HardSigmoid: output: {}", e),
-            })?;
+        let output =
+            output_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("HardSigmoid: output: {}", e),
+                })?;
 
         let output_ids = operation.output_operands_slice();
         tensor_map.insert(output_ids[0], output);
@@ -1980,12 +1956,12 @@ impl TrtxConverter {
 
     /// Add hard swish activation
     /// WebNN: y = x * max(0, min(6, (x + 3))) / 6 (MobileNetV3). Follows spec decomposition.
-    fn add_hard_swish_op(
+    fn add_hard_swish_op<'a>(
         graph: &GraphInfo,
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
-        temp_weights: &mut Vec<Vec<u8>>,
+        _temp_weights: &mut Vec<Vec<u8>>,
     ) -> Result<(), GraphError> {
         let input = tensor_map
             .get(&operation.input_operands()[0])
@@ -2004,12 +1980,12 @@ impl TrtxConverter {
                 ),
             })?;
         let input_dims = input
-            .dimensions()
+            .dimensions(&*network)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("HardSwish: failed to get input dimensions: {}", e),
             })?;
-        let broadcast_shape: Vec<i32> = vec![1; input_dims.len()];
+        let broadcast_shape: Vec<i64> = vec![1i64; input_dims.len()];
         let input_dtype = input_operand.descriptor.data_type;
 
         let three = 3.0f32;
@@ -2029,51 +2005,46 @@ impl TrtxConverter {
                 trtx::DataType::kFLOAT,
             ),
         };
-        temp_weights.push(three_bytes);
-        temp_weights.push(six_bytes);
-        temp_weights.push(zero_bytes);
-        let idx = temp_weights.len();
-        let three_ref = temp_weights[idx - 3].as_slice();
-        let six_ref = temp_weights[idx - 2].as_slice();
-        let zero_ref = temp_weights[idx - 1].as_slice();
-
         let three_const = network
-            .add_constant(&broadcast_shape, three_ref, trt_dtype.clone())
+            .add_small_constant_copied(&broadcast_shape, &three_bytes, trt_dtype.clone())
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("HardSwish: failed to add 3 constant: {}", e),
             })?;
         let six_const = network
-            .add_constant(&broadcast_shape, six_ref, trt_dtype.clone())
+            .add_small_constant_copied(&broadcast_shape, &six_bytes, trt_dtype.clone())
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("HardSwish: failed to add 6 constant: {}", e),
             })?;
         let zero_const = network
-            .add_constant(&broadcast_shape, zero_ref, trt_dtype)
+            .add_small_constant_copied(&broadcast_shape, &zero_bytes, trt_dtype)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("HardSwish: failed to add zero constant: {}", e),
             })?;
 
-        let three_out = three_const
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("HardSwish: 3 const output: {}", e),
-            })?;
-        let six_out = six_const
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("HardSwish: 6 const output: {}", e),
-            })?;
-        let zero_out = zero_const
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("HardSwish: zero const output: {}", e),
-            })?;
+        let three_out =
+            three_const
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("HardSwish: 3 const output: {}", e),
+                })?;
+        let six_out =
+            six_const
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("HardSwish: 6 const output: {}", e),
+                })?;
+        let zero_out =
+            zero_const
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("HardSwish: zero const output: {}", e),
+                })?;
 
         // Spec: div(mul(input, max(0, min(6, add(input, 3)))), 6)
         let x_plus_3 = network
@@ -2082,12 +2053,13 @@ impl TrtxConverter {
                 format: "trtx".to_string(),
                 reason: format!("HardSwish: add(input, 3): {}", e),
             })?;
-        let x_plus_3_out = x_plus_3
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("HardSwish: x+3 output: {}", e),
-            })?;
+        let x_plus_3_out =
+            x_plus_3
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("HardSwish: x+3 output: {}", e),
+                })?;
         let min6 = network
             .add_elementwise(&six_out, &x_plus_3_out, ElementWiseOperation::kMIN)
             .map_err(|e| GraphError::ConversionFailed {
@@ -2095,7 +2067,7 @@ impl TrtxConverter {
                 reason: format!("HardSwish: min(6, x+3): {}", e),
             })?;
         let min6_out = min6
-            .get_output(0)
+            .get_output(&*network, 0)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("HardSwish: min6 output: {}", e),
@@ -2107,7 +2079,7 @@ impl TrtxConverter {
                 reason: format!("HardSwish: max(0, ...): {}", e),
             })?;
         let inner_out = inner
-            .get_output(0)
+            .get_output(&*network, 0)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("HardSwish: inner output: {}", e),
@@ -2120,7 +2092,7 @@ impl TrtxConverter {
             })?;
         let x_times_inner_out =
             x_times_inner
-                .get_output(0)
+                .get_output(&*network, 0)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("HardSwish: x*inner output: {}", e),
@@ -2131,12 +2103,13 @@ impl TrtxConverter {
                 format: "trtx".to_string(),
                 reason: format!("HardSwish: div(..., 6): {}", e),
             })?;
-        let output = output_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("HardSwish: output: {}", e),
-            })?;
+        let output =
+            output_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("HardSwish: output: {}", e),
+                })?;
 
         let output_ids = operation.output_operands_slice();
         tensor_map.insert(output_ids[0], output);
@@ -2145,9 +2118,9 @@ impl TrtxConverter {
 
     /// Add identity operation
     /// Identity just passes through the input unchanged using IIdentityLayer
-    fn add_identity_op(
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+    fn add_identity_op<'a>(
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
         let input_id = operation.input_operands()[0];
@@ -2167,7 +2140,7 @@ impl TrtxConverter {
             })?;
 
         let output = layer
-            .get_output(0)
+            .get_output(&*network, 0)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get identity output: {}", e),
@@ -2183,11 +2156,11 @@ impl TrtxConverter {
     /// TensorRT does not allow INT8/UINT8 constants to feed a Cast (only DQ or plugin).
     /// Scalar int8/uint8 constants are promoted to int32 when added; Cast then becomes identity.
     /// For non-scalar int8/uint8 -> int32 we emulate via Dequantize(scale=1) -> Cast(INT32).
-    fn add_cast_op(
+    fn add_cast_op<'a>(
         graph: &GraphInfo,
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
-        temp_weights: &mut Vec<Vec<u8>>,
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
+        _temp_weights: &mut Vec<Vec<u8>>,
         promoted_constants: &HashSet<u32>,
         constants_stored_flat: &HashSet<u32>,
         operation: &Operation,
@@ -2249,33 +2222,29 @@ impl TrtxConverter {
                         format: "trtx".to_string(),
                         reason: format!("Failed to add identity for promoted scalar cast: {}", e),
                     })?;
-            let output =
-                identity_layer
-                    .get_output(0)
-                    .map_err(|e| GraphError::ConversionFailed {
-                        format: "trtx".to_string(),
-                        reason: format!("Failed to get identity output: {}", e),
-                    })?;
+            let output = identity_layer.get_output(&*network, 0).map_err(|e| {
+                GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get identity output: {}", e),
+                }
+            })?;
             tensor_map.insert(output_id, output);
             return Ok(());
         }
 
         // Helper: DQ(scale=1) with per-tensor (0D) scale. TensorRT only allows scalar or per-channel scale; 4D scale causes "ScaleMode is illegal".
-        let add_dq_scale_constant = |network: &mut trtx::NetworkDefinition,
-                                     temp_weights: &mut Vec<Vec<u8>>,
+        let add_dq_scale_constant = |network: &mut trtx::NetworkDefinition<'a>,
                                      err_prefix: &str|
-         -> Result<trtx::Tensor, GraphError> {
-            let scale_one: Vec<u8> = 1.0f32.to_le_bytes().to_vec();
-            temp_weights.push(scale_one);
-            let scale_ref = temp_weights.last().unwrap();
+         -> Result<trtx::Tensor<'a>, GraphError> {
+            let scale_one = 1.0f32.to_le_bytes();
             let scale_constant = network
-                .add_constant(&[], scale_ref, TrtDataType::kFLOAT)
+                .add_small_constant_copied(&[], scale_one.as_slice(), TrtDataType::kFLOAT)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("{}: {}", err_prefix, e),
                 })?;
             scale_constant
-                .get_output(0)
+                .get_output(&*network, 0)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("{}: get scale output: {}", err_prefix, e),
@@ -2285,7 +2254,7 @@ impl TrtxConverter {
         // Constant stored flat: 1D int8. Try 1D -> Reshape(4D) -> DQ so DQ sees Shuffle output not Constant.
         let stored_flat = constants_stored_flat.contains(&input_id);
         let _input_dims = input
-            .dimensions()
+            .dimensions(&*network)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Cast: failed to get input dimensions: {}", e),
@@ -2299,11 +2268,11 @@ impl TrtxConverter {
                 });
             }
             {
-                let original_shape: Vec<i32> = input_operand
+                let original_shape: Vec<i64> = input_operand
                     .descriptor
                     .shape
                     .iter()
-                    .map(|d| get_static_or_max_size(d) as i32)
+                    .map(|d| get_static_or_max_size(d) as i64)
                     .collect();
                 let mut shuffle_to_4d =
                     network
@@ -2312,38 +2281,37 @@ impl TrtxConverter {
                             format: "trtx".to_string(),
                             reason: format!("Cast: failed to add reshape shuffle: {}", e),
                         })?;
-                let _ = shuffle_to_4d.set_layer_name("cast_flat_reshape_4d");
+                let _ = shuffle_to_4d.set_name(network, "cast_flat_reshape_4d");
                 shuffle_to_4d
-                    .set_reshape_dimensions(&original_shape)
+                    .set_reshape_dimensions(network, &original_shape)
                     .map_err(|e| GraphError::ConversionFailed {
                         format: "trtx".to_string(),
                         reason: format!("Cast: failed to set reshape dimensions: {}", e),
                     })?;
-                let mut reshaped_4d =
-                    shuffle_to_4d
-                        .get_output(0)
-                        .map_err(|e| GraphError::ConversionFailed {
-                            format: "trtx".to_string(),
-                            reason: format!("Cast: failed to get reshape output: {}", e),
-                        })?;
-                let _ = reshaped_4d.set_name("cast_flat_reshape_4d");
+                let reshaped_4d = shuffle_to_4d.get_output(&*network, 0).map_err(|e| {
+                    GraphError::ConversionFailed {
+                        format: "trtx".to_string(),
+                        reason: format!("Cast: failed to get reshape output: {}", e),
+                    }
+                })?;
+                let _ = reshaped_4d.set_name(network, "cast_flat_reshape_4d");
                 let scale_tensor =
-                    add_dq_scale_constant(network, temp_weights, "int8->float32 cast")?;
+                    add_dq_scale_constant(network, "int8->float32 cast")?;
                 let mut dq_layer = network
                     .add_dequantize(&reshaped_4d, &scale_tensor, TrtDataType::kFLOAT)
                     .map_err(|e| GraphError::ConversionFailed {
                         format: "trtx".to_string(),
                         reason: format!("Failed to add dequantize for int8->float32 cast: {}", e),
                     })?;
-                let _ = dq_layer.set_layer_name("cast_flat_dq_f32");
-                let mut output =
+                let _ = dq_layer.set_name(network, "cast_flat_dq_f32");
+                let output =
                     dq_layer
-                        .get_output(0)
+                        .get_output(&*network, 0)
                         .map_err(|e| GraphError::ConversionFailed {
                             format: "trtx".to_string(),
                             reason: format!("Failed to get dequantize output: {}", e),
                         })?;
-                let _ = output.set_name("cast_flat_dq_f32");
+                let _ = output.set_name(network, "cast_flat_dq_f32");
                 tensor_map.insert(output_id, output);
                 return Ok(());
             }
@@ -2358,11 +2326,11 @@ impl TrtxConverter {
                 });
             }
             {
-                let original_shape: Vec<i32> = input_operand
+                let original_shape: Vec<i64> = input_operand
                     .descriptor
                     .shape
                     .iter()
-                    .map(|d| get_static_or_max_size(d) as i32)
+                    .map(|d| get_static_or_max_size(d) as i64)
                     .collect();
                 let mut shuffle_to_4d =
                     network
@@ -2371,38 +2339,37 @@ impl TrtxConverter {
                             format: "trtx".to_string(),
                             reason: format!("Cast: failed to add reshape shuffle: {}", e),
                         })?;
-                let _ = shuffle_to_4d.set_layer_name("cast_flat_reshape_4d_int32");
+                let _ = shuffle_to_4d.set_name(network, "cast_flat_reshape_4d_int32");
                 shuffle_to_4d
-                    .set_reshape_dimensions(&original_shape)
+                    .set_reshape_dimensions(network, &original_shape)
                     .map_err(|e| GraphError::ConversionFailed {
                         format: "trtx".to_string(),
                         reason: format!("Cast: failed to set reshape dimensions: {}", e),
                     })?;
-                let mut reshaped_4d =
-                    shuffle_to_4d
-                        .get_output(0)
-                        .map_err(|e| GraphError::ConversionFailed {
-                            format: "trtx".to_string(),
-                            reason: format!("Cast: failed to get reshape output: {}", e),
-                        })?;
-                let _ = reshaped_4d.set_name("cast_flat_reshape_4d");
+                let reshaped_4d = shuffle_to_4d.get_output(&*network, 0).map_err(|e| {
+                    GraphError::ConversionFailed {
+                        format: "trtx".to_string(),
+                        reason: format!("Cast: failed to get reshape output: {}", e),
+                    }
+                })?;
+                let _ = reshaped_4d.set_name(network, "cast_flat_reshape_4d");
                 let scale_tensor =
-                    add_dq_scale_constant(network, temp_weights, "int8->int32 cast")?;
+                    add_dq_scale_constant(network, "int8->int32 cast")?;
                 let mut dq_layer = network
                     .add_dequantize(&reshaped_4d, &scale_tensor, TrtDataType::kFLOAT)
                     .map_err(|e| GraphError::ConversionFailed {
                         format: "trtx".to_string(),
                         reason: format!("Failed to add dequantize for int8->int32 cast: {}", e),
                     })?;
-                let _ = dq_layer.set_layer_name("cast_flat_dq_int32");
-                let mut dq_out =
+                let _ = dq_layer.set_name(network, "cast_flat_dq_int32");
+                let dq_out =
                     dq_layer
-                        .get_output(0)
+                        .get_output(&*network, 0)
                         .map_err(|e| GraphError::ConversionFailed {
                             format: "trtx".to_string(),
                             reason: format!("Failed to get dequantize output: {}", e),
                         })?;
-                let _ = dq_out.set_name("cast_flat_dq_int32");
+                let _ = dq_out.set_name(network, "cast_flat_dq_int32");
                 let mut cast_layer =
                     network
                         .add_cast(&dq_out, TrtDataType::kINT32)
@@ -2410,15 +2377,14 @@ impl TrtxConverter {
                             format: "trtx".to_string(),
                             reason: format!("Failed to add cast to INT32: {}", e),
                         })?;
-                let _ = cast_layer.set_layer_name("cast_flat_cast_int32");
-                let mut output =
-                    cast_layer
-                        .get_output(0)
-                        .map_err(|e| GraphError::ConversionFailed {
-                            format: "trtx".to_string(),
-                            reason: format!("Failed to get cast output: {}", e),
-                        })?;
-                let _ = output.set_name("cast_flat_cast_int32");
+                let _ = cast_layer.set_name(network, "cast_flat_cast_int32");
+                let output = cast_layer.get_output(&*network, 0).map_err(|e| {
+                    GraphError::ConversionFailed {
+                        format: "trtx".to_string(),
+                        reason: format!("Failed to get cast output: {}", e),
+                    }
+                })?;
+                let _ = output.set_name(network, "cast_flat_cast_int32");
                 tensor_map.insert(output_id, output);
                 return Ok(());
             }
@@ -2436,7 +2402,7 @@ impl TrtxConverter {
                 })?;
 
         let output = layer
-            .get_output(0)
+            .get_output(&*network, 0)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get cast output: {}", e),
@@ -2447,9 +2413,9 @@ impl TrtxConverter {
     }
 
     /// Add quantizeLinear operation (float to quantized integer)
-    fn add_quantize_linear_op(
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+    fn add_quantize_linear_op<'a>(
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
         let input = tensor_map
@@ -2479,7 +2445,7 @@ impl TrtxConverter {
             })?;
 
         let output = layer
-            .get_output(0)
+            .get_output(&*network, 0)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get quantize output: {}", e),
@@ -2492,9 +2458,9 @@ impl TrtxConverter {
     }
 
     /// Add dequantizeLinear operation (quantized integer to float)
-    fn add_dequantize_linear_op(
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+    fn add_dequantize_linear_op<'a>(
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
         let input = tensor_map
@@ -2524,7 +2490,7 @@ impl TrtxConverter {
             })?;
 
         let output = layer
-            .get_output(0)
+            .get_output(&*network, 0)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get dequantize output: {}", e),
@@ -2537,9 +2503,9 @@ impl TrtxConverter {
     }
 
     /// Add global pooling operation
-    fn add_global_pooling_op(
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+    fn add_global_pooling_op<'a>(
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
         pool_type: PoolingType,
     ) -> Result<(), GraphError> {
@@ -2552,7 +2518,7 @@ impl TrtxConverter {
 
         // Get input dimensions to determine window size
         let input_dims = input
-            .dimensions()
+            .dimensions(&*network)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get input dimensions: {}", e),
@@ -2570,7 +2536,7 @@ impl TrtxConverter {
             });
         }
 
-        let window: [i32; 2] = [input_dims[2], input_dims[3]];
+        let window: [i64; 2] = [input_dims[2], input_dims[3]];
 
         let layer = network
             .add_pooling(input, pool_type, &window)
@@ -2580,7 +2546,7 @@ impl TrtxConverter {
             })?;
 
         let output = layer
-            .get_output(0)
+            .get_output(&*network, 0)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get layer output: {}", e),
@@ -2595,9 +2561,9 @@ impl TrtxConverter {
     /// Add matrix multiply operation.
     /// TensorRT IMatrixMultiplyLayer requires both inputs to have the same number of dimensions;
     /// if ranks differ, unsqueeze the lower-rank input by prepending 1s.
-    fn add_matmul_op(
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+    fn add_matmul_op<'a>(
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
         let input0 = tensor_map
@@ -2615,13 +2581,13 @@ impl TrtxConverter {
             })?;
 
         let dims0 = input0
-            .dimensions()
+            .dimensions(&*network)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Matmul: input0 dimensions: {}", e),
             })?;
         let dims1 = input1
-            .dimensions()
+            .dimensions(&*network)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Matmul: input1 dimensions: {}", e),
@@ -2631,11 +2597,16 @@ impl TrtxConverter {
         let rank1 = dims1.len();
 
         let layer = if rank0 == rank1 {
-            network.add_matrix_multiply(input0, 0, input1, 0)
+            network.add_matrix_multiply(
+                input0,
+                MatrixOperation::kNONE,
+                input1,
+                MatrixOperation::kNONE,
+            )
         } else if rank0 < rank1 {
-            let reshape_dims: Vec<i32> = dims0.iter().map(|&d| d as i32).collect();
+            let reshape_dims: Vec<i64> = dims0.iter().copied().collect();
             let rank_diff = rank1 - rank0;
-            let mut new_shape: Vec<i32> = vec![1; rank_diff];
+            let mut new_shape: Vec<i64> = vec![1i64; rank_diff];
             new_shape.extend(reshape_dims);
             let mut shuffle =
                 network
@@ -2644,23 +2615,29 @@ impl TrtxConverter {
                         format: "trtx".to_string(),
                         reason: format!("Matmul: unsqueeze shuffle: {}", e),
                     })?;
-            shuffle.set_reshape_dimensions(&new_shape).map_err(|e| {
+            shuffle.set_reshape_dimensions(network, &new_shape).map_err(|e| {
                 GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("Matmul: set reshape: {}", e),
                 }
             })?;
-            let reshaped0 = shuffle
-                .get_output(0)
-                .map_err(|e| GraphError::ConversionFailed {
-                    format: "trtx".to_string(),
-                    reason: format!("Matmul: shuffle output: {}", e),
-                })?;
-            network.add_matrix_multiply(&reshaped0, 0, input1, 0)
+            let reshaped0 =
+                shuffle
+                    .get_output(&*network, 0)
+                    .map_err(|e| GraphError::ConversionFailed {
+                        format: "trtx".to_string(),
+                        reason: format!("Matmul: shuffle output: {}", e),
+                    })?;
+            network.add_matrix_multiply(
+                &reshaped0,
+                MatrixOperation::kNONE,
+                input1,
+                MatrixOperation::kNONE,
+            )
         } else {
-            let reshape_dims: Vec<i32> = dims1.iter().map(|&d| d as i32).collect();
+            let reshape_dims: Vec<i64> = dims1.iter().copied().collect();
             let rank_diff = rank0 - rank1;
-            let mut new_shape: Vec<i32> = vec![1; rank_diff];
+            let mut new_shape: Vec<i64> = vec![1i64; rank_diff];
             new_shape.extend(reshape_dims);
             let mut shuffle =
                 network
@@ -2669,19 +2646,25 @@ impl TrtxConverter {
                         format: "trtx".to_string(),
                         reason: format!("Matmul: unsqueeze shuffle: {}", e),
                     })?;
-            shuffle.set_reshape_dimensions(&new_shape).map_err(|e| {
+            shuffle.set_reshape_dimensions(network, &new_shape).map_err(|e| {
                 GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("Matmul: set reshape: {}", e),
                 }
             })?;
-            let reshaped1 = shuffle
-                .get_output(0)
-                .map_err(|e| GraphError::ConversionFailed {
-                    format: "trtx".to_string(),
-                    reason: format!("Matmul: shuffle output: {}", e),
-                })?;
-            network.add_matrix_multiply(input0, 0, &reshaped1, 0)
+            let reshaped1 =
+                shuffle
+                    .get_output(&*network, 0)
+                    .map_err(|e| GraphError::ConversionFailed {
+                        format: "trtx".to_string(),
+                        reason: format!("Matmul: shuffle output: {}", e),
+                    })?;
+            network.add_matrix_multiply(
+                input0,
+                MatrixOperation::kNONE,
+                &reshaped1,
+                MatrixOperation::kNONE,
+            )
         }
         .map_err(|e| GraphError::ConversionFailed {
             format: "trtx".to_string(),
@@ -2689,7 +2672,7 @@ impl TrtxConverter {
         })?;
 
         let output = layer
-            .get_output(0)
+            .get_output(&*network, 0)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get layer output: {}", e),
@@ -2707,21 +2690,21 @@ impl TrtxConverter {
 
     /// Reshape 1D batch-norm stats [C] to same rank as input with shape [1,...,1,C,1,...,1]
     /// so that the channel dimension aligns with the input's axis. TensorRT then broadcasts correctly.
-    fn reshape_batch_norm_stats_for_broadcast(
-        network: &mut trtx::NetworkDefinition,
-        stats: &trtx::Tensor,
-        input: &trtx::Tensor,
+    fn reshape_batch_norm_stats_for_broadcast<'a>(
+        network: &mut trtx::NetworkDefinition<'a>,
+        stats: &trtx::Tensor<'a>,
+        input: &trtx::Tensor<'a>,
         axis: i64,
         op_name: &str,
-    ) -> Result<trtx::Tensor, GraphError> {
+    ) -> Result<trtx::Tensor<'a>, GraphError> {
         let input_dims = input
-            .dimensions()
+            .dimensions(&*network)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get input dims for {}: {}", op_name, e),
             })?;
         let stats_dims = stats
-            .dimensions()
+            .dimensions(&*network)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get stats dims for {}: {}", op_name, e),
@@ -2733,7 +2716,7 @@ impl TrtxConverter {
         }
         axis_idx = axis_idx.max(0).min((rank.saturating_sub(1)) as i64);
         // Channel count: stats may be 1D [C], 4D [C,1,1,1], or 4D [1,C,1,1]; use product so we get C in all cases.
-        let c: i32 = stats_dims.iter().product::<i32>().max(1);
+        let c: i64 = stats_dims.iter().product::<i64>().max(1);
         // When stats are 4D [C,1,1,1], use a transpose-only shuffle so TensorRT sees [1,C,1,1].
         // (Transpose+reshape in one shuffle can leave logical shape as [C,1,1,1].)
         let is_4d_channel_first = rank >= 2
@@ -2757,13 +2740,13 @@ impl TrtxConverter {
                         ),
                     })?;
             shuffle
-                .set_first_transpose(&perm)
+                .set_first_transpose(network, &perm)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("Failed to set transpose for {}: {}", op_name, e),
                 })?;
             return shuffle
-                .get_output(0)
+                .get_output(&*network, 0)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("Failed to get shuffle output for {}: {}", op_name, e),
@@ -2772,13 +2755,13 @@ impl TrtxConverter {
 
         // For 1D [C], reshape to [1,1,...,1,C] then transpose so C moves to axis_idx; avoids TensorRT giving [C,1,1,1].
         let (target_shape, need_second_transpose) = if stats_dims.len() == 1 {
-            let shape_last: Vec<i32> = (0..rank)
-                .map(|i| if i == rank - 1 { c } else { 1 })
+            let shape_last: Vec<i64> = (0..rank)
+                .map(|i| if i == rank - 1 { c } else { 1i64 })
                 .collect();
             (shape_last, true)
         } else {
-            let shape_axis: Vec<i32> = (0..rank)
-                .map(|i| if i as i64 == axis_idx { c } else { 1 })
+            let shape_axis: Vec<i64> = (0..rank)
+                .map(|i| if i as i64 == axis_idx { c } else { 1i64 })
                 .collect();
             (shape_axis, false)
         };
@@ -2788,18 +2771,21 @@ impl TrtxConverter {
                 format: "trtx".to_string(),
                 reason: format!("Failed to add shuffle for {}: {}", op_name, e),
             })?;
-        shuffle.set_reshape_dimensions(&target_shape).map_err(|e| {
+        shuffle
+            .set_reshape_dimensions(network, &target_shape)
+            .map_err(|e| {
             GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to set reshape for {}: {}", op_name, e),
             }
         })?;
-        let mut result = shuffle
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get shuffle output for {}: {}", op_name, e),
-            })?;
+        let mut result =
+            shuffle
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get shuffle output for {}: {}", op_name, e),
+                })?;
         if need_second_transpose {
             // Move dimension (rank-1) to axis_idx: perm[axis_idx] = rank-1, perm[rank-1] = axis_idx.
             let mut perm: Vec<i32> = (0..rank as i32).collect();
@@ -2813,13 +2799,13 @@ impl TrtxConverter {
                         reason: format!("Failed to add second shuffle for {}: {}", op_name, e),
                     })?;
             shuffle2
-                .set_first_transpose(&perm)
+                .set_first_transpose(network, &perm)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("Failed to set second transpose for {}: {}", op_name, e),
                 })?;
             result = shuffle2
-                .get_output(0)
+                .get_output(&*network, 0)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("Failed to get second shuffle output for {}: {}", op_name, e),
@@ -2830,10 +2816,10 @@ impl TrtxConverter {
 
     /// Add batch normalization operation
     /// Formula: y = (x - mean) / sqrt(variance + epsilon) * scale + bias
-    fn add_batch_normalization_op(
+    fn add_batch_normalization_op<'a>(
         _graph: &GraphInfo,
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
         // Input operands: input, mean, variance, scale (optional), bias (optional)
@@ -2884,14 +2870,15 @@ impl TrtxConverter {
                 format: "trtx".to_string(),
                 reason: format!("Failed to add sub for batch norm: {}", e),
             })?;
-        let _ = sub_layer.set_layer_name("batch_norm_sub");
+        let _ = sub_layer.set_name(network, "batch_norm_sub");
 
-        let x_minus_mean = sub_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get sub output: {}", e),
-            })?;
+        let x_minus_mean =
+            sub_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get sub output: {}", e),
+                })?;
 
         // Step 2: variance + epsilon (using constant)
         // Need to create a constant tensor with epsilon value
@@ -2914,14 +2901,15 @@ impl TrtxConverter {
                     format: "trtx".to_string(),
                     reason: format!("Failed to add sqrt for batch norm: {}", e),
                 })?;
-        let _ = sqrt_var_layer.set_layer_name("batch_norm_sqrt_var");
+        let _ = sqrt_var_layer.set_name(network, "batch_norm_sqrt_var");
 
-        let sqrt_var = sqrt_var_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get sqrt output: {}", e),
-            })?;
+        let sqrt_var =
+            sqrt_var_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get sqrt output: {}", e),
+                })?;
 
         // Step 4: (x - mean) / sqrt(variance + epsilon)
         let mut div_layer = network
@@ -2930,14 +2918,15 @@ impl TrtxConverter {
                 format: "trtx".to_string(),
                 reason: format!("Failed to add div for batch norm: {}", e),
             })?;
-        let _ = div_layer.set_layer_name("batch_norm_div");
+        let _ = div_layer.set_name(network, "batch_norm_div");
 
-        let normalized = div_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get div output: {}", e),
-            })?;
+        let normalized =
+            div_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get div output: {}", e),
+                })?;
 
         // Step 5: Apply scale if present (WebNN: scale is in MLBatchNormalizationOptions, not a positional input)
         let scale_id = operation
@@ -2967,14 +2956,15 @@ impl TrtxConverter {
                     format: "trtx".to_string(),
                     reason: format!("Failed to add mul for scale: {}", e),
                 })?;
-            let _ = mul_layer.set_layer_name("batch_norm_scale_mul");
+            let _ = mul_layer.set_name(network, "batch_norm_scale_mul");
 
-            result = mul_layer
-                .get_output(0)
-                .map_err(|e| GraphError::ConversionFailed {
-                    format: "trtx".to_string(),
-                    reason: format!("Failed to get mul output: {}", e),
-                })?;
+            result =
+                mul_layer
+                    .get_output(&*network, 0)
+                    .map_err(|e| GraphError::ConversionFailed {
+                        format: "trtx".to_string(),
+                        reason: format!("Failed to get mul output: {}", e),
+                    })?;
         }
 
         // Step 6: Apply bias if present (WebNN: bias is in MLBatchNormalizationOptions, not a positional input)
@@ -3004,14 +2994,15 @@ impl TrtxConverter {
                     format: "trtx".to_string(),
                     reason: format!("Failed to add bias: {}", e),
                 })?;
-            let _ = add_layer.set_layer_name("batch_norm_bias_add");
+            let _ = add_layer.set_name(network, "batch_norm_bias_add");
 
-            result = add_layer
-                .get_output(0)
-                .map_err(|e| GraphError::ConversionFailed {
-                    format: "trtx".to_string(),
-                    reason: format!("Failed to get add output: {}", e),
-                })?;
+            result =
+                add_layer
+                    .get_output(&*network, 0)
+                    .map_err(|e| GraphError::ConversionFailed {
+                        format: "trtx".to_string(),
+                        reason: format!("Failed to get add output: {}", e),
+                    })?;
         }
 
         let output_ids = operation.output_operands_slice();
@@ -3023,12 +3014,12 @@ impl TrtxConverter {
     /// Add instance normalization operation
     /// Formula: y = (x - mean) / sqrt(variance + epsilon) * scale + bias (WebNN spec)
     /// Computed per-instance over spatial dimensions
-    fn add_instance_normalization_op(
+    fn add_instance_normalization_op<'a>(
         graph: &GraphInfo,
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
-        temp_weights: &mut Vec<Vec<u8>>,
+        _temp_weights: &mut Vec<Vec<u8>>,
     ) -> Result<(), GraphError> {
         // Instance normalization computes statistics per-instance (N, C) over spatial dims
         // Input operands: input, scale (optional), bias (optional)
@@ -3040,7 +3031,7 @@ impl TrtxConverter {
             })?;
 
         let input_dims = input
-            .dimensions()
+            .dimensions(&*network)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("InstanceNorm: failed to get input dimensions: {}", e),
@@ -3070,14 +3061,19 @@ impl TrtxConverter {
         }
 
         let mean_layer = network
-            .add_reduce(input, ReduceOperation::kAVG, axes_mask, true)
+            .add_reduce(
+                input,
+                ReduceOperation::kAVG.into(),
+                Axes::from_bits(axes_mask),
+                true,
+            )
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to add mean reduce for instance norm: {}", e),
             })?;
 
         let mean = mean_layer
-            .get_output(0)
+            .get_output(&*network, 0)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get mean output: {}", e),
@@ -3091,12 +3087,13 @@ impl TrtxConverter {
                 reason: format!("Failed to add sub for instance norm: {}", e),
             })?;
 
-        let x_minus_mean = sub_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get sub output: {}", e),
-            })?;
+        let x_minus_mean =
+            sub_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get sub output: {}", e),
+                })?;
 
         // (x - mean)^2
         let square_layer = network
@@ -3106,31 +3103,38 @@ impl TrtxConverter {
                 reason: format!("Failed to add square for instance norm: {}", e),
             })?;
 
-        let squared = square_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get square output: {}", e),
-            })?;
+        let squared =
+            square_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get square output: {}", e),
+                })?;
 
         // variance = mean((x - mean)^2)
         let var_layer = network
-            .add_reduce(&squared, ReduceOperation::kAVG, axes_mask, true)
+            .add_reduce(
+                &squared,
+                ReduceOperation::kAVG.into(),
+                Axes::from_bits(axes_mask),
+                true,
+            )
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to add variance reduce for instance norm: {}", e),
             })?;
 
-        let variance = var_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get variance output: {}", e),
-            })?;
+        let variance =
+            var_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get variance output: {}", e),
+                })?;
 
         // variance + epsilon per WebNN spec (epsilon cast to input's dataType)
         let var_dims = variance
-            .dimensions()
+            .dimensions(&*network)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("InstanceNorm: failed to get variance dimensions: {}", e),
@@ -3161,18 +3165,16 @@ impl TrtxConverter {
                 (data, trtx::DataType::kFLOAT)
             }
         };
-        temp_weights.push(epsilon_bytes);
-        let epsilon_ref = temp_weights.last().unwrap().as_slice();
-        let var_shape: Vec<i32> = var_dims.iter().map(|&d| d as i32).collect();
+        let var_shape: Vec<i64> = var_dims.iter().map(|&d| d as i64).collect();
         let epsilon_const = network
-            .add_constant(&var_shape, epsilon_ref, trt_dtype)
+            .add_small_constant_copied(&var_shape, &epsilon_bytes, trt_dtype)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("InstanceNorm: failed to add epsilon constant: {}", e),
             })?;
         let epsilon_out =
             epsilon_const
-                .get_output(0)
+                .get_output(&*network, 0)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("InstanceNorm: epsilon const output: {}", e),
@@ -3185,7 +3187,7 @@ impl TrtxConverter {
             })?;
         let var_plus_eps_out =
             var_plus_eps
-                .get_output(0)
+                .get_output(&*network, 0)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("InstanceNorm: var_plus_eps output: {}", e),
@@ -3199,12 +3201,13 @@ impl TrtxConverter {
                 reason: format!("Failed to add sqrt for instance norm: {}", e),
             })?;
 
-        let std_dev = sqrt_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get sqrt output: {}", e),
-            })?;
+        let std_dev =
+            sqrt_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get sqrt output: {}", e),
+                })?;
 
         // (x - mean) / sqrt(variance + epsilon)
         let div_layer = network
@@ -3214,20 +3217,21 @@ impl TrtxConverter {
                 reason: format!("Failed to add div for instance norm: {}", e),
             })?;
 
-        let mut result = div_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get div output: {}", e),
-            })?;
+        let mut result =
+            div_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get div output: {}", e),
+                })?;
 
         // Build broadcast shape for scale/bias [C] to match input (TensorRT elementwise needs same rank).
-        let scale_broadcast_shape: Vec<i32> = if layout == "nchw" && !input_dims.is_empty() {
-            let mut s = vec![1i32; input_dims.len()];
+        let scale_broadcast_shape: Vec<i64> = if layout == "nchw" && !input_dims.is_empty() {
+            let mut s = vec![1i64; input_dims.len()];
             s[1] = input_dims[1];
             s
         } else if !input_dims.is_empty() {
-            let mut s = vec![1i32; input_dims.len()];
+            let mut s = vec![1i64; input_dims.len()];
             let last = input_dims.len() - 1;
             s[last] = input_dims[last];
             s
@@ -3270,15 +3274,17 @@ impl TrtxConverter {
                         format: "trtx".to_string(),
                         reason: format!("InstanceNorm: failed to add shuffle for scale: {}", e),
                     })?;
+            let scale_broadcast_i64: Vec<i64> =
+                scale_broadcast_shape.iter().map(|&d| d as i64).collect();
             scale_shuffle
-                .set_reshape_dimensions(&scale_broadcast_shape)
+                .set_reshape_dimensions(network, &scale_broadcast_i64)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("InstanceNorm: failed to set scale reshape: {}", e),
                 })?;
             let scale_bc =
                 scale_shuffle
-                    .get_output(0)
+                    .get_output(&*network, 0)
                     .map_err(|e| GraphError::ConversionFailed {
                         format: "trtx".to_string(),
                         reason: format!("InstanceNorm: failed to get scale shuffle output: {}", e),
@@ -3291,12 +3297,13 @@ impl TrtxConverter {
                     reason: format!("Failed to add mul for scale: {}", e),
                 })?;
 
-            result = mul_layer
-                .get_output(0)
-                .map_err(|e| GraphError::ConversionFailed {
-                    format: "trtx".to_string(),
-                    reason: format!("Failed to get mul output: {}", e),
-                })?;
+            result =
+                mul_layer
+                    .get_output(&*network, 0)
+                    .map_err(|e| GraphError::ConversionFailed {
+                        format: "trtx".to_string(),
+                        reason: format!("Failed to get mul output: {}", e),
+                    })?;
         }
 
         // Apply bias if present (add)
@@ -3315,18 +3322,21 @@ impl TrtxConverter {
                         format: "trtx".to_string(),
                         reason: format!("InstanceNorm: failed to add shuffle for bias: {}", e),
                     })?;
+            let bias_broadcast_i64: Vec<i64> =
+                scale_broadcast_shape.iter().map(|&d| d as i64).collect();
             bias_shuffle
-                .set_reshape_dimensions(&scale_broadcast_shape)
+                .set_reshape_dimensions(network, &bias_broadcast_i64)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("InstanceNorm: failed to set bias reshape: {}", e),
                 })?;
-            let bias_bc = bias_shuffle
-                .get_output(0)
-                .map_err(|e| GraphError::ConversionFailed {
-                    format: "trtx".to_string(),
-                    reason: format!("InstanceNorm: failed to get bias shuffle output: {}", e),
-                })?;
+            let bias_bc =
+                bias_shuffle
+                    .get_output(&*network, 0)
+                    .map_err(|e| GraphError::ConversionFailed {
+                        format: "trtx".to_string(),
+                        reason: format!("InstanceNorm: failed to get bias shuffle output: {}", e),
+                    })?;
 
             let add_layer = network
                 .add_elementwise(&result, &bias_bc, ElementWiseOperation::kSUM)
@@ -3335,12 +3345,13 @@ impl TrtxConverter {
                     reason: format!("Failed to add bias: {}", e),
                 })?;
 
-            result = add_layer
-                .get_output(0)
-                .map_err(|e| GraphError::ConversionFailed {
-                    format: "trtx".to_string(),
-                    reason: format!("Failed to get add output: {}", e),
-                })?;
+            result =
+                add_layer
+                    .get_output(&*network, 0)
+                    .map_err(|e| GraphError::ConversionFailed {
+                        format: "trtx".to_string(),
+                        reason: format!("Failed to get add output: {}", e),
+                    })?;
         }
 
         let output_ids = operation.output_operands_slice();
@@ -3352,12 +3363,12 @@ impl TrtxConverter {
     /// Add layer normalization operation
     /// Formula: y = (x - mean) / sqrt(variance + epsilon) * scale + bias
     /// Computed over specified axes (typically last dimensions)
-    fn add_layer_normalization_op(
+    fn add_layer_normalization_op<'a>(
         graph: &GraphInfo,
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
-        temp_weights: &mut Vec<Vec<u8>>,
+        _temp_weights: &mut Vec<Vec<u8>>,
     ) -> Result<(), GraphError> {
         // Layer normalization computes statistics over specified axes
         // Input operands: input, scale (optional), bias (optional)
@@ -3369,7 +3380,7 @@ impl TrtxConverter {
             })?;
 
         let input_dims = input
-            .dimensions()
+            .dimensions(&*network)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get input shape: {}", e),
@@ -3393,17 +3404,15 @@ impl TrtxConverter {
                 ),
                 _ => (0.0f32.to_le_bytes().to_vec(), TrtDataType::kFLOAT),
             };
-            temp_weights.push(zero_bytes);
-            let zero_ref = temp_weights.last().unwrap().as_slice();
             let zero_const = network
-                .add_constant(&[1], zero_ref, zero_dtype)
+                .add_small_constant_copied(&[1], &zero_bytes, zero_dtype)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("LayerNorm 0D: failed to add zero constant: {}", e),
                 })?;
             let mut result =
                 zero_const
-                    .get_output(0)
+                    .get_output(&*network, 0)
                     .map_err(|e| GraphError::ConversionFailed {
                         format: "trtx".to_string(),
                         reason: format!("LayerNorm 0D: zero const output: {}", e),
@@ -3426,31 +3435,33 @@ impl TrtxConverter {
                             format: "trtx".to_string(),
                             reason: format!("LayerNorm 0D: failed to add bias shuffle: {}", e),
                         })?;
-                bias_shuffle.set_reshape_dimensions(&[1]).map_err(|e| {
+                bias_shuffle
+                    .set_reshape_dimensions(network, &[1i64])
+                    .map_err(|e| {
                     GraphError::ConversionFailed {
                         format: "trtx".to_string(),
                         reason: format!("LayerNorm 0D: failed to set bias reshape: {}", e),
                     }
                 })?;
-                let bias_bc =
-                    bias_shuffle
-                        .get_output(0)
-                        .map_err(|e| GraphError::ConversionFailed {
-                            format: "trtx".to_string(),
-                            reason: format!("LayerNorm 0D: bias shuffle output: {}", e),
-                        })?;
+                let bias_bc = bias_shuffle.get_output(&*network, 0).map_err(|e| {
+                    GraphError::ConversionFailed {
+                        format: "trtx".to_string(),
+                        reason: format!("LayerNorm 0D: bias shuffle output: {}", e),
+                    }
+                })?;
                 let add_layer = network
                     .add_elementwise(&result, &bias_bc, ElementWiseOperation::kSUM)
                     .map_err(|e| GraphError::ConversionFailed {
                         format: "trtx".to_string(),
                         reason: format!("LayerNorm 0D: failed to add bias: {}", e),
                     })?;
-                result = add_layer
-                    .get_output(0)
-                    .map_err(|e| GraphError::ConversionFailed {
-                        format: "trtx".to_string(),
-                        reason: format!("LayerNorm 0D: bias add output: {}", e),
-                    })?;
+                result =
+                    add_layer
+                        .get_output(&*network, 0)
+                        .map_err(|e| GraphError::ConversionFailed {
+                            format: "trtx".to_string(),
+                            reason: format!("LayerNorm 0D: bias add output: {}", e),
+                        })?;
             }
             let output_id = operation.output_operands_slice()[0];
             tensor_map.insert(output_id, result);
@@ -3497,18 +3508,16 @@ impl TrtxConverter {
                     TrtDataType::kFLOAT,
                 ),
             };
-            temp_weights.push(zero_bytes);
-            let zero_ref = temp_weights.last().unwrap().as_slice();
-            let shape_i32: Vec<i32> = input_dims.iter().map(|&d| d as i32).collect();
+            let shape_i64: Vec<i64> = input_dims.iter().map(|&d| d as i64).collect();
             let zero_const = network
-                .add_constant(&shape_i32, zero_ref, zero_dtype.clone())
+                .add_small_constant_copied(&shape_i64, &zero_bytes, zero_dtype.clone())
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("LayerNorm axes=[]: failed to add zeros constant: {}", e),
                 })?;
             let mut result =
                 zero_const
-                    .get_output(0)
+                    .get_output(&*network, 0)
                     .map_err(|e| GraphError::ConversionFailed {
                         format: "trtx".to_string(),
                         reason: format!("LayerNorm axes=[]: zero const output: {}", e),
@@ -3555,10 +3564,8 @@ impl TrtxConverter {
                             (0..num_el).flat_map(|_| v.to_le_bytes()).collect()
                         }
                     };
-                    temp_weights.push(bias_broadcast_bytes);
-                    let bias_ref = temp_weights.last().unwrap().as_slice();
                     let bias_const = network
-                        .add_constant(&shape_i32, bias_ref, zero_dtype)
+                        .add_small_constant_copied(&shape_i64, &bias_broadcast_bytes, zero_dtype)
                         .map_err(|e| GraphError::ConversionFailed {
                             format: "trtx".to_string(),
                             reason: format!(
@@ -3567,7 +3574,7 @@ impl TrtxConverter {
                             ),
                         })?;
                     bias_const
-                        .get_output(0)
+                        .get_output(&*network, 0)
                         .map_err(|e| GraphError::ConversionFailed {
                             format: "trtx".to_string(),
                             reason: format!("LayerNorm axes=[]: bias const output: {}", e),
@@ -3580,10 +3587,8 @@ impl TrtxConverter {
                             .collect(),
                         _ => (0..num_el).flat_map(|_| 1.0f32.to_le_bytes()).collect(),
                     };
-                    temp_weights.push(ones_bytes);
-                    let ones_ref = temp_weights.last().unwrap().as_slice();
                     let ones_const = network
-                        .add_constant(&shape_i32, ones_ref, zero_dtype.clone())
+                        .add_small_constant_copied(&shape_i64, &ones_bytes, zero_dtype.clone())
                         .map_err(|e| GraphError::ConversionFailed {
                             format: "trtx".to_string(),
                             reason: format!(
@@ -3591,13 +3596,12 @@ impl TrtxConverter {
                                 e
                             ),
                         })?;
-                    let ones_tensor =
-                        ones_const
-                            .get_output(0)
-                            .map_err(|e| GraphError::ConversionFailed {
-                                format: "trtx".to_string(),
-                                reason: format!("LayerNorm axes=[]: ones const output: {}", e),
-                            })?;
+                    let ones_tensor = ones_const.get_output(&*network, 0).map_err(|e| {
+                        GraphError::ConversionFailed {
+                            format: "trtx".to_string(),
+                            reason: format!("LayerNorm axes=[]: ones const output: {}", e),
+                        }
+                    })?;
                     let (bias_bc, _) = Self::ensure_broadcast_compatible(
                         network,
                         bias,
@@ -3612,12 +3616,13 @@ impl TrtxConverter {
                         format: "trtx".to_string(),
                         reason: format!("LayerNorm axes=[]: failed to add bias: {}", e),
                     })?;
-                result = add_layer
-                    .get_output(0)
-                    .map_err(|e| GraphError::ConversionFailed {
-                        format: "trtx".to_string(),
-                        reason: format!("LayerNorm axes=[]: bias add output: {}", e),
-                    })?;
+                result =
+                    add_layer
+                        .get_output(&*network, 0)
+                        .map_err(|e| GraphError::ConversionFailed {
+                            format: "trtx".to_string(),
+                            reason: format!("LayerNorm axes=[]: bias add output: {}", e),
+                        })?;
             }
             let output_id = operation.output_operands_slice()[0];
             tensor_map.insert(output_id, result);
@@ -3632,14 +3637,19 @@ impl TrtxConverter {
 
         // Compute mean: E[x]
         let mean_layer = network
-            .add_reduce(input, ReduceOperation::kAVG, axes_mask, true)
+            .add_reduce(
+                input,
+                ReduceOperation::kAVG.into(),
+                Axes::from_bits(axes_mask),
+                true,
+            )
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to add mean reduce for layer norm: {}", e),
             })?;
 
         let mean = mean_layer
-            .get_output(0)
+            .get_output(&*network, 0)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get mean output: {}", e),
@@ -3653,12 +3663,13 @@ impl TrtxConverter {
                 reason: format!("Failed to add sub for layer norm: {}", e),
             })?;
 
-        let x_minus_mean = sub_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get sub output: {}", e),
-            })?;
+        let x_minus_mean =
+            sub_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get sub output: {}", e),
+                })?;
 
         // (x - mean)^2
         let square_layer = network
@@ -3668,36 +3679,43 @@ impl TrtxConverter {
                 reason: format!("Failed to add square for layer norm: {}", e),
             })?;
 
-        let squared = square_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get square output: {}", e),
-            })?;
+        let squared =
+            square_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get square output: {}", e),
+                })?;
 
         // variance = mean((x - mean)^2)
         let var_layer = network
-            .add_reduce(&squared, ReduceOperation::kAVG, axes_mask, true)
+            .add_reduce(
+                &squared,
+                ReduceOperation::kAVG.into(),
+                Axes::from_bits(axes_mask),
+                true,
+            )
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to add variance reduce for layer norm: {}", e),
             })?;
 
-        let variance = var_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get variance output: {}", e),
-            })?;
+        let variance =
+            var_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get variance output: {}", e),
+                })?;
 
         // variance + epsilon per WebNN spec (then sqrt)
         let var_dims = variance
-            .dimensions()
+            .dimensions(&*network)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("LayerNorm: failed to get variance dimensions: {}", e),
             })?;
-        let var_shape: Vec<i32> = var_dims.iter().map(|&d| d as i32).collect();
+        let var_shape: Vec<i64> = var_dims.clone();
         let num_var_el: usize = var_dims.iter().map(|&d| d as usize).product();
         let input_operand = graph
             .operand(operation.input_operands()[0])
@@ -3722,17 +3740,15 @@ impl TrtxConverter {
                 TrtDataType::kFLOAT,
             ),
         };
-        temp_weights.push(epsilon_bytes);
-        let epsilon_ref = temp_weights.last().unwrap().as_slice();
         let epsilon_const = network
-            .add_constant(&var_shape, epsilon_ref, epsilon_dtype)
+            .add_small_constant_copied(&var_shape, &epsilon_bytes, epsilon_dtype)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("LayerNorm: failed to add epsilon constant: {}", e),
             })?;
         let epsilon_out =
             epsilon_const
-                .get_output(0)
+                .get_output(&*network, 0)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("LayerNorm: epsilon const output: {}", e),
@@ -3745,7 +3761,7 @@ impl TrtxConverter {
             })?;
         let variance_eps =
             var_plus_eps
-                .get_output(0)
+                .get_output(&*network, 0)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("LayerNorm: variance+eps output: {}", e),
@@ -3759,12 +3775,13 @@ impl TrtxConverter {
                 reason: format!("Failed to add sqrt for layer norm: {}", e),
             })?;
 
-        let std_dev = sqrt_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get sqrt output: {}", e),
-            })?;
+        let std_dev =
+            sqrt_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get sqrt output: {}", e),
+                })?;
 
         // (x - mean) / sqrt(variance + epsilon)
         let div_layer = network
@@ -3774,34 +3791,37 @@ impl TrtxConverter {
                 reason: format!("Failed to add div for layer norm: {}", e),
             })?;
 
-        let mut result = div_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get div output: {}", e),
-            })?;
+        let mut result =
+            div_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get div output: {}", e),
+                })?;
 
         // Reshape scale/bias so they broadcast to result. Scale/bias have shape [d_axes[0], d_axes[1], ...]
         // in axis order; result has input shape. Broadcast shape: for each result dim i, use
         // scale_bias dim at that axis position if i is in axes, else 1.
-        let reshape_scale_bias_to_result_rank = |network: &mut trtx::NetworkDefinition,
-                                                 tensor: &trtx::Tensor,
-                                                 result: &trtx::Tensor,
+        let reshape_scale_bias_to_result_rank = |network: &mut trtx::NetworkDefinition<'a>,
+                                                 tensor: &trtx::Tensor<'a>,
+                                                 result: &trtx::Tensor<'a>,
                                                  op_name: &str,
                                                  axes: &[u32]|
-         -> Result<trtx::Tensor, GraphError> {
-            let result_dims = result
-                .dimensions()
-                .map_err(|e| GraphError::ConversionFailed {
-                    format: "trtx".to_string(),
-                    reason: format!("LayerNorm {}: result dims: {}", op_name, e),
-                })?;
-            let tensor_dims = tensor
-                .dimensions()
-                .map_err(|e| GraphError::ConversionFailed {
-                    format: "trtx".to_string(),
-                    reason: format!("LayerNorm {}: tensor dims: {}", op_name, e),
-                })?;
+         -> Result<trtx::Tensor<'a>, GraphError> {
+            let result_dims =
+                result
+                    .dimensions(&*network)
+                    .map_err(|e| GraphError::ConversionFailed {
+                        format: "trtx".to_string(),
+                        reason: format!("LayerNorm {}: result dims: {}", op_name, e),
+                    })?;
+            let tensor_dims =
+                tensor
+                    .dimensions(&*network)
+                    .map_err(|e| GraphError::ConversionFailed {
+                        format: "trtx".to_string(),
+                        reason: format!("LayerNorm {}: tensor dims: {}", op_name, e),
+                    })?;
             if tensor_dims.len() >= result_dims.len() {
                 let id_layer =
                     network
@@ -3811,7 +3831,7 @@ impl TrtxConverter {
                             reason: format!("LayerNorm {}: identity: {}", op_name, e),
                         })?;
                 return id_layer
-                    .get_output(0)
+                    .get_output(&*network, 0)
                     .map_err(|e| GraphError::ConversionFailed {
                         format: "trtx".to_string(),
                         reason: format!("LayerNorm {}: identity output: {}", op_name, e),
@@ -3862,20 +3882,23 @@ impl TrtxConverter {
                     })?;
             if let Some(ref perm) = transpose_perm {
                 shuffle
-                    .set_first_transpose(perm)
+                    .set_first_transpose(network, perm.as_slice())
                     .map_err(|e| GraphError::ConversionFailed {
                         format: "trtx".to_string(),
                         reason: format!("LayerNorm {}: set transpose: {}", op_name, e),
                     })?;
             }
-            shuffle.set_reshape_dimensions(&new_shape).map_err(|e| {
+            let new_shape_i64: Vec<i64> = new_shape.iter().map(|&d| d as i64).collect();
+            shuffle
+                .set_reshape_dimensions(network, &new_shape_i64)
+                .map_err(|e| {
                 GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("LayerNorm {}: set reshape: {}", op_name, e),
                 }
             })?;
             shuffle
-                .get_output(0)
+                .get_output(&*network, 0)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("LayerNorm {}: shuffle output: {}", op_name, e),
@@ -3910,12 +3933,13 @@ impl TrtxConverter {
                         format: "trtx".to_string(),
                         reason: format!("Failed to add bias: {}", e),
                     })?;
-                result = add_layer
-                    .get_output(0)
-                    .map_err(|e| GraphError::ConversionFailed {
-                        format: "trtx".to_string(),
-                        reason: format!("Failed to get add output: {}", e),
-                    })?;
+                result =
+                    add_layer
+                        .get_output(&*network, 0)
+                        .map_err(|e| GraphError::ConversionFailed {
+                            format: "trtx".to_string(),
+                            reason: format!("Failed to get add output: {}", e),
+                        })?;
             } else {
                 let mul_layer = network
                     .add_elementwise(&result, &opt_1_bc, ElementWiseOperation::kPROD)
@@ -3923,12 +3947,13 @@ impl TrtxConverter {
                         format: "trtx".to_string(),
                         reason: format!("Failed to add scale: {}", e),
                     })?;
-                result = mul_layer
-                    .get_output(0)
-                    .map_err(|e| GraphError::ConversionFailed {
-                        format: "trtx".to_string(),
-                        reason: format!("Failed to get mul output: {}", e),
-                    })?;
+                result =
+                    mul_layer
+                        .get_output(&*network, 0)
+                        .map_err(|e| GraphError::ConversionFailed {
+                            format: "trtx".to_string(),
+                            reason: format!("Failed to get mul output: {}", e),
+                        })?;
             }
         }
 
@@ -3949,12 +3974,13 @@ impl TrtxConverter {
                     reason: format!("Failed to add bias: {}", e),
                 })?;
 
-            result = add_layer
-                .get_output(0)
-                .map_err(|e| GraphError::ConversionFailed {
-                    format: "trtx".to_string(),
-                    reason: format!("Failed to get add output: {}", e),
-                })?;
+            result =
+                add_layer
+                    .get_output(&*network, 0)
+                    .map_err(|e| GraphError::ConversionFailed {
+                        format: "trtx".to_string(),
+                        reason: format!("Failed to get add output: {}", e),
+                    })?;
         }
 
         let output_ids = operation.output_operands_slice();
@@ -3969,9 +3995,9 @@ impl TrtxConverter {
 
     /// Add reduction operation (sum, mean, max, min, product).
     /// Axes optional: when missing, default to all axes (0..rank). Empty axes -> identity.
-    fn add_reduce_op(
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+    fn add_reduce_op<'a>(
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
         reduce_op: ReduceOperation,
     ) -> Result<(), GraphError> {
@@ -3983,7 +4009,7 @@ impl TrtxConverter {
             })?;
 
         let input_dims = input
-            .dimensions()
+            .dimensions(&*network)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Reduce: input dimensions: {}", e),
@@ -4004,12 +4030,13 @@ impl TrtxConverter {
                         format: "trtx".to_string(),
                         reason: format!("Reduce axes=[] identity: {}", e),
                     })?;
-            let output = id_layer
-                .get_output(0)
-                .map_err(|e| GraphError::ConversionFailed {
-                    format: "trtx".to_string(),
-                    reason: format!("Reduce axes=[] output: {}", e),
-                })?;
+            let output =
+                id_layer
+                    .get_output(&*network, 0)
+                    .map_err(|e| GraphError::ConversionFailed {
+                        format: "trtx".to_string(),
+                        reason: format!("Reduce axes=[] output: {}", e),
+                    })?;
             let output_id = operation.output_operands_slice()[0];
             tensor_map.insert(output_id, output);
             return Ok(());
@@ -4023,14 +4050,19 @@ impl TrtxConverter {
         let keep_dims = opts.map(|o| o.keep_dimensions).unwrap_or(false);
 
         let layer = network
-            .add_reduce(input, reduce_op, axes_mask, keep_dims)
+            .add_reduce(
+                input,
+                reduce_op.into(),
+                Axes::from_bits(axes_mask),
+                keep_dims,
+            )
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to add reduce operation: {}", e),
             })?;
 
         let output = layer
-            .get_output(0)
+            .get_output(&*network, 0)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get layer output: {}", e),
@@ -4043,9 +4075,9 @@ impl TrtxConverter {
     }
 
     /// Add reduceL1 operation: sum(abs(x)). Axes optional; empty axes -> output = abs(input).
-    fn add_reduce_l1_op(
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+    fn add_reduce_l1_op<'a>(
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
         let input = tensor_map
@@ -4062,15 +4094,16 @@ impl TrtxConverter {
                 reason: format!("Failed to add abs for L1: {}", e),
             })?;
 
-        let abs_output = abs_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get abs output: {}", e),
-            })?;
+        let abs_output =
+            abs_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get abs output: {}", e),
+                })?;
 
         let input_dims = input
-            .dimensions()
+            .dimensions(&*network)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("ReduceL1: input dimensions: {}", e),
@@ -4097,14 +4130,19 @@ impl TrtxConverter {
         let keep_dims = opts.map(|o| o.keep_dimensions).unwrap_or(false);
 
         let layer = network
-            .add_reduce(&abs_output, ReduceOperation::kSUM, axes_mask, keep_dims)
+            .add_reduce(
+                &abs_output,
+                ReduceOperation::kSUM.into(),
+                Axes::from_bits(axes_mask),
+                keep_dims,
+            )
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to add reduce for L1: {}", e),
             })?;
 
         let output = layer
-            .get_output(0)
+            .get_output(&*network, 0)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get layer output: {}", e),
@@ -4118,10 +4156,10 @@ impl TrtxConverter {
 
     /// Add reduceL2 operation: sqrt(sum(x^2)). Axes optional; empty axes -> output = sqrt(x^2) = |x|.
     /// For float16 input, sum of squares can overflow; do reduce in float32 then cast back.
-    fn add_reduce_l2_op(
+    fn add_reduce_l2_op<'a>(
         graph: &GraphInfo,
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
         let input = tensor_map
@@ -4145,14 +4183,14 @@ impl TrtxConverter {
 
         let square_output =
             square_layer
-                .get_output(0)
+                .get_output(&*network, 0)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("Failed to get square output: {}", e),
                 })?;
 
         let input_dims = input
-            .dimensions()
+            .dimensions(&*network)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("ReduceL2: input dimensions: {}", e),
@@ -4172,12 +4210,13 @@ impl TrtxConverter {
                     format: "trtx".to_string(),
                     reason: format!("ReduceL2 axes=[] sqrt: {}", e),
                 })?;
-            let output = sqrt_layer
-                .get_output(0)
-                .map_err(|e| GraphError::ConversionFailed {
-                    format: "trtx".to_string(),
-                    reason: format!("ReduceL2 axes=[] output: {}", e),
-                })?;
+            let output =
+                sqrt_layer
+                    .get_output(&*network, 0)
+                    .map_err(|e| GraphError::ConversionFailed {
+                        format: "trtx".to_string(),
+                        reason: format!("ReduceL2 axes=[] output: {}", e),
+                    })?;
             let output_id = operation.output_operands_slice()[0];
             tensor_map.insert(output_id, output);
             return Ok(());
@@ -4193,18 +4232,24 @@ impl TrtxConverter {
         // Always reduce in float32 to avoid overflow (sum of squares can exceed float16 range).
         let to_reduce = Self::cast_to_float32(network, &square_output)?;
         let sum_layer = network
-            .add_reduce(&to_reduce, ReduceOperation::kSUM, axes_mask, keep_dims)
+            .add_reduce(
+                &to_reduce,
+                ReduceOperation::kSUM.into(),
+                Axes::from_bits(axes_mask),
+                keep_dims,
+            )
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to add reduce for L2: {}", e),
             })?;
 
-        let sum_output = sum_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get sum output: {}", e),
-            })?;
+        let sum_output =
+            sum_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get sum output: {}", e),
+                })?;
 
         let sqrt_layer = network
             .add_unary(&sum_output, UnaryOperation::kSQRT)
@@ -4213,12 +4258,13 @@ impl TrtxConverter {
                 reason: format!("Failed to add sqrt for L2: {}", e),
             })?;
 
-        let sqrt_output = sqrt_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get layer output: {}", e),
-            })?;
+        let sqrt_output =
+            sqrt_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get layer output: {}", e),
+                })?;
 
         let output = if input_dtype == DataType::Float16 {
             Self::cast_to_float16(network, &sqrt_output)?
@@ -4232,9 +4278,9 @@ impl TrtxConverter {
     }
 
     /// Add reduceLogSum operation: log(sum(x)). Axes optional; empty axes -> output = log(x).
-    fn add_reduce_log_sum_op(
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+    fn add_reduce_log_sum_op<'a>(
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
         let input = tensor_map
@@ -4245,7 +4291,7 @@ impl TrtxConverter {
             })?;
 
         let input_dims = input
-            .dimensions()
+            .dimensions(&*network)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("ReduceLogSum: input dimensions: {}", e),
@@ -4265,12 +4311,13 @@ impl TrtxConverter {
                     format: "trtx".to_string(),
                     reason: format!("ReduceLogSum axes=[] log: {}", e),
                 })?;
-            let output = log_layer
-                .get_output(0)
-                .map_err(|e| GraphError::ConversionFailed {
-                    format: "trtx".to_string(),
-                    reason: format!("ReduceLogSum axes=[] output: {}", e),
-                })?;
+            let output =
+                log_layer
+                    .get_output(&*network, 0)
+                    .map_err(|e| GraphError::ConversionFailed {
+                        format: "trtx".to_string(),
+                        reason: format!("ReduceLogSum axes=[] output: {}", e),
+                    })?;
             let output_id = operation.output_operands_slice()[0];
             tensor_map.insert(output_id, output);
             return Ok(());
@@ -4284,18 +4331,24 @@ impl TrtxConverter {
         let keep_dims = opts.map(|o| o.keep_dimensions).unwrap_or(false);
 
         let sum_layer = network
-            .add_reduce(input, ReduceOperation::kSUM, axes_mask, keep_dims)
+            .add_reduce(
+                input,
+                ReduceOperation::kSUM.into(),
+                Axes::from_bits(axes_mask),
+                keep_dims,
+            )
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to add reduce for LogSum: {}", e),
             })?;
 
-        let sum_output = sum_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get sum output: {}", e),
-            })?;
+        let sum_output =
+            sum_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get sum output: {}", e),
+                })?;
 
         // Then log
         let log_layer = network
@@ -4305,12 +4358,13 @@ impl TrtxConverter {
                 reason: format!("Failed to add log for LogSum: {}", e),
             })?;
 
-        let output = log_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get layer output: {}", e),
-            })?;
+        let output =
+            log_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get layer output: {}", e),
+                })?;
 
         let output_ids = operation.output_operands_slice();
         let output_id = output_ids[0];
@@ -4319,9 +4373,9 @@ impl TrtxConverter {
     }
 
     /// Add reduceLogSumExp operation: log(sum(exp(x))). Axes optional; empty axes -> output = x.
-    fn add_reduce_log_sum_exp_op(
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+    fn add_reduce_log_sum_exp_op<'a>(
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
         let input = tensor_map
@@ -4338,15 +4392,16 @@ impl TrtxConverter {
                 reason: format!("Failed to add exp for LogSumExp: {}", e),
             })?;
 
-        let exp_output = exp_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get exp output: {}", e),
-            })?;
+        let exp_output =
+            exp_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get exp output: {}", e),
+                })?;
 
         let input_dims = input
-            .dimensions()
+            .dimensions(&*network)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("ReduceLogSumExp: input dimensions: {}", e),
@@ -4367,12 +4422,13 @@ impl TrtxConverter {
                         format: "trtx".to_string(),
                         reason: format!("ReduceLogSumExp axes=[] identity: {}", e),
                     })?;
-            let output = id_layer
-                .get_output(0)
-                .map_err(|e| GraphError::ConversionFailed {
-                    format: "trtx".to_string(),
-                    reason: format!("ReduceLogSumExp axes=[] output: {}", e),
-                })?;
+            let output =
+                id_layer
+                    .get_output(&*network, 0)
+                    .map_err(|e| GraphError::ConversionFailed {
+                        format: "trtx".to_string(),
+                        reason: format!("ReduceLogSumExp axes=[] output: {}", e),
+                    })?;
             let output_id = operation.output_operands_slice()[0];
             tensor_map.insert(output_id, output);
             return Ok(());
@@ -4386,18 +4442,24 @@ impl TrtxConverter {
         let keep_dims = opts.map(|o| o.keep_dimensions).unwrap_or(false);
 
         let sum_layer = network
-            .add_reduce(&exp_output, ReduceOperation::kSUM, axes_mask, keep_dims)
+            .add_reduce(
+                &exp_output,
+                ReduceOperation::kSUM.into(),
+                Axes::from_bits(axes_mask),
+                keep_dims,
+            )
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to add reduce for LogSumExp: {}", e),
             })?;
 
-        let sum_output = sum_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get sum output: {}", e),
-            })?;
+        let sum_output =
+            sum_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get sum output: {}", e),
+                })?;
 
         // Finally log
         let log_layer = network
@@ -4407,12 +4469,13 @@ impl TrtxConverter {
                 reason: format!("Failed to add log for LogSumExp: {}", e),
             })?;
 
-        let output = log_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get layer output: {}", e),
-            })?;
+        let output =
+            log_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get layer output: {}", e),
+                })?;
 
         let output_ids = operation.output_operands_slice();
         let output_id = output_ids[0];
@@ -4421,9 +4484,9 @@ impl TrtxConverter {
     }
 
     /// Add reduceSumSquare operation: sum(x^2). Axes optional; empty axes -> output = x^2.
-    fn add_reduce_sum_square_op(
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+    fn add_reduce_sum_square_op<'a>(
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
         let input = tensor_map
@@ -4442,14 +4505,14 @@ impl TrtxConverter {
 
         let square_output =
             square_layer
-                .get_output(0)
+                .get_output(&*network, 0)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("Failed to get square output: {}", e),
                 })?;
 
         let input_dims = input
-            .dimensions()
+            .dimensions(&*network)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("ReduceSumSquare: input dimensions: {}", e),
@@ -4476,14 +4539,19 @@ impl TrtxConverter {
         let keep_dims = opts.map(|o| o.keep_dimensions).unwrap_or(false);
 
         let layer = network
-            .add_reduce(&square_output, ReduceOperation::kSUM, axes_mask, keep_dims)
+            .add_reduce(
+                &square_output,
+                ReduceOperation::kSUM.into(),
+                Axes::from_bits(axes_mask),
+                keep_dims,
+            )
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to add reduce for SumSquare: {}", e),
             })?;
 
         let output = layer
-            .get_output(0)
+            .get_output(&*network, 0)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get layer output: {}", e),
@@ -4500,9 +4568,9 @@ impl TrtxConverter {
     // ============================================================================
 
     /// Add slice operation
-    fn add_slice_op(
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+    fn add_slice_op<'a>(
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
         let input = tensor_map
@@ -4544,12 +4612,13 @@ impl TrtxConverter {
                         format: "trtx".to_string(),
                         reason: format!("Slice no-op identity: {}", e),
                     })?;
-            let output = id_layer
-                .get_output(0)
-                .map_err(|e| GraphError::ConversionFailed {
-                    format: "trtx".to_string(),
-                    reason: format!("Slice no-op output: {}", e),
-                })?;
+            let output =
+                id_layer
+                    .get_output(&*network, 0)
+                    .map_err(|e| GraphError::ConversionFailed {
+                        format: "trtx".to_string(),
+                        reason: format!("Slice no-op output: {}", e),
+                    })?;
             let output_id = operation.output_operands_slice()[0];
             tensor_map.insert(output_id, output);
             return Ok(());
@@ -4579,15 +4648,19 @@ impl TrtxConverter {
             })
             .collect();
 
+        let starts_i64: Vec<i64> = starts.iter().map(|&x| x as i64).collect();
+        let trt_sizes_i64: Vec<i64> = trt_sizes.iter().map(|&x| x as i64).collect();
+        let strides_i64: Vec<i64> = strides.iter().map(|&x| x as i64).collect();
+
         let layer = network
-            .add_slice(input, &starts, &trt_sizes, &strides)
+            .add_slice(input, &starts_i64, &trt_sizes_i64, &strides_i64)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to add slice layer: {}", e),
             })?;
 
         let output = layer
-            .get_output(0)
+            .get_output(&*network, 0)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get layer output: {}", e),
@@ -4600,9 +4673,9 @@ impl TrtxConverter {
     }
 
     /// Add split operation
-    fn add_split_op(
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+    fn add_split_op<'a>(
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
         let input_id = operation.input_operands()[0];
@@ -4612,7 +4685,7 @@ impl TrtxConverter {
                 format: "trtx".to_string(),
                 reason: format!("Input operand {} not found", input_id),
             })?
-            .dimensions()
+            .dimensions(&*network)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get input shape: {}", e),
@@ -4671,13 +4744,13 @@ impl TrtxConverter {
             });
         }
 
-        let mut offset = 0i32;
+        let mut offset = 0i64;
         for (k, &size_k) in splits.iter().enumerate() {
-            let mut starts = vec![0i32; ndim];
+            let mut starts = vec![0i64; ndim];
             starts[axis as usize] = offset;
             let mut sizes = input_dims.clone();
-            sizes[axis as usize] = size_k;
-            let strides = vec![1i32; ndim];
+            sizes[axis as usize] = size_k as i64;
+            let strides = vec![1i64; ndim];
 
             let output = {
                 let input =
@@ -4694,7 +4767,7 @@ impl TrtxConverter {
                         reason: format!("Failed to add slice layer for split {}: {}", k, e),
                     })?;
                 layer
-                    .get_output(0)
+                    .get_output(&*network, 0)
                     .map_err(|e| GraphError::ConversionFailed {
                         format: "trtx".to_string(),
                         reason: format!("Failed to get layer output for split {}: {}", k, e),
@@ -4702,16 +4775,16 @@ impl TrtxConverter {
             };
 
             tensor_map.insert(output_ids[k], output);
-            offset += size_k;
+            offset += size_k as i64;
         }
 
         Ok(())
     }
 
     /// Add squeeze operation (remove dimensions of size 1)
-    fn add_squeeze_op(
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+    fn add_squeeze_op<'a>(
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
         let input = tensor_map
@@ -4739,7 +4812,7 @@ impl TrtxConverter {
         // For now, this creates the layer structure correctly
 
         let output = layer
-            .get_output(0)
+            .get_output(&*network, 0)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get layer output: {}", e),
@@ -4752,9 +4825,9 @@ impl TrtxConverter {
     }
 
     /// Add unsqueeze operation (add dimensions of size 1)
-    fn add_unsqueeze_op(
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+    fn add_unsqueeze_op<'a>(
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
         let input = tensor_map
@@ -4798,7 +4871,7 @@ impl TrtxConverter {
         // with the expanded shape (inserting 1s at specified axes)
 
         let output = layer
-            .get_output(0)
+            .get_output(&*network, 0)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get layer output: {}", e),
@@ -4812,12 +4885,12 @@ impl TrtxConverter {
 
     /// Add expand operation (broadcast to new shape)
     /// Implemented as input * ones(new_shape) so elementwise broadcast produces the expanded tensor.
-    fn add_expand_op(
+    fn add_expand_op<'a>(
         graph: &GraphInfo,
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
-        temp_weights: &mut Vec<Vec<u8>>,
+        _temp_weights: &mut Vec<Vec<u8>>,
     ) -> Result<(), GraphError> {
         let input = tensor_map
             .get(&operation.input_operands()[0])
@@ -4875,21 +4948,20 @@ impl TrtxConverter {
                 (data, trtx::DataType::kFLOAT)
             }
         };
-        temp_weights.push(ones_data);
-        let ones_ref = temp_weights.last().unwrap().as_slice();
-
+        let new_shape_i64: Vec<i64> = new_shape.iter().map(|&d| d as i64).collect();
         let ones_const = network
-            .add_constant(&new_shape, ones_ref, trt_dtype)
+            .add_small_constant_copied(&new_shape_i64, &ones_data, trt_dtype)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to create ones constant for expand: {}", e),
             })?;
-        let ones_tensor = ones_const
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get ones constant output: {}", e),
-            })?;
+        let ones_tensor =
+            ones_const
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get ones constant output: {}", e),
+                })?;
 
         let (bc_input, bc_ones) =
             Self::ensure_broadcast_compatible(network, input, &ones_tensor, "expand")?;
@@ -4900,12 +4972,13 @@ impl TrtxConverter {
                 format: "trtx".to_string(),
                 reason: format!("Failed to add multiply for expand: {}", e),
             })?;
-        let output = mul_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get expand output: {}", e),
-            })?;
+        let output =
+            mul_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get expand output: {}", e),
+                })?;
 
         let output_ids = operation.output_operands_slice();
         let output_id = output_ids[0];
@@ -4914,9 +4987,9 @@ impl TrtxConverter {
     }
 
     /// Add tile operation (repeat tensor along axes)
-    fn add_tile_op(
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+    fn add_tile_op<'a>(
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
         let repetitions = match operation {
@@ -4956,7 +5029,8 @@ impl TrtxConverter {
                     })?;
 
             // Create a vector of references to the same tensor, repeated 'reps' times
-            let tensors_to_concat: Vec<&trtx::Tensor> = (0..reps).map(|_| current_tensor).collect();
+            let tensors_to_concat: Vec<&trtx::Tensor<'a>> =
+                (0..reps).map(|_| current_tensor).collect();
 
             // Concatenate along this axis
             let mut concat_layer = network.add_concatenation(&tensors_to_concat).map_err(|e| {
@@ -4967,17 +5041,12 @@ impl TrtxConverter {
             })?;
 
             // Set the concatenation axis
-            concat_layer
-                .set_axis(axis as i32)
-                .map_err(|e| GraphError::ConversionFailed {
-                    format: "trtx".to_string(),
-                    reason: format!("Failed to set concatenation axis {}: {}", axis, e),
-                })?;
+            concat_layer.set_axis(network, axis as i32);
 
             // Get the output tensor
             let output_tensor =
                 concat_layer
-                    .get_output(0)
+                    .get_output(&*network, 0)
                     .map_err(|e| GraphError::ConversionFailed {
                         format: "trtx".to_string(),
                         reason: format!(
@@ -5009,13 +5078,12 @@ impl TrtxConverter {
                         reason: format!("Failed to add identity layer: {}", e),
                     }
                 })?;
-                let output_tensor =
-                    identity_layer
-                        .get_output(0)
-                        .map_err(|e| GraphError::ConversionFailed {
-                            format: "trtx".to_string(),
-                            reason: format!("Failed to get identity output: {}", e),
-                        })?;
+                let output_tensor = identity_layer.get_output(&*network, 0).map_err(|e| {
+                    GraphError::ConversionFailed {
+                        format: "trtx".to_string(),
+                        reason: format!("Failed to get identity output: {}", e),
+                    }
+                })?;
                 tensor_map.insert(output_id, output_tensor);
             }
         }
@@ -5028,9 +5096,9 @@ impl TrtxConverter {
     // ============================================================================
 
     /// Add greaterOrEqual operation (greater(x, y) OR equal(x, y))
-    fn add_greater_or_equal_op(
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+    fn add_greater_or_equal_op<'a>(
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
         let input0 = tensor_map
@@ -5060,7 +5128,7 @@ impl TrtxConverter {
 
         let greater_output =
             greater_layer
-                .get_output(0)
+                .get_output(&*network, 0)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("Failed to get greater output: {}", e),
@@ -5073,12 +5141,13 @@ impl TrtxConverter {
                 reason: format!("Failed to add equal layer: {}", e),
             })?;
 
-        let equal_output = equal_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get equal output: {}", e),
-            })?;
+        let equal_output =
+            equal_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get equal output: {}", e),
+                })?;
 
         let or_layer = network
             .add_elementwise(&greater_output, &equal_output, ElementWiseOperation::kOR)
@@ -5087,12 +5156,13 @@ impl TrtxConverter {
                 reason: format!("Failed to add OR layer: {}", e),
             })?;
 
-        let bool_output = or_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get OR output: {}", e),
-            })?;
+        let bool_output =
+            or_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get OR output: {}", e),
+                })?;
 
         // Cast BOOL to Float32 for WebNN compatibility
         let output = Self::cast_to_float32(network, &bool_output)?;
@@ -5104,9 +5174,9 @@ impl TrtxConverter {
     }
 
     /// Add lesserOrEqual operation (lesser(x, y) OR equal(x, y))
-    fn add_lesser_or_equal_op(
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+    fn add_lesser_or_equal_op<'a>(
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
         let input0 = tensor_map
@@ -5136,7 +5206,7 @@ impl TrtxConverter {
 
         let lesser_output =
             lesser_layer
-                .get_output(0)
+                .get_output(&*network, 0)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("Failed to get lesser output: {}", e),
@@ -5149,12 +5219,13 @@ impl TrtxConverter {
                 reason: format!("Failed to add equal layer: {}", e),
             })?;
 
-        let equal_output = equal_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get equal output: {}", e),
-            })?;
+        let equal_output =
+            equal_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get equal output: {}", e),
+                })?;
 
         let or_layer = network
             .add_elementwise(&lesser_output, &equal_output, ElementWiseOperation::kOR)
@@ -5163,12 +5234,13 @@ impl TrtxConverter {
                 reason: format!("Failed to add OR layer: {}", e),
             })?;
 
-        let bool_output = or_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get OR output: {}", e),
-            })?;
+        let bool_output =
+            or_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get OR output: {}", e),
+                })?;
 
         // Cast BOOL to Float32 for WebNN compatibility
         let output = Self::cast_to_float32(network, &bool_output)?;
@@ -5180,9 +5252,9 @@ impl TrtxConverter {
     }
 
     /// Add notEqual operation (NOT equal(x, y))
-    fn add_not_equal_op(
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+    fn add_not_equal_op<'a>(
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
         let input0 = tensor_map
@@ -5210,12 +5282,13 @@ impl TrtxConverter {
                 reason: format!("Failed to add equal layer: {}", e),
             })?;
 
-        let equal_output = equal_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get equal output: {}", e),
-            })?;
+        let equal_output =
+            equal_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get equal output: {}", e),
+                })?;
 
         let not_layer = network
             .add_unary(&equal_output, UnaryOperation::kNOT)
@@ -5224,12 +5297,13 @@ impl TrtxConverter {
                 reason: format!("Failed to add NOT layer: {}", e),
             })?;
 
-        let bool_output = not_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get NOT output: {}", e),
-            })?;
+        let bool_output =
+            not_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get NOT output: {}", e),
+                })?;
 
         // Cast BOOL to Float32 for WebNN compatibility
         let output = Self::cast_to_float32(network, &bool_output)?;
@@ -5246,12 +5320,12 @@ impl TrtxConverter {
 
     /// Add gather operation (gather elements along an axis using indices).
     /// Clamps indices to [-dim_size, dim_size - 1] to match WebNN/Chromium behavior and avoid TensorRT out-of-bounds.
-    fn add_gather_op(
+    fn add_gather_op<'a>(
         graph: &GraphInfo,
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
-        temp_weights: &mut Vec<Vec<u8>>,
+        _temp_weights: &mut Vec<Vec<u8>>,
     ) -> Result<(), GraphError> {
         let input = tensor_map
             .get(&operation.input_operands()[0])
@@ -5314,6 +5388,7 @@ impl TrtxConverter {
             .iter()
             .map(|d| get_static_or_max_size(d) as i32)
             .collect();
+        let indices_shape_i64: Vec<i64> = indices_shape.iter().map(|&d| d as i64).collect();
 
         // Clamp indices to [-dim_size, dim_size - 1] (WebNN/conformance behavior).
         // TensorRT elementwise requires same rank; repeat scalar to match indices shape.
@@ -5331,37 +5406,33 @@ impl TrtxConverter {
         let max_data: Vec<u8> = (0..num_elements)
             .flat_map(|_| clamp_max_val.to_le_bytes())
             .collect();
-        temp_weights.push(min_data);
-        temp_weights.push(max_data);
-        let idx = temp_weights.len();
-        let min_ref = temp_weights[idx - 2].as_slice();
-        let max_ref = temp_weights[idx - 1].as_slice();
-
         let min_const = network
-            .add_constant(&indices_shape, min_ref, trtx::DataType::kINT32)
+            .add_small_constant_copied(&indices_shape_i64, &min_data, trtx::DataType::kINT32)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to add gather clamp min constant: {}", e),
             })?;
         let max_const = network
-            .add_constant(&indices_shape, max_ref, trtx::DataType::kINT32)
+            .add_small_constant_copied(&indices_shape_i64, &max_data, trtx::DataType::kINT32)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to add gather clamp max constant: {}", e),
             })?;
 
-        let min_const_out = min_const
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get clamp min output: {}", e),
-            })?;
-        let max_const_out = max_const
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get clamp max output: {}", e),
-            })?;
+        let min_const_out =
+            min_const
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get clamp min output: {}", e),
+                })?;
+        let max_const_out =
+            max_const
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get clamp max output: {}", e),
+                })?;
 
         let clamped_upper = network
             .add_elementwise(indices, &max_const_out, ElementWiseOperation::kMIN)
@@ -5371,7 +5442,7 @@ impl TrtxConverter {
             })?;
         let clamped_upper_out =
             clamped_upper
-                .get_output(0)
+                .get_output(&*network, 0)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("Failed to get gather clamp upper output: {}", e),
@@ -5387,12 +5458,13 @@ impl TrtxConverter {
                 format: "trtx".to_string(),
                 reason: format!("Failed to add gather indices clamp (max): {}", e),
             })?;
-        let clamped_indices = clamped
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get gather clamped indices output: {}", e),
-            })?;
+        let clamped_indices =
+            clamped
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get gather clamped indices output: {}", e),
+                })?;
 
         let layer = network
             .add_gather(input, &clamped_indices, axis)
@@ -5402,7 +5474,7 @@ impl TrtxConverter {
             })?;
 
         let output = layer
-            .get_output(0)
+            .get_output(&*network, 0)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get gather output: {}", e),
@@ -5415,9 +5487,9 @@ impl TrtxConverter {
     }
 
     /// Add gatherND operation (N-dimensional gather)
-    fn add_gather_nd_op(
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+    fn add_gather_nd_op<'a>(
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
         let input = tensor_map
@@ -5447,15 +5519,10 @@ impl TrtxConverter {
                 })?;
 
         // Set gather mode to kND for N-dimensional gather
-        layer
-            .set_gather_mode(trtx::GatherMode::kND)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to set gather mode to kND: {}", e),
-            })?;
+        layer.set_gather_mode(network, trtx::GatherMode::kND);
 
         let output = layer
-            .get_output(0)
+            .get_output(&*network, 0)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get gatherND output: {}", e),
@@ -5468,9 +5535,9 @@ impl TrtxConverter {
     }
 
     /// Add scatterElements operation (element-wise scatter)
-    fn add_scatter_elements_op(
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+    fn add_scatter_elements_op<'a>(
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
         let data = tensor_map
@@ -5516,15 +5583,10 @@ impl TrtxConverter {
             })?;
 
         // Set axis for element-wise scatter
-        layer
-            .set_axis(axis)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to set scatter axis: {}", e),
-            })?;
+        layer.set_axis(network, axis);
 
         let output = layer
-            .get_output(0)
+            .get_output(&*network, 0)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get scatterElements output: {}", e),
@@ -5537,9 +5599,9 @@ impl TrtxConverter {
     }
 
     /// Add scatterND operation (N-dimensional scatter)
-    fn add_scatter_nd_op(
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+    fn add_scatter_nd_op<'a>(
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
         let data = tensor_map
@@ -5578,7 +5640,7 @@ impl TrtxConverter {
             })?;
 
         let output = layer
-            .get_output(0)
+            .get_output(&*network, 0)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get scatterND output: {}", e),
@@ -5591,16 +5653,18 @@ impl TrtxConverter {
     }
 
     /// Add argMax operation (find indices of maximum values)
-    fn add_arg_max_op(
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+    fn add_arg_max_op<'a>(
+        graph: &GraphInfo,
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
+        let input_id = operation.input_operands()[0];
         let input = tensor_map
-            .get(&operation.input_operands()[0])
+            .get(&input_id)
             .ok_or_else(|| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
-                reason: format!("Input operand {} not found", operation.input_operands()[0]),
+                reason: format!("Input operand {} not found", input_id),
             })?;
 
         let (axis, keep_dims) = match operation {
@@ -5616,45 +5680,101 @@ impl TrtxConverter {
             }
         };
 
-        // TopK operation: 0=kMAX, 1=kMIN
-        let layer = network
-            .add_topk(input, 0, 1, 1u32 << axis) // operation=kMAX, k=1, axes as bitmask
-            .map_err(|e| GraphError::ConversionFailed {
+        let input_shape = graph
+            .operand(input_id)
+            .ok_or_else(|| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
-                reason: format!("Failed to add topK layer: {}", e),
+                reason: format!("ArgMax input operand {} not in graph", input_id),
+            })?
+            .descriptor
+            .static_or_max_shape();
+        let target_shape_u32 = infer_arg_reduce_shape(&input_shape, axis, keep_dims)?;
+        let target_shape_i64: Vec<i64> = target_shape_u32.iter().map(|&d| d as i64).collect();
+
+        // TensorRT TopK requires at least 2 input dimensions. For 1D [N], use [N, 1] and reduce axis 0.
+        let layer = if input_shape.len() == 1 {
+            let n = input_shape[0] as i64;
+            let mut shuffle_in =
+                network
+                    .add_shuffle(input)
+                    .map_err(|e| GraphError::ConversionFailed {
+                        format: "trtx".to_string(),
+                        reason: format!("ArgMax: unsqueeze 1D input for TopK: {}", e),
+                    })?;
+            shuffle_in
+                .set_reshape_dimensions(network, &[n, 1])
+                .map_err(|e| {
+                GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("ArgMax: set [N,1] reshape: {}", e),
+                }
             })?;
+            let rank2 =
+                shuffle_in
+                    .get_output(&*network, 0)
+                    .map_err(|e| GraphError::ConversionFailed {
+                        format: "trtx".to_string(),
+                        reason: format!("ArgMax: rank-2 TopK input: {}", e),
+                    })?;
+            network
+                .add_topk(
+                    &rank2,
+                    TopKOperation::kMAX,
+                    1,
+                    Axes::from_bits(1u32),
+                ) // kMAX along axis 0 of [N,1]
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to add topK layer: {}", e),
+                })?
+        } else {
+            network
+                .add_topk(
+                    input,
+                    TopKOperation::kMAX,
+                    1,
+                    Axes::from_bits(1u32 << axis),
+                ) // kMAX, k=1, axes bitmask
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to add topK layer: {}", e),
+                })?
+        };
 
         // TopK returns two outputs: values and indices
         // We want indices (output 1)
-        let indices_output = layer
-            .get_output(1)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get topK indices output: {}", e),
-            })?;
-
-        let squeezed_output = if !keep_dims {
-            // Squeeze the k dimension (which is 1)
-            let squeeze_layer =
-                network
-                    .add_shuffle(&indices_output)
-                    .map_err(|e| GraphError::ConversionFailed {
-                        format: "trtx".to_string(),
-                        reason: format!("Failed to add squeeze layer: {}", e),
-                    })?;
-
-            squeeze_layer
-                .get_output(0)
+        let indices_output =
+            layer
+                .get_output(&*network, 1)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
-                    reason: format!("Failed to get squeeze output: {}", e),
-                })?
-        } else {
-            indices_output
-        };
+                    reason: format!("Failed to get topK indices output: {}", e),
+                })?;
+
+        // TopK keeps the reduced axis as size k (=1). Reshape to WebNN argMax output rank.
+        let mut shuffle_layer =
+            network
+                .add_shuffle(&indices_output)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("ArgMax: shuffle for output shape: {}", e),
+                })?;
+        shuffle_layer
+            .set_reshape_dimensions(network, &target_shape_i64)
+            .map_err(|e| GraphError::ConversionFailed {
+                format: "trtx".to_string(),
+                reason: format!("ArgMax: set reshape dimensions: {}", e),
+            })?;
+        let shaped_output =
+            shuffle_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("ArgMax: shuffle output: {}", e),
+                })?;
 
         // Cast INT32 indices to Float32 for WebNN compatibility
-        let final_output = Self::cast_int32_to_float32(network, &squeezed_output)?;
+        let final_output = Self::cast_int32_to_float32(network, &shaped_output)?;
 
         let output_ids = operation.output_operands_slice();
         let output_id = output_ids[0];
@@ -5663,16 +5783,18 @@ impl TrtxConverter {
     }
 
     /// Add argMin operation (find indices of minimum values)
-    fn add_arg_min_op(
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+    fn add_arg_min_op<'a>(
+        graph: &GraphInfo,
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
+        let input_id = operation.input_operands()[0];
         let input = tensor_map
-            .get(&operation.input_operands()[0])
+            .get(&input_id)
             .ok_or_else(|| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
-                reason: format!("Input operand {} not found", operation.input_operands()[0]),
+                reason: format!("Input operand {} not found", input_id),
             })?;
 
         let (axis, keep_dims) = match operation {
@@ -5688,45 +5810,101 @@ impl TrtxConverter {
             }
         };
 
-        // TopK operation: 0=kMAX, 1=kMIN
-        let layer = network
-            .add_topk(input, 1, 1, 1u32 << axis) // operation=kMIN, k=1, axes as bitmask
-            .map_err(|e| GraphError::ConversionFailed {
+        let input_shape = graph
+            .operand(input_id)
+            .ok_or_else(|| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
-                reason: format!("Failed to add topK layer: {}", e),
+                reason: format!("ArgMin input operand {} not in graph", input_id),
+            })?
+            .descriptor
+            .static_or_max_shape();
+        let target_shape_u32 = infer_arg_reduce_shape(&input_shape, axis, keep_dims)?;
+        let target_shape_i64: Vec<i64> = target_shape_u32.iter().map(|&d| d as i64).collect();
+
+        let layer = if input_shape.len() == 1 {
+            let n = input_shape[0] as i64;
+            let mut shuffle_in =
+                network
+                    .add_shuffle(input)
+                    .map_err(|e| GraphError::ConversionFailed {
+                        format: "trtx".to_string(),
+                        reason: format!("ArgMin: unsqueeze 1D input for TopK: {}", e),
+                    })?;
+            shuffle_in
+                .set_reshape_dimensions(network, &[n, 1])
+                .map_err(|e| {
+                GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("ArgMin: set [N,1] reshape: {}", e),
+                }
             })?;
+            let rank2 =
+                shuffle_in
+                    .get_output(&*network, 0)
+                    .map_err(|e| GraphError::ConversionFailed {
+                        format: "trtx".to_string(),
+                        reason: format!("ArgMin: rank-2 TopK input: {}", e),
+                    })?;
+            network
+                .add_topk(
+                    &rank2,
+                    TopKOperation::kMIN,
+                    1,
+                    Axes::from_bits(1u32),
+                ) // kMIN along axis 0 of [N,1]
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to add topK layer: {}", e),
+                })?
+        } else {
+            network
+                .add_topk(
+                    input,
+                    TopKOperation::kMIN,
+                    1,
+                    Axes::from_bits(1u32 << axis),
+                )
+                .map_err(|e| {
+                    GraphError::ConversionFailed {
+                        format: "trtx".to_string(),
+                        reason: format!("Failed to add topK layer: {}", e),
+                    }
+                })?
+        };
 
         // TopK returns two outputs: values and indices
         // We want indices (output 1)
-        let indices_output = layer
-            .get_output(1)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get topK indices output: {}", e),
-            })?;
-
-        let squeezed_output = if !keep_dims {
-            // Squeeze the k dimension (which is 1)
-            let squeeze_layer =
-                network
-                    .add_shuffle(&indices_output)
-                    .map_err(|e| GraphError::ConversionFailed {
-                        format: "trtx".to_string(),
-                        reason: format!("Failed to add squeeze layer: {}", e),
-                    })?;
-
-            squeeze_layer
-                .get_output(0)
+        let indices_output =
+            layer
+                .get_output(&*network, 1)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
-                    reason: format!("Failed to get squeeze output: {}", e),
-                })?
-        } else {
-            indices_output
-        };
+                    reason: format!("Failed to get topK indices output: {}", e),
+                })?;
+
+        let mut shuffle_layer =
+            network
+                .add_shuffle(&indices_output)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("ArgMin: shuffle for output shape: {}", e),
+                })?;
+        shuffle_layer
+            .set_reshape_dimensions(network, &target_shape_i64)
+            .map_err(|e| GraphError::ConversionFailed {
+                format: "trtx".to_string(),
+                reason: format!("ArgMin: set reshape dimensions: {}", e),
+            })?;
+        let shaped_output =
+            shuffle_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("ArgMin: shuffle output: {}", e),
+                })?;
 
         // Cast INT32 indices to Float32 for WebNN compatibility
-        let final_output = Self::cast_int32_to_float32(network, &squeezed_output)?;
+        let final_output = Self::cast_int32_to_float32(network, &shaped_output)?;
 
         let output_ids = operation.output_operands_slice();
         let output_id = output_ids[0];
@@ -5739,12 +5917,12 @@ impl TrtxConverter {
     // ============================================================================
 
     /// Add clamp operation (clip values to range [min, max])
-    fn add_clamp_op(
+    fn add_clamp_op<'a>(
         graph: &GraphInfo,
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
-        temp_weights: &mut Vec<Vec<u8>>,
+        _temp_weights: &mut Vec<Vec<u8>>,
     ) -> Result<(), GraphError> {
         let input = tensor_map
             .get(&operation.input_operands()[0])
@@ -5766,7 +5944,7 @@ impl TrtxConverter {
         let num_dims = input_operand.descriptor.shape.len();
         let input_dtype = input_operand.descriptor.data_type;
         // Create broadcast shape: [1, 1, ..., 1] with same number of dimensions as input
-        let broadcast_shape: Vec<i32> = vec![1; num_dims];
+        let broadcast_shape: Vec<i64> = vec![1i64; num_dims];
 
         // Get min and max values from attributes (handle "Infinity"/"-Infinity"/"NaN" strings from WPT).
         let parse_clamp_bound_f32 = |v: &serde_json::Value| -> Option<f32> {
@@ -5897,10 +6075,8 @@ impl TrtxConverter {
 
         // Implement clamp as: max(min_value, min(input, max_value))
         // First: min(input, max_value)
-        temp_weights.push(max_bytes);
-        let max_const_data = temp_weights.last().unwrap();
         let max_const = network
-            .add_constant(&broadcast_shape, max_const_data, trt_dtype.clone())
+            .add_small_constant_copied(&broadcast_shape, &max_bytes, trt_dtype.clone())
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to add max constant: {}", e),
@@ -5908,7 +6084,7 @@ impl TrtxConverter {
 
         let max_const_output =
             max_const
-                .get_output(0)
+                .get_output(&*network, 0)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("Failed to get max constant output: {}", e),
@@ -5923,17 +6099,15 @@ impl TrtxConverter {
 
         let clamped_upper_output =
             clamped_upper
-                .get_output(0)
+                .get_output(&*network, 0)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("Failed to get upper clamp output: {}", e),
                 })?;
 
         // Second: max(min_value, clamped_upper)
-        temp_weights.push(min_bytes);
-        let min_const_data = temp_weights.last().unwrap();
         let min_const = network
-            .add_constant(&broadcast_shape, min_const_data, trt_dtype)
+            .add_small_constant_copied(&broadcast_shape, &min_bytes, trt_dtype)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to add min constant: {}", e),
@@ -5941,7 +6115,7 @@ impl TrtxConverter {
 
         let min_const_output =
             min_const
-                .get_output(0)
+                .get_output(&*network, 0)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("Failed to get min constant output: {}", e),
@@ -5959,7 +6133,7 @@ impl TrtxConverter {
             })?;
 
         let output = layer
-            .get_output(0)
+            .get_output(&*network, 0)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get clamp output: {}", e),
@@ -5972,9 +6146,9 @@ impl TrtxConverter {
     }
 
     /// Add where operation (select elements based on condition)
-    fn add_where_op(
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+    fn add_where_op<'a>(
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
         let condition = tensor_map
@@ -6018,7 +6192,7 @@ impl TrtxConverter {
             })?;
 
         let output = layer
-            .get_output(0)
+            .get_output(&*network, 0)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get select output: {}", e),
@@ -6031,12 +6205,12 @@ impl TrtxConverter {
     }
 
     /// Add linear operation (alpha * x + beta)
-    fn add_linear_op(
+    fn add_linear_op<'a>(
         graph: &GraphInfo,
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
-        temp_weights: &mut Vec<Vec<u8>>,
+        _temp_weights: &mut Vec<Vec<u8>>,
     ) -> Result<(), GraphError> {
         let input = tensor_map
             .get(&operation.input_operands()[0])
@@ -6057,7 +6231,7 @@ impl TrtxConverter {
             })?;
         let num_dims = input_operand.descriptor.shape.len();
         // Create broadcast shape: [1, 1, ..., 1] with same number of dimensions as input
-        let broadcast_shape: Vec<i32> = vec![1; num_dims];
+        let broadcast_shape: Vec<i64> = vec![1i64; num_dims];
 
         let attrs = operation.attributes();
         let linear_opts = attrs.as_linear();
@@ -6077,23 +6251,19 @@ impl TrtxConverter {
                 ),
                 _ => (alpha.to_le_bytes().to_vec(), trtx::DataType::kFLOAT),
             };
-            temp_weights.push(alpha_bytes);
-            let alpha_bytes_ref = temp_weights.last().unwrap();
-
             let alpha_constant = network
-                .add_constant(&broadcast_shape, alpha_bytes_ref, alpha_dtype)
+                .add_small_constant_copied(&broadcast_shape, &alpha_bytes, alpha_dtype)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("Failed to create alpha constant: {}", e),
                 })?;
 
-            let alpha_tensor =
-                alpha_constant
-                    .get_output(0)
-                    .map_err(|e| GraphError::ConversionFailed {
-                        format: "trtx".to_string(),
-                        reason: format!("Failed to get alpha constant output: {}", e),
-                    })?;
+            let alpha_tensor = alpha_constant.get_output(&*network, 0).map_err(|e| {
+                GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get alpha constant output: {}", e),
+                }
+            })?;
 
             // Multiply: alpha * x
             let mul_layer = network
@@ -6104,7 +6274,7 @@ impl TrtxConverter {
                 })?;
 
             mul_layer
-                .get_output(0)
+                .get_output(&*network, 0)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("Failed to get multiply output: {}", e),
@@ -6119,7 +6289,7 @@ impl TrtxConverter {
                         reason: format!("Failed to add identity layer: {}", e),
                     })?;
             identity_layer
-                .get_output(0)
+                .get_output(&*network, 0)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("Failed to get identity output: {}", e),
@@ -6136,11 +6306,8 @@ impl TrtxConverter {
                 ),
                 _ => (beta.to_le_bytes().to_vec(), trtx::DataType::kFLOAT),
             };
-            temp_weights.push(beta_bytes);
-            let beta_bytes_ref = temp_weights.last().unwrap();
-
             let beta_constant = network
-                .add_constant(&broadcast_shape, beta_bytes_ref, beta_dtype)
+                .add_small_constant_copied(&broadcast_shape, &beta_bytes, beta_dtype)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("Failed to create beta constant: {}", e),
@@ -6148,7 +6315,7 @@ impl TrtxConverter {
 
             let beta_tensor =
                 beta_constant
-                    .get_output(0)
+                    .get_output(&*network, 0)
                     .map_err(|e| GraphError::ConversionFailed {
                         format: "trtx".to_string(),
                         reason: format!("Failed to get beta constant output: {}", e),
@@ -6163,7 +6330,7 @@ impl TrtxConverter {
                 })?;
 
             add_layer
-                .get_output(0)
+                .get_output(&*network, 0)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("Failed to get add output: {}", e),
@@ -6179,9 +6346,9 @@ impl TrtxConverter {
     }
 
     /// Add pad operation (pad tensor with constant/edge/reflection values)
-    fn add_pad_op(
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+    fn add_pad_op<'a>(
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
         let input = tensor_map
@@ -6225,7 +6392,7 @@ impl TrtxConverter {
 
         // Get input dimensions
         let input_dims = input
-            .dimensions()
+            .dimensions(&*network)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get input dimensions: {}", e),
@@ -6249,7 +6416,7 @@ impl TrtxConverter {
                 original_ndims
             );
             // Calculate 4D shape: pad with 1s on the left
-            let mut shape_4d = vec![1; 4 - original_ndims];
+            let mut shape_4d: Vec<i64> = vec![1i64; 4 - original_ndims];
             shape_4d.extend_from_slice(&input_dims);
             eprintln!("[PAD DEBUG] Shape 4D: {:?}", shape_4d);
 
@@ -6263,14 +6430,14 @@ impl TrtxConverter {
                     })?;
 
             reshape_layer
-                .set_reshape_dimensions(&shape_4d)
+                .set_reshape_dimensions(network, &shape_4d)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("Failed to set reshape dimensions: {}", e),
                 })?;
 
             reshape_layer
-                .get_output(0)
+                .get_output(&*network, 0)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("Failed to get reshape output: {}", e),
@@ -6286,7 +6453,7 @@ impl TrtxConverter {
                         reason: format!("Failed to create identity layer: {}", e),
                     })?;
             identity
-                .get_output(0)
+                .get_output(&*network, 0)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("Failed to get identity output: {}", e),
@@ -6300,20 +6467,21 @@ impl TrtxConverter {
         let spatial_dims = 2; // H, W dimensions in NCHW
 
         // Right-align: If we have fewer than 2 padding values, pad LEFT with zeros
-        let mut pre_padding_spatial = vec![0; spatial_dims];
-        let mut post_padding_spatial = vec![0; spatial_dims];
+        let mut pre_padding_spatial: Vec<i64> = vec![0; spatial_dims];
+        let mut post_padding_spatial: Vec<i64> = vec![0; spatial_dims];
 
         let len = pre_padding.len().min(spatial_dims);
         let pad_offset = spatial_dims.saturating_sub(pre_padding.len());
-        let pad_offset_end = pad_offset + len;
 
-        pre_padding_spatial[pad_offset..pad_offset_end].copy_from_slice(&pre_padding[..len]);
-        post_padding_spatial[pad_offset..pad_offset_end].copy_from_slice(&post_padding[..len]);
+        for i in 0..len {
+            pre_padding_spatial[pad_offset + i] = pre_padding[i] as i64;
+            post_padding_spatial[pad_offset + i] = post_padding[i] as i64;
+        }
 
         // Check actual dimensions of input_to_pad
         let input_to_pad_dims =
             input_to_pad
-                .dimensions()
+                .dimensions(&*network)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("Failed to get input_to_pad dimensions: {}", e),
@@ -6346,7 +6514,7 @@ impl TrtxConverter {
 
         let padded_output =
             padding_layer
-                .get_output(0)
+                .get_output(&*network, 0)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("Failed to get padding output: {}", e),
@@ -6358,7 +6526,7 @@ impl TrtxConverter {
             let mut output_shape = input_dims.clone();
             for (i, (&pre, &post)) in pre_padding.iter().zip(post_padding.iter()).enumerate() {
                 if i < output_shape.len() {
-                    output_shape[i] += pre + post;
+                    output_shape[i] += (pre + post) as i64;
                 }
             }
 
@@ -6371,14 +6539,14 @@ impl TrtxConverter {
                     })?;
 
             reshape_back
-                .set_reshape_dimensions(&output_shape)
+                .set_reshape_dimensions(network, &output_shape)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("Failed to set reshape-back dimensions: {}", e),
                 })?;
 
             reshape_back
-                .get_output(0)
+                .get_output(&*network, 0)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("Failed to get reshape-back output: {}", e),
@@ -6395,11 +6563,11 @@ impl TrtxConverter {
 
     /// Add GEMM (General Matrix Multiply) operation
     /// Computes: C = alpha * A * B + beta * C
-    fn add_gemm_op(
+    fn add_gemm_op<'a>(
         _graph: &GraphInfo,
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
-        temp_weights: &mut Vec<Vec<u8>>,
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
+        _temp_weights: &mut Vec<Vec<u8>>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
         let input_a = tensor_map
@@ -6425,13 +6593,13 @@ impl TrtxConverter {
 
         // Get actual dimensions for validation
         let _dims_a = input_a
-            .dimensions()
+            .dimensions(&*network)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get input A dimensions: {}", e),
             })?;
         let _dims_b = input_b
-            .dimensions()
+            .dimensions(&*network)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get input B dimensions: {}", e),
@@ -6453,38 +6621,28 @@ impl TrtxConverter {
         // This would only work if B was already [1280, 1000]!
         //
         // Try swapping operands and transpose flags to match TensorRT's expectations
-        use trtx::MatrixOperation;
-
         // Swap: instead of A @ B^T, try B^T @ A^T (which gives same result transposed)
         // NO wait - let's try: B @ A instead since B^T @ A^T = (A @ B)^T
         //
         // Actually, for WebNN: output = A @ B^T
         // Try: output = (B @ A^T)^T = A @ B^T (mathematically equivalent)
         let (mat_a, mat_b, op_a, op_b) = if b_transpose && !a_transpose {
-            // Original: A @ B^T
-            // Our input_a: [1, 1280], input_b: [1000, 1280]
-            // Try: use B @ A^T and then transpose result
-            // B: [1000, 1280] @ A^T: [1280, 1] = [1000, 1]
-            // Then transpose to [1, 1000]
-            //
-            // But we can't easily transpose the result...
-            // Let's just try the transpose flags as-is first
             (
                 input_a,
                 input_b,
-                MatrixOperation::kNONE as i32,
-                MatrixOperation::kTRANSPOSE as i32,
+                MatrixOperation::kNONE,
+                MatrixOperation::kTRANSPOSE,
             )
         } else {
             let a_op = if a_transpose {
-                MatrixOperation::kTRANSPOSE as i32
+                MatrixOperation::kTRANSPOSE
             } else {
-                MatrixOperation::kNONE as i32
+                MatrixOperation::kNONE
             };
             let b_op = if b_transpose {
-                MatrixOperation::kTRANSPOSE as i32
+                MatrixOperation::kTRANSPOSE
             } else {
-                MatrixOperation::kNONE as i32
+                MatrixOperation::kNONE
             };
             (input_a, input_b, a_op, b_op)
         };
@@ -6497,34 +6655,32 @@ impl TrtxConverter {
                 reason: format!("Failed to add GEMM matrix multiply: {}", e),
             })?;
 
-        let mut result = layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get GEMM layer output: {}", e),
-            })?;
+        let mut result =
+            layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get GEMM layer output: {}", e),
+                })?;
 
         // If alpha != 1.0, scale the result
         if (alpha - 1.0).abs() > 1e-6 {
             // Get result dimensions to create a constant with matching shape
-            let result_dims = result
-                .dimensions()
-                .map_err(|e| GraphError::ConversionFailed {
-                    format: "trtx".to_string(),
-                    reason: format!("Failed to get result dimensions: {}", e),
-                })?;
+            let result_dims =
+                result
+                    .dimensions(&*network)
+                    .map_err(|e| GraphError::ConversionFailed {
+                        format: "trtx".to_string(),
+                        reason: format!("Failed to get result dimensions: {}", e),
+                    })?;
 
             // Create constant filled with alpha value matching result shape
             let num_elements: usize = result_dims.iter().map(|&d| d as usize).product();
             let alpha_data: Vec<f32> = vec![alpha; num_elements];
             let alpha_bytes: Vec<u8> = alpha_data.iter().flat_map(|&f| f.to_le_bytes()).collect();
 
-            // Store weights to keep them alive until engine serialization
-            temp_weights.push(alpha_bytes);
-            let alpha_bytes_ref = temp_weights.last().unwrap().as_slice();
-
             let alpha_layer = network
-                .add_constant(&result_dims, alpha_bytes_ref, TrtDataType::kFLOAT)
+                .add_small_constant_copied(&result_dims, &alpha_bytes, TrtDataType::kFLOAT)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("Failed to create alpha constant: {}", e),
@@ -6532,7 +6688,7 @@ impl TrtxConverter {
 
             let alpha_tensor =
                 alpha_layer
-                    .get_output(0)
+                    .get_output(&*network, 0)
                     .map_err(|e| GraphError::ConversionFailed {
                         format: "trtx".to_string(),
                         reason: format!("Failed to get alpha tensor: {}", e),
@@ -6546,12 +6702,13 @@ impl TrtxConverter {
                     reason: format!("Failed to scale by alpha: {}", e),
                 })?;
 
-            result = scale_layer
-                .get_output(0)
-                .map_err(|e| GraphError::ConversionFailed {
-                    format: "trtx".to_string(),
-                    reason: format!("Failed to get scaled output: {}", e),
-                })?;
+            result =
+                scale_layer
+                    .get_output(&*network, 0)
+                    .map_err(|e| GraphError::ConversionFailed {
+                        format: "trtx".to_string(),
+                        reason: format!("Failed to get scaled output: {}", e),
+                    })?;
         }
 
         // If there's a C input and beta != 0, add it
@@ -6566,36 +6723,32 @@ impl TrtxConverter {
             // Scale C by beta if needed, then add to result
             if (beta - 1.0).abs() > 1e-6 {
                 // Get C dimensions to create a constant with matching shape
-                let c_dims = input_c
-                    .dimensions()
-                    .map_err(|e| GraphError::ConversionFailed {
-                        format: "trtx".to_string(),
-                        reason: format!("Failed to get C dimensions: {}", e),
-                    })?;
+                let c_dims =
+                    input_c
+                        .dimensions(&*network)
+                        .map_err(|e| GraphError::ConversionFailed {
+                            format: "trtx".to_string(),
+                            reason: format!("Failed to get C dimensions: {}", e),
+                        })?;
 
                 // Create constant filled with beta value matching C shape
                 let num_elements: usize = c_dims.iter().map(|&d| d as usize).product();
                 let beta_data: Vec<f32> = vec![beta; num_elements];
                 let beta_bytes: Vec<u8> = beta_data.iter().flat_map(|&f| f.to_le_bytes()).collect();
 
-                // Store weights to keep them alive until engine serialization
-                temp_weights.push(beta_bytes);
-                let beta_bytes_ref = temp_weights.last().unwrap().as_slice();
-
                 let beta_layer = network
-                    .add_constant(&c_dims, beta_bytes_ref, TrtDataType::kFLOAT)
+                    .add_small_constant_copied(&c_dims, &beta_bytes, TrtDataType::kFLOAT)
                     .map_err(|e| GraphError::ConversionFailed {
                         format: "trtx".to_string(),
                         reason: format!("Failed to create beta constant: {}", e),
                     })?;
 
-                let beta_tensor =
-                    beta_layer
-                        .get_output(0)
-                        .map_err(|e| GraphError::ConversionFailed {
-                            format: "trtx".to_string(),
-                            reason: format!("Failed to get beta tensor: {}", e),
-                        })?;
+                let beta_tensor = beta_layer.get_output(&*network, 0).map_err(|e| {
+                    GraphError::ConversionFailed {
+                        format: "trtx".to_string(),
+                        reason: format!("Failed to get beta tensor: {}", e),
+                    }
+                })?;
 
                 // Multiply C by beta
                 let scale_c_layer = network
@@ -6605,13 +6758,12 @@ impl TrtxConverter {
                         reason: format!("Failed to scale C by beta: {}", e),
                     })?;
 
-                let scaled_c =
-                    scale_c_layer
-                        .get_output(0)
-                        .map_err(|e| GraphError::ConversionFailed {
-                            format: "trtx".to_string(),
-                            reason: format!("Failed to get scaled C: {}", e),
-                        })?;
+                let scaled_c = scale_c_layer.get_output(&*network, 0).map_err(|e| {
+                    GraphError::ConversionFailed {
+                        format: "trtx".to_string(),
+                        reason: format!("Failed to get scaled C: {}", e),
+                    }
+                })?;
 
                 // Add result + beta*C
                 let add_layer = network
@@ -6621,12 +6773,13 @@ impl TrtxConverter {
                         reason: format!("Failed to add scaled C to result: {}", e),
                     })?;
 
-                result = add_layer
-                    .get_output(0)
-                    .map_err(|e| GraphError::ConversionFailed {
-                        format: "trtx".to_string(),
-                        reason: format!("Failed to get final GEMM output: {}", e),
-                    })?;
+                result =
+                    add_layer
+                        .get_output(&*network, 0)
+                        .map_err(|e| GraphError::ConversionFailed {
+                            format: "trtx".to_string(),
+                            reason: format!("Failed to get final GEMM output: {}", e),
+                        })?;
             } else {
                 // beta == 1.0: add C directly
                 let add_layer = network
@@ -6636,12 +6789,13 @@ impl TrtxConverter {
                         reason: format!("Failed to add C to result: {}", e),
                     })?;
 
-                result = add_layer
-                    .get_output(0)
-                    .map_err(|e| GraphError::ConversionFailed {
-                        format: "trtx".to_string(),
-                        reason: format!("Failed to get final GEMM output: {}", e),
-                    })?;
+                result =
+                    add_layer
+                        .get_output(&*network, 0)
+                        .map_err(|e| GraphError::ConversionFailed {
+                            format: "trtx".to_string(),
+                            reason: format!("Failed to get final GEMM output: {}", e),
+                        })?;
             }
         }
 
@@ -6652,11 +6806,10 @@ impl TrtxConverter {
     }
 
     /// Add 2D convolution operation
-    fn add_conv2d_op(
-        graph: &GraphInfo,
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
-        temp_weights: &mut Vec<Vec<u8>>,
+    fn add_conv2d_op<'a>(
+        graph: &'a GraphInfo,
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
         let filter_id = operation.input_operands()[1];
@@ -6684,7 +6837,7 @@ impl TrtxConverter {
             .map(|o| o.filter_layout.as_str())
             .filter(|s| !s.is_empty())
             .unwrap_or("oihw");
-        let (o, _i, h, w): (u32, u32, u32, u32) = match filter_layout {
+        let (o, in_ch, h, w): (u32, u32, u32, u32) = match filter_layout {
             "oihw" => (fs[0], fs[1], fs[2], fs[3]),
             "hwio" => (fs[3], fs[2], fs[0], fs[1]),
             "ohwi" => (fs[0], fs[3], fs[1], fs[2]),
@@ -6705,11 +6858,12 @@ impl TrtxConverter {
             .contains_key(&filter_id);
 
         // When filter is non-constant we use ILayer::setInput(1, kernel) / setInput(2, bias); kernel/bias weights must be empty.
-        let (filter_data_to_use, bias_data) = if filter_constant {
+        // Promoted layouts / f16 use `add_convolution_owned_weights` so slices are not tied to `&'a GraphInfo` for the whole op loop.
+        let (filter_data_to_use, bias_data, conv_weights_owned) = if filter_constant {
             let filter_shape_u32 = filter_operand.descriptor.static_or_max_shape();
             let filter_data = Self::get_constant_data(graph, filter_id)?;
-            // Get optional bias - operand 2 if present.
-            let (bias_temp_index, bias_raw): (Option<usize>, Option<&[u8]>) = match bias_id {
+            let mut bias_promoted: Option<Vec<u8>> = None;
+            let bias_raw: Option<&[u8]> = match bias_id {
                 Some(id) => {
                     if !graph.constant_operand_ids_to_handles.contains_key(&id) {
                         return Err(GraphError::ConversionFailed {
@@ -6723,17 +6877,17 @@ impl TrtxConverter {
                         .map(|o| o.descriptor.data_type)
                         .unwrap_or(DataType::Float32);
                     if dtype == DataType::Float16 {
-                        let f32_bias = Self::f16_bytes_to_f32_bytes(raw)?;
-                        temp_weights.push(f32_bias);
-                        (Some(temp_weights.len() - 1), None)
+                        bias_promoted = Some(Self::f16_bytes_to_f32_bytes(raw)?);
+                        None
                     } else {
-                        (None, Some(raw))
+                        Some(raw)
                     }
                 }
-                None => (None, None),
+                None => None,
             };
             let filter_dtype = filter_operand.descriptor.data_type;
-            let filter_temp_index: Option<usize> = match (filter_dtype, filter_layout) {
+            let mut kernel_promoted: Option<Vec<u8>> = None;
+            match (filter_dtype, filter_layout) {
                 (DataType::Float16, _) => {
                     let f32_bytes = Self::f16_bytes_to_f32_bytes(filter_data)?;
                     let oihw = if filter_layout == "oihw" {
@@ -6741,15 +6895,15 @@ impl TrtxConverter {
                     } else {
                         Self::conv_filter_to_oihw(&f32_bytes, filter_layout, &filter_shape_u32)?
                     };
-                    temp_weights.push(oihw);
-                    Some(temp_weights.len() - 1)
+                    kernel_promoted = Some(oihw);
                 }
-                (DataType::Float32, "oihw") => None,
+                (DataType::Float32, "oihw") => {}
                 (DataType::Float32, _) => {
-                    let oihw =
-                        Self::conv_filter_to_oihw(filter_data, filter_layout, &filter_shape_u32)?;
-                    temp_weights.push(oihw);
-                    Some(temp_weights.len() - 1)
+                    kernel_promoted = Some(Self::conv_filter_to_oihw(
+                        filter_data,
+                        filter_layout,
+                        &filter_shape_u32,
+                    )?);
                 }
                 _ => {
                     return Err(GraphError::ConversionFailed {
@@ -6761,15 +6915,36 @@ impl TrtxConverter {
                     });
                 }
             };
-            let bias_data: Option<&[u8]> = match bias_temp_index {
-                Some(idx) => Some(temp_weights[idx].as_slice()),
-                None => bias_raw,
+            let conv_weights_owned = if kernel_promoted.is_some() || bias_promoted.is_some() {
+                let conv_kernel_const_shape: Vec<i64> =
+                    vec![o as i64, in_ch as i64, h as i64, w as i64];
+                let kernel_values =
+                    kernel_promoted.unwrap_or_else(|| filter_data.to_vec());
+                let bias_values = match (bias_promoted, bias_raw) {
+                    (Some(b), _) => Some(b),
+                    (None, Some(br)) => Some(br.to_vec()),
+                    (None, None) => None,
+                };
+                Some(OwnedConvWeights {
+                    kernel: OwnedWeights {
+                        shape: conv_kernel_const_shape,
+                        data_type: TrtDataType::kFLOAT,
+                        values: kernel_values,
+                    },
+                    bias: bias_values.map(|values| OwnedWeights {
+                        shape: vec![num_output_maps as i64],
+                        data_type: TrtDataType::kFLOAT,
+                        values,
+                    }),
+                })
+            } else {
+                None
             };
-            let filter_data_to_use: &[u8] = match filter_temp_index {
-                Some(idx) => temp_weights[idx].as_slice(),
-                None => filter_data,
-            };
-            (Some(filter_data_to_use), bias_data)
+            if conv_weights_owned.is_some() {
+                (None, None, conv_weights_owned)
+            } else {
+                (Some(filter_data), bias_raw, None)
+            }
         } else {
             // Non-constant filter: use tensor inputs (setInput(1)=kernel, setInput(2)=bias). TensorRT expects OIHW for kernel.
             if filter_layout != "oihw" {
@@ -6787,7 +6962,7 @@ impl TrtxConverter {
                     });
                 }
             }
-            (None, None)
+            (None, None, None)
         };
 
         // Input layout: nchw (default) or nhwc. TensorRT conv is NCHW; we use IShuffleLayer::setFirstTranspose for NHWC.
@@ -6816,7 +6991,9 @@ impl TrtxConverter {
                         format: "trtx".to_string(),
                         reason: format!("Conv2d NHWC->NCHW shuffle: {}", e),
                     })?;
-            shuffle.set_first_transpose(&[0, 3, 1, 2]).map_err(|e| {
+            shuffle
+                .set_first_transpose(network, &[0, 3, 1, 2])
+                .map_err(|e| {
                 GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("Conv2d set_first_transpose NHWC->NCHW: {}", e),
@@ -6824,7 +7001,7 @@ impl TrtxConverter {
             })?;
             Some(
                 shuffle
-                    .get_output(0)
+                    .get_output(&*network, 0)
                     .map_err(|e| GraphError::ConversionFailed {
                         format: "trtx".to_string(),
                         reason: format!("Conv2d NHWC shuffle output: {}", e),
@@ -6836,24 +7013,23 @@ impl TrtxConverter {
         let pre_conv_input = nhwc_shuffle_output.as_ref().unwrap_or(input);
 
         // TensorRT conv kernel is always Float; cast Half input to Float so types match.
-        let half_cast_output: Option<trtx::Tensor> = if input_dtype == DataType::Float16 {
-            let cast_layer = network
-                .add_cast(pre_conv_input, TrtDataType::kFLOAT)
-                .map_err(|e| GraphError::ConversionFailed {
-                    format: "trtx".to_string(),
-                    reason: format!("Conv2d Half->Float cast: {}", e),
-                })?;
-            Some(
-                cast_layer
-                    .get_output(0)
+        let half_cast_output: Option<trtx::Tensor<'a>> =
+            if input_dtype == DataType::Float16 {
+                let cast_layer = network
+                    .add_cast(pre_conv_input, TrtDataType::kFLOAT)
                     .map_err(|e| GraphError::ConversionFailed {
                         format: "trtx".to_string(),
+                        reason: format!("Conv2d Half->Float cast: {}", e),
+                    })?;
+                Some(cast_layer.get_output(&*network, 0).map_err(|e| {
+                    GraphError::ConversionFailed {
+                        format: "trtx".to_string(),
                         reason: format!("Conv2d cast output: {}", e),
-                    })?,
-            )
-        } else {
-            None
-        };
+                    }
+                })?)
+            } else {
+                None
+            };
         let conv_input_source = half_cast_output.as_ref().unwrap_or(pre_conv_input);
 
         // Stride, padding, dilation, groups from typed options
@@ -6892,15 +7068,17 @@ impl TrtxConverter {
         // Use explicit padding layer if any padding is specified
         let conv_input =
             if pre_padding.iter().any(|&p| p != 0) || post_padding.iter().any(|&p| p != 0) {
+                let pre_pad_i64: Vec<i64> = pre_padding.iter().map(|&p| p as i64).collect();
+                let post_pad_i64: Vec<i64> = post_padding.iter().map(|&p| p as i64).collect();
                 let padding_layer = network
-                    .add_padding(&conv_input_source, &pre_padding, &post_padding)
+                    .add_padding(&conv_input_source, &pre_pad_i64, &post_pad_i64)
                     .map_err(|e| GraphError::ConversionFailed {
                         format: "trtx".to_string(),
                         reason: format!("Failed to add padding layer: {}", e),
                     })?;
 
                 padding_layer
-                    .get_output(0)
+                    .get_output(&*network, 0)
                     .map_err(|e| GraphError::ConversionFailed {
                         format: "trtx".to_string(),
                         reason: format!("Failed to get padding layer output: {}", e),
@@ -6914,7 +7092,7 @@ impl TrtxConverter {
                     }
                 })?;
                 id_layer
-                    .get_output(0)
+                    .get_output(&*network, 0)
                     .map_err(|e| GraphError::ConversionFailed {
                         format: "trtx".to_string(),
                         reason: format!("Failed to get identity output: {}", e),
@@ -6923,13 +7101,19 @@ impl TrtxConverter {
 
         // Add convolution layer with zero padding (padding already applied via padding layer)
         // Constant path always passes f32 data (f16 filter/bias are converted above); dtype must match.
-        let mut layer = match (filter_data_to_use, bias_data) {
-            (Some(fd), b) => {
+        let mut layer = match (conv_weights_owned, filter_data_to_use) {
+            (Some(owned), _) => network
+                .add_convolution_owned_weights(&conv_input, num_output_maps, &kernel_size, owned)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to add convolution (owned weights): {}", e),
+                })?,
+            (None, Some(fd)) => {
                 let conv_weights = trtx::ConvWeights {
                     kernel_weights: fd,
                     kernel_dtype: TrtDataType::kFLOAT,
-                    bias_weights: b,
-                    bias_dtype: b.map(|_| TrtDataType::kFLOAT),
+                    bias_weights: bias_data,
+                    bias_dtype: bias_data.map(|_| TrtDataType::kFLOAT),
                 };
                 network
                     .add_convolution(&conv_input, num_output_maps, &kernel_size, &conv_weights)
@@ -6938,7 +7122,7 @@ impl TrtxConverter {
                         reason: format!("Failed to add convolution: {}", e),
                     })?
             }
-            (None, _) => {
+            (None, None) => {
                 let filter_tensor =
                     tensor_map
                         .get(&filter_id)
@@ -6947,7 +7131,7 @@ impl TrtxConverter {
                             reason: format!("Filter operand {} tensor not found", filter_id),
                         })?;
                 // TensorRT conv requires input and kernel same type. We cast activation to Float when input_dtype is Float16; cast filter (and bias) to Float too.
-                let filter_tensor_for_conv: Option<trtx::Tensor> =
+                let filter_tensor_for_conv: Option<trtx::Tensor<'a>> =
                     if filter_operand.descriptor.data_type == DataType::Float16
                         && input_dtype == DataType::Float16
                     {
@@ -6957,7 +7141,7 @@ impl TrtxConverter {
                                 format: "trtx".to_string(),
                                 reason: format!("Conv2d filter Half->Float cast: {}", e),
                             })?;
-                        Some(cast_layer.get_output(0).map_err(|e| {
+                        Some(cast_layer.get_output(&*network, 0).map_err(|e| {
                             GraphError::ConversionFailed {
                                 format: "trtx".to_string(),
                                 reason: format!("Conv2d filter cast output: {}", e),
@@ -6969,7 +7153,7 @@ impl TrtxConverter {
                 let filter_tensor_to_use = filter_tensor_for_conv.as_ref().unwrap_or(filter_tensor);
 
                 let bias_tensor_raw = bias_id.and_then(|id| tensor_map.get(&id));
-                let bias_tensor_for_conv: Option<trtx::Tensor> =
+                let bias_tensor_for_conv: Option<trtx::Tensor<'a>> =
                     if let (Some(bt), Some(bid)) = (bias_tensor_raw, bias_id) {
                         let bias_dtype = graph
                             .operand(bid)
@@ -6983,7 +7167,7 @@ impl TrtxConverter {
                                         reason: format!("Conv2d bias Half->Float cast: {}", e),
                                     }
                                 })?;
-                            Some(cast_layer.get_output(0).map_err(|e| {
+                            Some(cast_layer.get_output(&*network, 0).map_err(|e| {
                                 GraphError::ConversionFailed {
                                     format: "trtx".to_string(),
                                     reason: format!("Conv2d bias cast output: {}", e),
@@ -7009,15 +7193,15 @@ impl TrtxConverter {
                         format: "trtx".to_string(),
                         reason: format!("Failed to add convolution (tensor weights): {}", e),
                     })?;
-                layer.set_input(1, filter_tensor_to_use).map_err(|e| {
-                    GraphError::ConversionFailed {
+                layer
+                    .set_input(network, 1, filter_tensor_to_use)
+                    .map_err(|e| GraphError::ConversionFailed {
                         format: "trtx".to_string(),
                         reason: format!("Conv2d set_input(1) filter: {}", e),
-                    }
-                })?;
+                    })?;
                 if let Some(bt) = bias_tensor_to_use {
                     layer
-                        .set_input(2, bt)
+                        .set_input(network, 2, bt)
                         .map_err(|e| GraphError::ConversionFailed {
                             format: "trtx".to_string(),
                             reason: format!("Conv2d set_input(2) bias: {}", e),
@@ -7028,42 +7212,23 @@ impl TrtxConverter {
         };
 
         // Set layer properties (matches C++ API pattern: call setters after creation)
-        layer
-            .set_stride(&strides)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to set stride: {}", e),
-            })?;
+        layer.set_stride(network, &[strides[0] as i64, strides[1] as i64]);
 
         // No need to set padding on convolution layer - already handled by explicit padding layer
-        layer
-            .set_padding(&[0, 0])
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to set padding: {}", e),
-            })?;
+        layer.set_padding(network, &[0i64, 0]);
 
-        layer
-            .set_dilation(&dilations)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to set dilation: {}", e),
-            })?;
+        layer.set_dilation(network, &[dilations[0] as i64, dilations[1] as i64]);
 
-        layer
-            .set_num_groups(groups)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to set groups: {}", e),
-            })?;
+        layer.set_num_groups(network, groups as i64);
 
         // Extract output tensor from layer (NCHW, Float)
-        let conv_output = layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get convolution output: {}", e),
-            })?;
+        let conv_output =
+            layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get convolution output: {}", e),
+                })?;
 
         // If input was Half, cast conv output back to Half to match graph output type.
         let conv_output = if input_dtype == DataType::Float16 {
@@ -7074,7 +7239,7 @@ impl TrtxConverter {
                     reason: format!("Conv2d Float->Half cast: {}", e),
                 })?;
             cast_layer
-                .get_output(0)
+                .get_output(&*network, 0)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("Conv2d cast output: {}", e),
@@ -7092,14 +7257,16 @@ impl TrtxConverter {
                         format: "trtx".to_string(),
                         reason: format!("Conv2d NCHW->NHWC shuffle: {}", e),
                     })?;
-            shuffle.set_first_transpose(&[0, 2, 3, 1]).map_err(|e| {
+            shuffle
+                .set_first_transpose(network, &[0, 2, 3, 1])
+                .map_err(|e| {
                 GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("Conv2d set_first_transpose NCHW->NHWC: {}", e),
                 }
             })?;
             shuffle
-                .get_output(0)
+                .get_output(&*network, 0)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("Conv2d NHWC output shuffle: {}", e),
@@ -7116,11 +7283,10 @@ impl TrtxConverter {
 
     /// Add convTranspose2d operation (deconvolution/transposed convolution).
     /// Mirrors add_conv2d_op: supports constant or non-constant filter/bias via setInput(1)/setInput(2).
-    fn add_conv_transpose2d_op(
-        graph: &GraphInfo,
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
-        temp_weights: &mut Vec<Vec<u8>>,
+    fn add_conv_transpose2d_op<'a>(
+        graph: &'a GraphInfo,
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
         let filter_id = operation.input_operands()[1];
@@ -7150,7 +7316,7 @@ impl TrtxConverter {
             .map(|o| o.filter_layout.as_str())
             .filter(|s| !s.is_empty())
             .unwrap_or("iohw");
-        let (_i, o, h, w): (u32, u32, u32, u32) = match filter_layout {
+        let (in_ch, out_ch, h, w): (u32, u32, u32, u32) = match filter_layout {
             "iohw" => (fs[0], fs[1], fs[2], fs[3]),
             "oihw" => (fs[1], fs[0], fs[2], fs[3]),
             "hwio" => (fs[2], fs[3], fs[0], fs[1]),
@@ -7166,17 +7332,18 @@ impl TrtxConverter {
         };
         let groups = deconv_opts.map(|o| o.groups as i32).unwrap_or(1);
         // WebNN filter shape is [inputChannels, outputChannels/groups, H, W]; TensorRT expects total output maps.
-        let num_output_maps = (o as i32) * groups;
+        let num_output_maps = (out_ch as i32) * groups;
         let kernel_size: [i32; 2] = [h as i32, w as i32];
 
         let filter_constant = graph
             .constant_operand_ids_to_handles
             .contains_key(&filter_id);
 
-        let (filter_data_to_use, bias_data) = if filter_constant {
+        let (filter_data_to_use, bias_data, deconv_weights_owned) = if filter_constant {
             let filter_shape_u32 = filter_operand.descriptor.static_or_max_shape();
             let filter_data = Self::get_constant_data(graph, filter_id)?;
-            let (bias_temp_index, bias_raw): (Option<usize>, Option<&[u8]>) = match bias_id {
+            let mut bias_promoted: Option<Vec<u8>> = None;
+            let bias_raw: Option<&[u8]> = match bias_id {
                 Some(id) => {
                     if !graph.constant_operand_ids_to_handles.contains_key(&id) {
                         return Err(GraphError::ConversionFailed {
@@ -7190,17 +7357,17 @@ impl TrtxConverter {
                         .map(|o| o.descriptor.data_type)
                         .unwrap_or(DataType::Float32);
                     if dtype == DataType::Float16 {
-                        let f32_bias = Self::f16_bytes_to_f32_bytes(raw)?;
-                        temp_weights.push(f32_bias);
-                        (Some(temp_weights.len() - 1), None)
+                        bias_promoted = Some(Self::f16_bytes_to_f32_bytes(raw)?);
+                        None
                     } else {
-                        (None, Some(raw))
+                        Some(raw)
                     }
                 }
-                None => (None, None),
+                None => None,
             };
             let filter_dtype = filter_operand.descriptor.data_type;
-            let filter_temp_index: Option<usize> = match (filter_dtype, filter_layout) {
+            let mut kernel_promoted: Option<Vec<u8>> = None;
+            match (filter_dtype, filter_layout) {
                 (DataType::Float16, _) => {
                     let f32_bytes = Self::f16_bytes_to_f32_bytes(filter_data)?;
                     let iohw = if filter_layout == "iohw" {
@@ -7208,15 +7375,15 @@ impl TrtxConverter {
                     } else {
                         Self::deconv_filter_to_iohw(&f32_bytes, filter_layout, &filter_shape_u32)?
                     };
-                    temp_weights.push(iohw);
-                    Some(temp_weights.len() - 1)
+                    kernel_promoted = Some(iohw);
                 }
-                (DataType::Float32, "iohw") => None,
+                (DataType::Float32, "iohw") => {}
                 (DataType::Float32, _) => {
-                    let iohw =
-                        Self::deconv_filter_to_iohw(filter_data, filter_layout, &filter_shape_u32)?;
-                    temp_weights.push(iohw);
-                    Some(temp_weights.len() - 1)
+                    kernel_promoted = Some(Self::deconv_filter_to_iohw(
+                        filter_data,
+                        filter_layout,
+                        &filter_shape_u32,
+                    )?);
                 }
                 _ => {
                     return Err(GraphError::ConversionFailed {
@@ -7228,15 +7395,36 @@ impl TrtxConverter {
                     });
                 }
             };
-            let bias_data: Option<&[u8]> = match bias_temp_index {
-                Some(idx) => Some(temp_weights[idx].as_slice()),
-                None => bias_raw,
+            let deconv_weights_owned = if kernel_promoted.is_some() || bias_promoted.is_some() {
+                let deconv_kernel_const_shape: Vec<i64> =
+                    vec![in_ch as i64, out_ch as i64, h as i64, w as i64];
+                let kernel_values =
+                    kernel_promoted.unwrap_or_else(|| filter_data.to_vec());
+                let bias_values = match (bias_promoted, bias_raw) {
+                    (Some(b), _) => Some(b),
+                    (None, Some(br)) => Some(br.to_vec()),
+                    (None, None) => None,
+                };
+                Some(OwnedConvWeights {
+                    kernel: OwnedWeights {
+                        shape: deconv_kernel_const_shape,
+                        data_type: TrtDataType::kFLOAT,
+                        values: kernel_values,
+                    },
+                    bias: bias_values.map(|values| OwnedWeights {
+                        shape: vec![num_output_maps as i64],
+                        data_type: TrtDataType::kFLOAT,
+                        values,
+                    }),
+                })
+            } else {
+                None
             };
-            let filter_data_to_use: &[u8] = match filter_temp_index {
-                Some(idx) => temp_weights[idx].as_slice(),
-                None => filter_data,
-            };
-            (Some(filter_data_to_use), bias_data)
+            if deconv_weights_owned.is_some() {
+                (None, None, deconv_weights_owned)
+            } else {
+                (Some(filter_data), bias_raw, None)
+            }
         } else {
             if filter_layout != "iohw" {
                 return Err(GraphError::ConversionFailed {
@@ -7254,7 +7442,7 @@ impl TrtxConverter {
                     });
                 }
             }
-            (None, None)
+            (None, None, None)
         };
 
         let input_layout = deconv_opts
@@ -7281,7 +7469,9 @@ impl TrtxConverter {
                         format: "trtx".to_string(),
                         reason: format!("convTranspose2d NHWC->NCHW shuffle: {}", e),
                     })?;
-            shuffle.set_first_transpose(&[0, 3, 1, 2]).map_err(|e| {
+            shuffle
+                .set_first_transpose(network, &[0, 3, 1, 2])
+                .map_err(|e| {
                 GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("convTranspose2d set_first_transpose NHWC->NCHW: {}", e),
@@ -7289,7 +7479,7 @@ impl TrtxConverter {
             })?;
             Some(
                 shuffle
-                    .get_output(0)
+                    .get_output(&*network, 0)
                     .map_err(|e| GraphError::ConversionFailed {
                         format: "trtx".to_string(),
                         reason: format!("convTranspose2d NHWC shuffle output: {}", e),
@@ -7300,24 +7490,23 @@ impl TrtxConverter {
         };
         let pre_deconv_input = nhwc_shuffle_output.as_ref().unwrap_or(input);
 
-        let half_cast_output: Option<trtx::Tensor> = if input_dtype == DataType::Float16 {
-            let cast_layer = network
-                .add_cast(pre_deconv_input, TrtDataType::kFLOAT)
-                .map_err(|e| GraphError::ConversionFailed {
-                    format: "trtx".to_string(),
-                    reason: format!("convTranspose2d Half->Float cast: {}", e),
-                })?;
-            Some(
-                cast_layer
-                    .get_output(0)
+        let half_cast_output: Option<trtx::Tensor<'a>> =
+            if input_dtype == DataType::Float16 {
+                let cast_layer = network
+                    .add_cast(pre_deconv_input, TrtDataType::kFLOAT)
                     .map_err(|e| GraphError::ConversionFailed {
                         format: "trtx".to_string(),
+                        reason: format!("convTranspose2d Half->Float cast: {}", e),
+                    })?;
+                Some(cast_layer.get_output(&*network, 0).map_err(|e| {
+                    GraphError::ConversionFailed {
+                        format: "trtx".to_string(),
                         reason: format!("convTranspose2d cast output: {}", e),
-                    })?,
-            )
-        } else {
-            None
-        };
+                    }
+                })?)
+            } else {
+                None
+            };
         let deconv_input_source = half_cast_output.as_ref().unwrap_or(pre_deconv_input);
 
         let strides: [i32; 2] = deconv_opts
@@ -7360,26 +7549,38 @@ impl TrtxConverter {
                 }
             })?;
             id_layer
-                .get_output(0)
+                .get_output(&*network, 0)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("convTranspose2d identity output: {}", e),
                 })?
         };
 
-        let mut layer = match (filter_data_to_use, bias_data) {
-            (Some(fd), b) => {
+        let kernel_size_i64: [i64; 2] = [kernel_size[0] as i64, kernel_size[1] as i64];
+        let mut layer = match (deconv_weights_owned, filter_data_to_use) {
+            (Some(owned), _) => network
+                .add_deconvolution_owned_weights(
+                    &deconv_input,
+                    num_output_maps as i64,
+                    &kernel_size_i64,
+                    owned,
+                )
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to add deconvolution (owned weights): {}", e),
+                })?,
+            (None, Some(fd)) => {
                 let deconv_weights = trtx::ConvWeights {
                     kernel_weights: fd,
                     kernel_dtype: TrtDataType::kFLOAT,
-                    bias_weights: b,
-                    bias_dtype: b.map(|_| TrtDataType::kFLOAT),
+                    bias_weights: bias_data,
+                    bias_dtype: bias_data.map(|_| TrtDataType::kFLOAT),
                 };
                 network
                     .add_deconvolution(
                         &deconv_input,
-                        num_output_maps,
-                        &kernel_size,
+                        num_output_maps as i64,
+                        &kernel_size_i64,
                         &deconv_weights,
                     )
                     .map_err(|e| GraphError::ConversionFailed {
@@ -7387,7 +7588,7 @@ impl TrtxConverter {
                         reason: format!("Failed to add deconvolution: {}", e),
                     })?
             }
-            (None, _) => {
+            (None, None) => {
                 let filter_tensor =
                     tensor_map
                         .get(&filter_id)
@@ -7395,7 +7596,7 @@ impl TrtxConverter {
                             format: "trtx".to_string(),
                             reason: format!("Filter operand {} tensor not found", filter_id),
                         })?;
-                let filter_tensor_for_conv: Option<trtx::Tensor> =
+                let filter_tensor_for_conv: Option<trtx::Tensor<'a>> =
                     if filter_operand.descriptor.data_type == DataType::Float16
                         && input_dtype == DataType::Float16
                     {
@@ -7405,7 +7606,7 @@ impl TrtxConverter {
                                 format: "trtx".to_string(),
                                 reason: format!("convTranspose2d filter Half->Float cast: {}", e),
                             })?;
-                        Some(cast_layer.get_output(0).map_err(|e| {
+                        Some(cast_layer.get_output(&*network, 0).map_err(|e| {
                             GraphError::ConversionFailed {
                                 format: "trtx".to_string(),
                                 reason: format!("convTranspose2d filter cast output: {}", e),
@@ -7417,7 +7618,7 @@ impl TrtxConverter {
                 let filter_tensor_to_use = filter_tensor_for_conv.as_ref().unwrap_or(filter_tensor);
 
                 let bias_tensor_raw = bias_id.and_then(|id| tensor_map.get(&id));
-                let bias_tensor_for_conv: Option<trtx::Tensor> = if let (Some(bt), Some(bid)) =
+                let bias_tensor_for_conv: Option<trtx::Tensor<'a>> = if let (Some(bt), Some(bid)) =
                     (bias_tensor_raw, bias_id)
                 {
                     let bias_dtype = graph
@@ -7432,7 +7633,7 @@ impl TrtxConverter {
                                     reason: format!("convTranspose2d bias Half->Float cast: {}", e),
                                 }
                             })?;
-                        Some(cast_layer.get_output(0).map_err(|e| {
+                        Some(cast_layer.get_output(&*network, 0).map_err(|e| {
                             GraphError::ConversionFailed {
                                 format: "trtx".to_string(),
                                 reason: format!("convTranspose2d bias cast output: {}", e),
@@ -7455,23 +7656,23 @@ impl TrtxConverter {
                 let mut layer = network
                     .add_deconvolution(
                         &deconv_input,
-                        num_output_maps,
-                        &kernel_size,
+                        num_output_maps as i64,
+                        &[kernel_size[0] as i64, kernel_size[1] as i64],
                         &deconv_weights,
                     )
                     .map_err(|e| GraphError::ConversionFailed {
                         format: "trtx".to_string(),
                         reason: format!("Failed to add deconvolution (tensor weights): {}", e),
                     })?;
-                layer.set_input(1, filter_tensor_to_use).map_err(|e| {
-                    GraphError::ConversionFailed {
+                layer
+                    .set_input(network, 1, filter_tensor_to_use)
+                    .map_err(|e| GraphError::ConversionFailed {
                         format: "trtx".to_string(),
                         reason: format!("convTranspose2d set_input(1) filter: {}", e),
-                    }
-                })?;
+                    })?;
                 if let Some(bt) = bias_tensor_to_use {
                     layer
-                        .set_input(2, bt)
+                        .set_input(network, 2, bt)
                         .map_err(|e| GraphError::ConversionFailed {
                             format: "trtx".to_string(),
                             reason: format!("convTranspose2d set_input(2) bias: {}", e),
@@ -7482,13 +7683,13 @@ impl TrtxConverter {
         };
 
         layer
-            .set_stride(&strides)
+            .set_stride(network, &[strides[0] as i64, strides[1] as i64])
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("convTranspose2d set_stride: {}", e),
             })?;
         layer
-            .set_dilation(&dilations)
+            .set_dilation(network, &[dilations[0] as i64, dilations[1] as i64])
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("convTranspose2d set_dilation: {}", e),
@@ -7525,39 +7726,43 @@ impl TrtxConverter {
         ];
         // TensorRT Deconvolution: pre/post padding trim the output. DimsHW order is (height, width).
         // See https://docs.nvidia.com/deeplearning/tensorrt/archives/tensorrt-861/operators/docs/Deconvolution.html
-        let pre: [i32; 2] = pre_effective;
-        let post: [i32; 2] = post_effective;
+        let pre: [i64; 2] = [pre_effective[0] as i64, pre_effective[1] as i64];
+        let post: [i64; 2] = [post_effective[0] as i64, post_effective[1] as i64];
         layer
-            .set_pre_padding(&pre)
+            .set_pre_padding(network, &pre)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("convTranspose2d set_pre_padding: {}", e),
             })?;
         layer
-            .set_post_padding(&post)
+            .set_post_padding(network, &post)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("convTranspose2d set_post_padding: {}", e),
             })?;
 
         layer
-            .set_num_groups(groups)
+            .set_num_groups(network, groups as i64)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("convTranspose2d set_num_groups: {}", e),
             })?;
 
-        let deconv_output = layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get deconvolution output: {}", e),
-            })?;
+        let deconv_output =
+            layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get deconvolution output: {}", e),
+                })?;
 
         // When padding could not fully absorb outputPadding, add IPaddingLayer for remainder.
         let deconv_output = if padding_remainder[0] != 0 || padding_remainder[1] != 0 {
-            let pre_pad: Vec<i32> = vec![0, 0];
-            let post_pad: Vec<i32> = vec![padding_remainder[0], padding_remainder[1]];
+            let pre_pad: Vec<i64> = vec![0, 0];
+            let post_pad: Vec<i64> = vec![
+                padding_remainder[0] as i64,
+                padding_remainder[1] as i64,
+            ];
             let pad_layer = network
                 .add_padding(&deconv_output, &pre_pad, &post_pad)
                 .map_err(|e| GraphError::ConversionFailed {
@@ -7565,7 +7770,7 @@ impl TrtxConverter {
                     reason: format!("convTranspose2d outputPadding remainder: {}", e),
                 })?;
             pad_layer
-                .get_output(0)
+                .get_output(&*network, 0)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("convTranspose2d outputPadding remainder output: {}", e),
@@ -7627,16 +7832,21 @@ impl TrtxConverter {
                         let slice_w = current_w.min(target_w);
                         let mut current = deconv_output;
                         if slice_h < current_h || slice_w < current_w {
-                            let start: Vec<i32> = vec![0, 0, 0, 0];
-                            let size: Vec<i32> = vec![out_batch, out_c, slice_h, slice_w];
-                            let stride: Vec<i32> = vec![1, 1, 1, 1];
+                            let start: Vec<i64> = vec![0, 0, 0, 0];
+                            let size: Vec<i64> = vec![
+                                out_batch as i64,
+                                out_c as i64,
+                                slice_h as i64,
+                                slice_w as i64,
+                            ];
+                            let stride: Vec<i64> = vec![1, 1, 1, 1];
                             let slice_layer = network
                                 .add_slice(&current, &start, &size, &stride)
                                 .map_err(|e| GraphError::ConversionFailed {
                                 format: "trtx".to_string(),
                                 reason: format!("convTranspose2d outputSizes slice: {}", e),
                             })?;
-                            current = slice_layer.get_output(0).map_err(|e| {
+                            current = slice_layer.get_output(&*network, 0).map_err(|e| {
                                 GraphError::ConversionFailed {
                                     format: "trtx".to_string(),
                                     reason: format!(
@@ -7649,8 +7859,8 @@ impl TrtxConverter {
                         let pad_h = target_h - slice_h;
                         let pad_w = target_w - slice_w;
                         if pad_h > 0 || pad_w > 0 {
-                            let pre: Vec<i32> = vec![0, 0];
-                            let post: Vec<i32> = vec![pad_h, pad_w];
+                            let pre: Vec<i64> = vec![0, 0];
+                            let post: Vec<i64> = vec![pad_h as i64, pad_w as i64];
                             let pad_layer =
                                 network.add_padding(&current, &pre, &post).map_err(|e| {
                                     GraphError::ConversionFailed {
@@ -7658,15 +7868,15 @@ impl TrtxConverter {
                                         reason: format!("convTranspose2d outputSizes pad: {}", e),
                                     }
                                 })?;
-                            pad_layer
-                                .get_output(0)
-                                .map_err(|e| GraphError::ConversionFailed {
+                            pad_layer.get_output(&*network, 0).map_err(|e| {
+                                GraphError::ConversionFailed {
                                     format: "trtx".to_string(),
                                     reason: format!(
                                         "convTranspose2d outputSizes pad output: {}",
                                         e
                                     ),
-                                })?
+                                }
+                            })?
                         } else {
                             current
                         }
@@ -7684,7 +7894,7 @@ impl TrtxConverter {
                     reason: format!("convTranspose2d Float->Half cast: {}", e),
                 })?;
             cast_layer
-                .get_output(0)
+                .get_output(&*network, 0)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("convTranspose2d cast output: {}", e),
@@ -7701,14 +7911,16 @@ impl TrtxConverter {
                         format: "trtx".to_string(),
                         reason: format!("convTranspose2d NCHW->NHWC shuffle: {}", e),
                     })?;
-            shuffle.set_first_transpose(&[0, 2, 3, 1]).map_err(|e| {
+            shuffle
+                .set_first_transpose(network, &[0, 2, 3, 1])
+                .map_err(|e| {
                 GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("convTranspose2d set_first_transpose NCHW->NHWC: {}", e),
                 }
             })?;
             shuffle
-                .get_output(0)
+                .get_output(&*network, 0)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("convTranspose2d NHWC output shuffle: {}", e),
@@ -7724,9 +7936,9 @@ impl TrtxConverter {
     }
 
     /// Add pooling operation
-    fn add_pooling_op(
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+    fn add_pooling_op<'a>(
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
         pool_type: PoolingType,
     ) -> Result<(), GraphError> {
@@ -7753,9 +7965,9 @@ impl TrtxConverter {
                 reason: "Missing windowDimensions attribute".to_string(),
             })?;
 
-        let window: [i32; 2] = [
-            window_size.get(0).copied().unwrap_or(2) as i32,
-            window_size.get(1).copied().unwrap_or(2) as i32,
+        let window: [i64; 2] = [
+            window_size.get(0).copied().unwrap_or(2) as i64,
+            window_size.get(1).copied().unwrap_or(2) as i64,
         ];
 
         let layer = network
@@ -7767,7 +7979,7 @@ impl TrtxConverter {
 
         // Extract output tensor from layer
         let output = layer
-            .get_output(0)
+            .get_output(&*network, 0)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get layer output: {}", e),
@@ -7780,9 +7992,9 @@ impl TrtxConverter {
     }
 
     /// Add softmax operation
-    fn add_softmax_op(
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+    fn add_softmax_op<'a>(
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
         let input = tensor_map
@@ -7809,7 +8021,7 @@ impl TrtxConverter {
         let axes = 1u32 << positive_axis;
 
         let layer = network
-            .add_softmax(input, axes)
+            .add_softmax(input, Axes::from_bits(axes))
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to add softmax: {}", e),
@@ -7817,7 +8029,7 @@ impl TrtxConverter {
 
         // Extract output tensor from layer
         let output = layer
-            .get_output(0)
+            .get_output(&*network, 0)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get layer output: {}", e),
@@ -7830,12 +8042,12 @@ impl TrtxConverter {
     }
 
     /// Add concatenation operation
-    fn add_concat_op(
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+    fn add_concat_op<'a>(
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
-        let inputs: Vec<&trtx::Tensor> = operation
+        let inputs: Vec<&trtx::Tensor<'a>> = operation
             .input_operands()
             .iter()
             .map(|&id| {
@@ -7866,7 +8078,7 @@ impl TrtxConverter {
                 .unwrap_or(0),
         };
         let ndim = inputs[0]
-            .dimensions()
+            .dimensions(&*network)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Concat: failed to get input dimensions: {}", e),
@@ -7877,16 +8089,11 @@ impl TrtxConverter {
             axis_i32 += ndim;
         }
         axis_i32 = axis_i32.max(0).min(ndim.saturating_sub(1));
-        layer
-            .set_axis(axis_i32)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to set concat axis {}: {}", axis_i32, e),
-            })?;
+        layer.set_axis(network, axis_i32);
 
         // Extract output tensor from layer
         let output = layer
-            .get_output(0)
+            .get_output(&*network, 0)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get layer output: {}", e),
@@ -7904,10 +8111,10 @@ impl TrtxConverter {
     }
 
     /// Add transpose operation using shuffle layer
-    fn add_transpose_op(
+    fn add_transpose_op<'a>(
         _graph: &GraphInfo,
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
         let input = tensor_map
@@ -7918,7 +8125,7 @@ impl TrtxConverter {
             })?;
 
         let input_dims = input
-            .dimensions()
+            .dimensions(&*network)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Transpose: failed to get input dimensions: {}", e),
@@ -7952,14 +8159,14 @@ impl TrtxConverter {
             })?;
 
         layer
-            .set_first_transpose(&perm)
+            .set_first_transpose(network, perm.as_slice())
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to set transpose permutation: {}", e),
             })?;
 
         let output = layer
-            .get_output(0)
+            .get_output(&*network, 0)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get layer output: {}", e),
@@ -7972,10 +8179,10 @@ impl TrtxConverter {
     }
 
     /// Add reshape operation using shuffle layer
-    fn add_reshape_op(
+    fn add_reshape_op<'a>(
         _graph: &GraphInfo,
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
         let input = tensor_map
@@ -8001,9 +8208,9 @@ impl TrtxConverter {
             });
         }
 
-        let dims: Vec<i32> = crate::operator_options::mldimensions_static_or_max(new_shape)
+        let dims: Vec<i64> = crate::operator_options::mldimensions_static_or_max(new_shape)
             .into_iter()
-            .map(|u| u as i32)
+            .map(|u| u as i64)
             .collect();
 
         // Use shuffle layer for reshape
@@ -8016,7 +8223,7 @@ impl TrtxConverter {
 
         // Set the reshape dimensions
         layer
-            .set_reshape_dimensions(&dims)
+            .set_reshape_dimensions(network, &dims)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to set reshape dimensions: {}", e),
@@ -8024,7 +8231,7 @@ impl TrtxConverter {
 
         // Extract output tensor from layer
         let output = layer
-            .get_output(0)
+            .get_output(&*network, 0)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get layer output: {}", e),
@@ -8037,9 +8244,9 @@ impl TrtxConverter {
     }
 
     /// Add resample2d operation (resize/interpolate 2D tensor)
-    fn add_resample2d_op(
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+    fn add_resample2d_op<'a>(
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
         let input = tensor_map
@@ -8101,26 +8308,16 @@ impl TrtxConverter {
         // WebNN resample2d only specifies [H, W], so we need to preserve N and C
         // For now, we'll assume 4D NCHW input and set full dimensions
         // TODO: Get actual input dimensions to preserve N and C
-        let output_dims = vec![1, 1, sizes[0], sizes[1]]; // Placeholder: [N=1, C=1, H, W]
+        let output_dims: Vec<i64> = vec![1, 1, sizes[0] as i64, sizes[1] as i64]; // Placeholder: [N=1, C=1, H, W]
 
         // Set output dimensions
-        layer
-            .set_output_dimensions(&output_dims)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to set resize output dimensions: {}", e),
-            })?;
+        layer.set_output_dimensions(network, &output_dims);
 
         // Set resize mode (uses ResizeMode typedef for InterpolationMode)
-        layer
-            .set_resize_mode(resize_mode)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to set resize mode: {}", e),
-            })?;
+        layer.set_resize_mode(network, resize_mode);
 
         let output = layer
-            .get_output(0)
+            .get_output(&*network, 0)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get resize output: {}", e),
@@ -8137,9 +8334,9 @@ impl TrtxConverter {
     // ============================================================================
 
     /// Add isNaN operation (check if value is NaN using x != x)
-    fn add_is_nan_op(
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+    fn add_is_nan_op<'a>(
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
         let input_tensor = tensor_map
@@ -8158,12 +8355,13 @@ impl TrtxConverter {
                 reason: format!("Failed to create EQUAL layer for isNaN: {}", e),
             })?;
 
-        let equal_output = layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get EQUAL output: {}", e),
-            })?;
+        let equal_output =
+            layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get EQUAL output: {}", e),
+                })?;
 
         // Negate the result (isNaN = NOT(x == x))
         let not_layer = network
@@ -8173,12 +8371,13 @@ impl TrtxConverter {
                 reason: format!("Failed to create NOT layer for isNaN: {}", e),
             })?;
 
-        let bool_output = not_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get isNaN output: {}", e),
-            })?;
+        let bool_output =
+            not_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get isNaN output: {}", e),
+                })?;
 
         // Cast BOOL to Float32 for WebNN compatibility
         let output = Self::cast_to_float32(network, &bool_output)?;
@@ -8190,11 +8389,10 @@ impl TrtxConverter {
     }
 
     /// Add isInfinite operation (check if value is infinite)
-    fn add_is_infinite_op(
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+    fn add_is_infinite_op<'a>(
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
-        temp_weights: &mut Vec<Vec<u8>>,
     ) -> Result<(), GraphError> {
         let input_tensor = tensor_map
             .get(&operation.input_operands()[0])
@@ -8212,29 +8410,29 @@ impl TrtxConverter {
                 reason: format!("Failed to create ABS layer for isInfinite: {}", e),
             })?;
 
-        let abs_output = abs_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get ABS output: {}", e),
-            })?;
+        let abs_output =
+            abs_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get ABS output: {}", e),
+                })?;
 
-        // Create constant for infinity
-        temp_weights.push(f32::INFINITY.to_le_bytes().to_vec());
-        let inf_data = temp_weights.last().unwrap();
+        let inf_bytes = f32::INFINITY.to_le_bytes();
         let inf_constant = network
-            .add_constant(&[1], inf_data, TrtDataType::kFLOAT)
+            .add_small_constant_copied(&[1], inf_bytes.as_slice(), TrtDataType::kFLOAT)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to create infinity constant: {}", e),
             })?;
 
-        let inf_tensor = inf_constant
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get infinity tensor: {}", e),
-            })?;
+        let inf_tensor =
+            inf_constant
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get infinity tensor: {}", e),
+                })?;
 
         // Compare abs(x) == infinity
         let equal_layer = network
@@ -8244,12 +8442,13 @@ impl TrtxConverter {
                 reason: format!("Failed to create EQUAL layer for isInfinite: {}", e),
             })?;
 
-        let bool_output = equal_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get isInfinite output: {}", e),
-            })?;
+        let bool_output =
+            equal_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get isInfinite output: {}", e),
+                })?;
 
         // Cast BOOL to Float32 for WebNN compatibility
         let output = Self::cast_to_float32(network, &bool_output)?;
@@ -8261,9 +8460,9 @@ impl TrtxConverter {
     }
 
     /// Add roundEven operation (round to nearest even integer, banker's rounding)
-    fn add_round_even_op(
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+    fn add_round_even_op<'a>(
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
         let input_tensor = tensor_map
@@ -8282,7 +8481,7 @@ impl TrtxConverter {
             })?;
 
         let output = layer
-            .get_output(0)
+            .get_output(&*network, 0)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get roundEven output: {}", e),
@@ -8295,9 +8494,9 @@ impl TrtxConverter {
     }
 
     /// Add gatherElements operation (gather using index tensor along axis)
-    fn add_gather_elements_op(
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+    fn add_gather_elements_op<'a>(
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
         let data_tensor = tensor_map
@@ -8333,15 +8532,10 @@ impl TrtxConverter {
             })?;
 
         // Set gather mode to ELEMENT
-        layer
-            .set_gather_mode(trtx::GatherMode::kELEMENT)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to set gather mode: {}", e),
-            })?;
+        layer.set_gather_mode(network, trtx::GatherMode::kELEMENT);
 
         let output = layer
-            .get_output(0)
+            .get_output(&*network, 0)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get gatherElements output: {}", e),
@@ -8354,9 +8548,9 @@ impl TrtxConverter {
     }
 
     /// Add l2Pool2d operation (L2 pooling: square → avgPool → sqrt)
-    fn add_l2_pool2d_op(
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+    fn add_l2_pool2d_op<'a>(
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
         let input_tensor = tensor_map
@@ -8374,12 +8568,13 @@ impl TrtxConverter {
                 reason: format!("Failed to create square layer for l2Pool2d: {}", e),
             })?;
 
-        let squared = square_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get squared output: {}", e),
-            })?;
+        let squared =
+            square_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get squared output: {}", e),
+                })?;
 
         // Step 2: Apply average pooling (use same parameters as maxPool2d/averagePool2d)
         let window_size = operation
@@ -8391,9 +8586,9 @@ impl TrtxConverter {
                 reason: "Missing windowDimensions for l2Pool2d".to_string(),
             })?;
 
-        let window: [i32; 2] = [
-            window_size[0].as_i64().unwrap_or(1) as i32,
-            window_size[1].as_i64().unwrap_or(1) as i32,
+        let window: [i64; 2] = [
+            window_size[0].as_i64().unwrap_or(1),
+            window_size[1].as_i64().unwrap_or(1),
         ];
 
         let pool_layer = network
@@ -8403,12 +8598,13 @@ impl TrtxConverter {
                 reason: format!("Failed to create pooling layer for l2Pool2d: {}", e),
             })?;
 
-        let pooled = pool_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get pooled output: {}", e),
-            })?;
+        let pooled =
+            pool_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get pooled output: {}", e),
+                })?;
 
         // Step 3: Take square root
         let sqrt_layer = network
@@ -8418,12 +8614,13 @@ impl TrtxConverter {
                 reason: format!("Failed to create sqrt layer for l2Pool2d: {}", e),
             })?;
 
-        let output = sqrt_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get l2Pool2d output: {}", e),
-            })?;
+        let output =
+            sqrt_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get l2Pool2d output: {}", e),
+                })?;
 
         let output_ids = operation.output_operands_slice();
         let output_id = output_ids[0];
@@ -8433,10 +8630,10 @@ impl TrtxConverter {
 
     /// Add reverse operation (reverse elements along axes) - PLACEHOLDER
     /// Add reverse operation (reverse elements along axes using negative stride slicing)
-    fn add_reverse_op(
+    fn add_reverse_op<'a>(
         graph: &GraphInfo,
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
         let input_tensor = tensor_map
@@ -8469,12 +8666,12 @@ impl TrtxConverter {
         //   size = n (number of elements)
         //   stride = -1
         //   end_idx should be = (n-1) + (n-1)*(-1) = (n-1) - (n-1) = 0 ✓
-        let mut starts: Vec<i32> = vec![0; rank];
-        let sizes: Vec<i32> = shape
+        let mut starts: Vec<i64> = vec![0; rank];
+        let sizes: Vec<i64> = shape
             .iter()
-            .map(|s| get_static_or_max_size(s) as i32)
+            .map(|s| get_static_or_max_size(s) as i64)
             .collect();
-        let mut strides: Vec<i32> = vec![1; rank];
+        let mut strides: Vec<i64> = vec![1; rank];
 
         for &axis in &axes_to_reverse {
             if axis >= rank {
@@ -8490,7 +8687,7 @@ impl TrtxConverter {
             // TensorRT will compute: indices = start + i*stride for i in 0..size
             // So: indices = (size-1) + i*(-1) = (size-1) - i
             // For i=0: size-1, i=1: size-2, ..., i=size-1: 0 ✓
-            starts[axis] = (get_static_or_max_size(&shape[axis]) - 1) as i32;
+            starts[axis] = (get_static_or_max_size(&shape[axis]) - 1) as i64;
             strides[axis] = -1;
         }
 
@@ -8502,7 +8699,7 @@ impl TrtxConverter {
             })?;
 
         let output = layer
-            .get_output(0)
+            .get_output(&*network, 0)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get reverse output: {}", e),
@@ -8518,12 +8715,11 @@ impl TrtxConverter {
     /// Add cumulativeSum operation using explicit slice-and-add decomposition
     ///
     /// Uses TensorRT's native ICumulativeLayer for efficient implementation.
-    fn add_cumulative_sum_op(
+    fn add_cumulative_sum_op<'a>(
         graph: &GraphInfo,
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
-        temp_weights: &mut Vec<Vec<u8>>,
     ) -> Result<(), GraphError> {
         let input_tensor = tensor_map
             .get(&operation.input_operands()[0])
@@ -8553,17 +8749,13 @@ impl TrtxConverter {
             });
         }
 
-        // Create axis constant with proper lifetime management
-        // Store bytes in temp_weights to keep them alive until engine is built
         let axis_value = axis as i32;
-        let axis_bytes: Vec<u8> = axis_value.to_le_bytes().to_vec();
-        temp_weights.push(axis_bytes);
-        let axis_bytes_ref = temp_weights.last().unwrap();
+        let axis_bytes = axis_value.to_le_bytes();
 
         // Create axis constant tensor (true 0D scalar with shape [])
         // TensorRT requires axisDims.nbDims == 0 for cumulative operations
         let axis_constant = network
-            .add_constant(&[], axis_bytes_ref, trtx::DataType::kINT32)
+            .add_small_constant_copied(&[], axis_bytes.as_slice(), trtx::DataType::kINT32)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to create axis constant: {}", e),
@@ -8571,7 +8763,7 @@ impl TrtxConverter {
 
         let axis_tensor =
             axis_constant
-                .get_output(0)
+                .get_output(&*network, 0)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("Failed to get axis constant output: {}", e),
@@ -8592,7 +8784,7 @@ impl TrtxConverter {
             })?;
 
         let output = layer
-            .get_output(0)
+            .get_output(&*network, 0)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to get cumulative sum output: {}", e),
@@ -8606,12 +8798,11 @@ impl TrtxConverter {
 
     /// Add triangular operation (extract triangular part of matrix) - PLACEHOLDER
     /// Add triangular operation (extract upper/lower triangular part with masking)
-    fn add_triangular_op(
+    fn add_triangular_op<'a>(
         graph: &GraphInfo,
-        network: &mut trtx::NetworkDefinition,
-        tensor_map: &mut HashMap<u32, trtx::Tensor>,
+        network: &mut trtx::NetworkDefinition<'a>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
-        temp_weights: &mut Vec<Vec<u8>>,
     ) -> Result<(), GraphError> {
         let input_tensor = tensor_map
             .get(&operation.input_operands()[0])
@@ -8672,28 +8863,25 @@ impl TrtxConverter {
         // Convert mask to bytes
         let mask_bytes: Vec<u8> = mask_data.iter().flat_map(|&f| f.to_le_bytes()).collect();
 
-        // Store mask in temp_weights to keep it alive (critical for weight lifetime)
-        temp_weights.push(mask_bytes);
-        let mask_bytes_ref = temp_weights.last().unwrap();
-
         // Create constant layer with the mask
-        let dims: Vec<i32> = shape
+        let dims: Vec<i64> = shape
             .iter()
-            .map(|s| get_static_or_max_size(s) as i32)
+            .map(|s| get_static_or_max_size(s) as i64)
             .collect();
         let mask_layer = network
-            .add_constant(&dims, mask_bytes_ref, trtx::DataType::kFLOAT)
+            .add_constant_owned(&dims, mask_bytes, trtx::DataType::kFLOAT)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to add constant mask for triangular: {}", e),
             })?;
 
-        let mask_tensor = mask_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get mask tensor: {}", e),
-            })?;
+        let mask_tensor =
+            mask_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get mask tensor: {}", e),
+                })?;
 
         // Multiply input by mask (elementwise)
         let multiply_layer = network
@@ -8703,12 +8891,13 @@ impl TrtxConverter {
                 reason: format!("Failed to add elementwise multiply for triangular: {}", e),
             })?;
 
-        let output = multiply_layer
-            .get_output(0)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to get triangular output: {}", e),
-            })?;
+        let output =
+            multiply_layer
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("Failed to get triangular output: {}", e),
+                })?;
 
         let output_ids = operation.output_operands_slice();
         let output_id = output_ids[0];
@@ -8754,7 +8943,7 @@ impl GraphConverter for TrtxConverter {
             reason: format!("Failed to create TensorRT logger: {}", e),
         })?;
 
-        let builder = trtx::Builder::new(&logger).map_err(|e| GraphError::ConversionFailed {
+        let mut builder = trtx::Builder::new(&logger).map_err(|e| GraphError::ConversionFailed {
             format: "trtx".to_string(),
             reason: format!("Failed to create TensorRT builder: {}", e),
         })?;
@@ -8766,9 +8955,9 @@ impl GraphConverter for TrtxConverter {
                 reason: format!("Failed to create TensorRT network: {}", e),
             })?;
 
-        // Build the network from WebNN graph and capture temporary weights
-        // These weights must stay alive until engine serialization completes
-        let _temp_weights = Self::build_network(graph_info, &mut network)?;
+        // Temporary weight buffers referenced by the network; must outlive `build_serialized_network`.
+        let mut temp_weights: Vec<Vec<u8>> = Vec::new();
+        Self::build_network(graph_info, &mut network, &mut temp_weights)?;
 
         // Create builder config
         let mut config = builder
@@ -8779,12 +8968,7 @@ impl GraphConverter for TrtxConverter {
             })?;
 
         // Set workspace size (1 GB)
-        config
-            .set_memory_pool_limit(trtx::builder::MemoryPoolType::Workspace, 1 << 30)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("Failed to set workspace size: {}", e),
-            })?;
+        config.set_memory_pool_limit(trtx::builder::MemoryPoolType::kWORKSPACE, 1 << 30);
 
         // Build and serialize the engine
         let engine_data = builder
@@ -8797,7 +8981,7 @@ impl GraphConverter for TrtxConverter {
         Ok(ConvertedGraph {
             format: "trtx",
             content_type: "application/x-tensorrt-engine",
-            data: engine_data,
+            data: engine_data.to_vec(),
             weights_data: None,
         })
     }
