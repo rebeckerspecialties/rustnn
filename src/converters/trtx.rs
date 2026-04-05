@@ -1168,37 +1168,57 @@ impl TrtxConverter {
         Ok(())
     }
 
-    /// Add logical operation (cast Float32 to BOOL, perform operation, cast back to Float32)
+    /// Add logical operation: broadcast on float/half tensors, cast to BOOL, elementwise kAND/kOR/kXOR, Float32 output.
+    ///
+    /// TensorRT elementwise `kAND` / `kOR` / `kXOR` require BOOL inputs, so we cast after broadcast.
+    /// [`ensure_broadcast_compatible`] may use `IResizeLayer`, which does not accept BOOL—so broadcast must
+    /// run on Float/Half (original path). UInt8/Int8 are **`Cast` to Float32 first** so they never pass
+    /// through `Identity` as internal UINT8/INT8 (strongly-typed TRT rejects that).
     fn add_logical_binary_op<'a>(
-        _graph: &GraphInfo,
+        graph: &GraphInfo,
         network: &mut trtx::NetworkDefinition<'a>,
         tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
         op_code: ElementWiseOperation,
     ) -> Result<(), GraphError> {
+        let id0 = operation.input_operands()[0];
+        let id1 = operation.input_operands()[1];
         let input0 = tensor_map
-            .get(&operation.input_operands()[0])
+            .get(&id0)
             .ok_or_else(|| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
-                reason: format!("Input operand {} not found", operation.input_operands()[0]),
+                reason: format!("Input operand {} not found", id0),
             })?;
 
         let input1 = tensor_map
-            .get(&operation.input_operands()[1])
+            .get(&id1)
             .ok_or_else(|| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
-                reason: format!("Input operand {} not found", operation.input_operands()[1]),
+                reason: format!("Input operand {} not found", id1),
             })?;
 
-        // Ensure broadcast compatibility BEFORE casting to BOOL
-        let (bc_input0, bc_input1) =
-            Self::ensure_broadcast_compatible(network, input0, input1, operation.op_type())?;
+        let promoted0 = match graph.operand(id0).map(|o| o.descriptor.data_type) {
+            Some(DataType::Uint8) | Some(DataType::Int8) => {
+                Some(Self::cast_to_float32(network, input0)?)
+            }
+            _ => None,
+        };
+        let promoted1 = match graph.operand(id1).map(|o| o.descriptor.data_type) {
+            Some(DataType::Uint8) | Some(DataType::Int8) => {
+                Some(Self::cast_to_float32(network, input1)?)
+            }
+            _ => None,
+        };
 
-        // Cast Float32 inputs to BOOL
+        let t0: &trtx::Tensor<'a> = promoted0.as_ref().unwrap_or(input0);
+        let t1: &trtx::Tensor<'a> = promoted1.as_ref().unwrap_or(input1);
+
+        let (bc_input0, bc_input1) =
+            Self::ensure_broadcast_compatible(network, t0, t1, operation.op_type())?;
+
         let bool_input0 = Self::cast_to_bool(network, &bc_input0)?;
         let bool_input1 = Self::cast_to_bool(network, &bc_input1)?;
 
-        // Perform logical operation on BOOL
         let layer = network
             .add_elementwise(&bool_input0, &bool_input1, op_code)
             .map_err(|e| GraphError::ConversionFailed {
@@ -9083,8 +9103,22 @@ impl TrtxConverter {
             }
         }
 
-        // Convert mask to bytes
-        let mask_bytes: Vec<u8> = mask_data.iter().flat_map(|&f| f.to_le_bytes()).collect();
+        let input_dtype = input_operand.descriptor.data_type;
+        // Elementwise PROD requires matching types; mask must match input (e.g. Half for float16).
+        let (mask_bytes, mask_trt_ty) = match input_dtype {
+            DataType::Float16 => {
+                let mut bytes = Vec::with_capacity(total_elements * 2);
+                for &f in &mask_data {
+                    let v = if f == 1.0 { 1.0f32 } else { 0.0f32 };
+                    bytes.extend_from_slice(&f16::from_f32(v).to_bits().to_le_bytes());
+                }
+                (bytes, TrtDataType::kHALF)
+            }
+            _ => {
+                let mask_bytes: Vec<u8> = mask_data.iter().flat_map(|&f| f.to_le_bytes()).collect();
+                (mask_bytes, TrtDataType::kFLOAT)
+            }
+        };
 
         // Create constant layer with the mask
         let dims: Vec<i64> = shape
@@ -9092,7 +9126,7 @@ impl TrtxConverter {
             .map(|s| get_static_or_max_size(s) as i64)
             .collect();
         let mask_layer = network
-            .add_constant_owned(&dims, mask_bytes, trtx::DataType::kFLOAT)
+            .add_constant_owned(&dims, mask_bytes, mask_trt_ty)
             .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
                 reason: format!("Failed to add constant mask for triangular: {}", e),
