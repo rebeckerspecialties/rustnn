@@ -6582,17 +6582,18 @@ impl TrtxConverter {
     /// Add GEMM (General Matrix Multiply) operation
     /// Computes: C = alpha * A * B + beta * C
     fn add_gemm_op<'a>(
-        _graph: &GraphInfo,
+        graph: &GraphInfo,
         network: &mut trtx::NetworkDefinition<'a>,
         tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         _temp_weights: &mut Vec<Vec<u8>>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
+        let a_id = operation.input_operands()[0];
         let input_a = tensor_map
-            .get(&operation.input_operands()[0])
+            .get(&a_id)
             .ok_or_else(|| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
-                reason: format!("Input operand {} not found", operation.input_operands()[0]),
+                reason: format!("Input operand {} not found", a_id),
             })?;
 
         let input_b = tensor_map
@@ -6601,6 +6602,11 @@ impl TrtxConverter {
                 format: "trtx".to_string(),
                 reason: format!("Input operand {} not found", operation.input_operands()[1]),
             })?;
+
+        let gemm_dtype = graph
+            .operand(a_id)
+            .map(|o| o.descriptor.data_type)
+            .unwrap_or(DataType::Float32);
 
         let attrs = operation.attributes();
         let opts = attrs.as_gemm();
@@ -6692,13 +6698,28 @@ impl TrtxConverter {
                         reason: format!("Failed to get result dimensions: {}", e),
                     })?;
 
-            // Create constant filled with alpha value matching result shape
+            // Create constant filled with alpha value matching result shape and element type
+            // (TensorRT elementwise PROD requires matching types; matrix multiply output follows A/B).
             let num_elements: usize = result_dims.iter().map(|&d| d as usize).product();
-            let alpha_data: Vec<f32> = vec![alpha; num_elements];
-            let alpha_bytes: Vec<u8> = alpha_data.iter().flat_map(|&f| f.to_le_bytes()).collect();
+            let (alpha_bytes, alpha_trt_ty) = match gemm_dtype {
+                DataType::Float16 => {
+                    let bits = f16::from_f32(alpha).to_bits().to_le_bytes();
+                    let mut v = Vec::with_capacity(num_elements * 2);
+                    for _ in 0..num_elements {
+                        v.extend_from_slice(&bits);
+                    }
+                    (v, TrtDataType::kHALF)
+                }
+                _ => {
+                    let alpha_data: Vec<f32> = vec![alpha; num_elements];
+                    let alpha_bytes: Vec<u8> =
+                        alpha_data.iter().flat_map(|&f| f.to_le_bytes()).collect();
+                    (alpha_bytes, TrtDataType::kFLOAT)
+                }
+            };
 
             let alpha_layer = network
-                .add_small_constant_copied(&result_dims, &alpha_bytes, TrtDataType::kFLOAT)
+                .add_small_constant_copied(&result_dims, &alpha_bytes, alpha_trt_ty)
                 .map_err(|e| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
                     reason: format!("Failed to create alpha constant: {}", e),
@@ -6729,13 +6750,14 @@ impl TrtxConverter {
                     })?;
         }
 
-        // If there's a C input and beta != 0, add it
-        if operation.input_operands().len() > 2 && beta.abs() > 1e-6 {
+        // Optional bias matrix C is WebNN `MLGemmOptions.c`; Gemm only lists [A, B] in
+        // `input_operands` (same as ONNX node inputs in converters/onnx.rs).
+        if let Some(c_id) = opts.and_then(|o| o.c).filter(|_| beta.abs() > 1e-6) {
             let input_c = tensor_map
-                .get(&operation.input_operands()[2])
+                .get(&c_id)
                 .ok_or_else(|| GraphError::ConversionFailed {
                     format: "trtx".to_string(),
-                    reason: format!("Input operand {} not found", operation.input_operands()[2]),
+                    reason: format!("GEMM options.c operand {} not found", c_id),
                 })?;
 
             // Scale C by beta if needed, then add to result
@@ -6749,13 +6771,27 @@ impl TrtxConverter {
                             reason: format!("Failed to get C dimensions: {}", e),
                         })?;
 
-                // Create constant filled with beta value matching C shape
+                // Create constant filled with beta value matching C shape and GEMM element type
                 let num_elements: usize = c_dims.iter().map(|&d| d as usize).product();
-                let beta_data: Vec<f32> = vec![beta; num_elements];
-                let beta_bytes: Vec<u8> = beta_data.iter().flat_map(|&f| f.to_le_bytes()).collect();
+                let (beta_bytes, beta_trt_ty) = match gemm_dtype {
+                    DataType::Float16 => {
+                        let bits = f16::from_f32(beta).to_bits().to_le_bytes();
+                        let mut v = Vec::with_capacity(num_elements * 2);
+                        for _ in 0..num_elements {
+                            v.extend_from_slice(&bits);
+                        }
+                        (v, TrtDataType::kHALF)
+                    }
+                    _ => {
+                        let beta_data: Vec<f32> = vec![beta; num_elements];
+                        let beta_bytes: Vec<u8> =
+                            beta_data.iter().flat_map(|&f| f.to_le_bytes()).collect();
+                        (beta_bytes, TrtDataType::kFLOAT)
+                    }
+                };
 
                 let beta_layer = network
-                    .add_small_constant_copied(&c_dims, &beta_bytes, TrtDataType::kFLOAT)
+                    .add_small_constant_copied(&c_dims, &beta_bytes, beta_trt_ty)
                     .map_err(|e| GraphError::ConversionFailed {
                         format: "trtx".to_string(),
                         reason: format!("Failed to create beta constant: {}", e),
@@ -6783,9 +6819,19 @@ impl TrtxConverter {
                     }
                 })?;
 
-                // Add result + beta*C
+                // WebNN/ONNX broadcast C to alpha*A*B (e.g. C [5] with output [3,5]). One call
+                // pads rank ([5]->[1,5]); a second call expands 1s to match rows (TRT elementwise).
+                let (r_bc, c_bc) = Self::ensure_broadcast_compatible(
+                    network,
+                    &result,
+                    &scaled_c,
+                    "gemm_options_c",
+                )?;
+                let (r_bc2, c_bc2) =
+                    Self::ensure_broadcast_compatible(network, &r_bc, &c_bc, "gemm_options_c")?;
+
                 let add_layer = network
-                    .add_elementwise(&result, &scaled_c, ElementWiseOperation::kSUM)
+                    .add_elementwise(&r_bc2, &c_bc2, ElementWiseOperation::kSUM)
                     .map_err(|e| GraphError::ConversionFailed {
                         format: "trtx".to_string(),
                         reason: format!("Failed to add scaled C to result: {}", e),
@@ -6798,9 +6844,13 @@ impl TrtxConverter {
                     }
                 })?;
             } else {
-                // beta == 1.0: add C directly
+                let (r_bc, c_bc) =
+                    Self::ensure_broadcast_compatible(network, &result, input_c, "gemm_options_c")?;
+                let (r_bc2, c_bc2) =
+                    Self::ensure_broadcast_compatible(network, &r_bc, &c_bc, "gemm_options_c")?;
+
                 let add_layer = network
-                    .add_elementwise(&result, input_c, ElementWiseOperation::kSUM)
+                    .add_elementwise(&r_bc2, &c_bc2, ElementWiseOperation::kSUM)
                     .map_err(|e| GraphError::ConversionFailed {
                         format: "trtx".to_string(),
                         reason: format!("Failed to add C to result: {}", e),
