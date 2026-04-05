@@ -2309,18 +2309,44 @@ impl Operation {
                 options: attributes.as_constant().cloned(),
                 outputs: outputs.to_vec(),
             }),
-            "conv2d" if input_operands.len() >= 2 => Some(Operation::Conv2d {
-                input: at(input_operands, 0)?,
-                filter: at(input_operands, 1)?,
-                options: attributes.as_conv2d().cloned(),
-                outputs: outputs.to_vec(),
-            }),
-            "convTranspose2d" if input_operands.len() >= 2 => Some(Operation::ConvTranspose2d {
-                input: at(input_operands, 0)?,
-                filter: at(input_operands, 1)?,
-                options: attributes.as_conv_transpose2d().cloned(),
-                outputs: outputs.to_vec(),
-            }),
+            "conv2d" if input_operands.len() >= 2 => {
+                let parsed = attributes.as_conv2d().cloned();
+                let mut opts = parsed.clone().unwrap_or_default();
+                if opts.bias.is_none()
+                    && let Some(b) = at(input_operands, 2)
+                {
+                    opts.bias = Some(b);
+                }
+                let options = match parsed {
+                    None if opts == MLConv2dOptions::default() => None,
+                    _ => Some(opts),
+                };
+                Some(Operation::Conv2d {
+                    input: at(input_operands, 0)?,
+                    filter: at(input_operands, 1)?,
+                    options,
+                    outputs: outputs.to_vec(),
+                })
+            }
+            "convTranspose2d" if input_operands.len() >= 2 => {
+                let parsed = attributes.as_conv_transpose2d().cloned();
+                let mut opts = parsed.clone().unwrap_or_default();
+                if opts.bias.is_none()
+                    && let Some(b) = at(input_operands, 2)
+                {
+                    opts.bias = Some(b);
+                }
+                let options = match parsed {
+                    None if opts == MLConvTranspose2dOptions::default() => None,
+                    _ => Some(opts),
+                };
+                Some(Operation::ConvTranspose2d {
+                    input: at(input_operands, 0)?,
+                    filter: at(input_operands, 1)?,
+                    options,
+                    outputs: outputs.to_vec(),
+                })
+            }
             "concat" => Some(Operation::Concat {
                 inputs: input_operands.to_vec(),
                 axis: extras.axis.unwrap_or(0),

@@ -6743,8 +6743,23 @@ impl TrtxConverter {
         tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
-        let filter_id = operation.input_operands()[1];
-        let bias_id = operation.input_operands().get(2).copied();
+        let (input_id, filter_id, conv_opts) = match operation {
+            Operation::Conv2d {
+                input,
+                filter,
+                options,
+                ..
+            } => (*input, *filter, options.as_ref()),
+            _ => {
+                return Err(GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: "add_conv2d_op: expected Conv2d operation".to_string(),
+                });
+            }
+        };
+        // WebNN: bias is MLConv2dOptions.bias. [`Operation::input_operands`] is only [input, filter];
+        // a legacy third JSON input is merged into options.bias when the graph is parsed.
+        let bias_id = conv_opts.and_then(|o| o.bias);
 
         // Filter operand and shape (needed for both constant and tensor-weight paths)
         let filter_operand =
@@ -6762,8 +6777,6 @@ impl TrtxConverter {
             });
         }
         let fs = filter_operand.descriptor.static_or_max_shape();
-        let attrs = operation.attributes();
-        let conv_opts = attrs.as_conv2d();
         let filter_layout = conv_opts
             .map(|o| o.filter_layout.as_str())
             .filter(|s| !s.is_empty())
@@ -6900,7 +6913,6 @@ impl TrtxConverter {
             .map(|o| o.input_layout.as_str())
             .filter(|s| !s.is_empty())
             .unwrap_or("nchw");
-        let input_id = operation.input_operands()[0];
         let input_dtype = graph
             .operand(input_id)
             .map(|o| o.descriptor.data_type)
@@ -7214,8 +7226,23 @@ impl TrtxConverter {
         tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
-        let filter_id = operation.input_operands()[1];
-        let bias_id = operation.input_operands().get(2).copied();
+        let (input_id, filter_id, deconv_opts) = match operation {
+            Operation::ConvTranspose2d {
+                input,
+                filter,
+                options,
+                ..
+            } => (*input, *filter, options.as_ref()),
+            _ => {
+                return Err(GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: "add_conv_transpose2d_op: expected ConvTranspose2d operation"
+                        .to_string(),
+                });
+            }
+        };
+        // Same as conv2d: bias from MLConvTranspose2dOptions.bias (optional third JSON input merged at parse time).
+        let bias_id = deconv_opts.and_then(|o| o.bias);
 
         let filter_operand =
             graph
@@ -7235,8 +7262,6 @@ impl TrtxConverter {
             });
         }
         let fs = filter_operand.descriptor.static_or_max_shape();
-        let attrs = operation.attributes();
-        let deconv_opts = attrs.as_conv_transpose2d();
         let filter_layout = deconv_opts
             .map(|o| o.filter_layout.as_str())
             .filter(|s| !s.is_empty())
@@ -7373,7 +7398,6 @@ impl TrtxConverter {
             .map(|o| o.input_layout.as_str())
             .filter(|s| !s.is_empty())
             .unwrap_or("nchw");
-        let input_id = operation.input_operands()[0];
         let input_dtype = graph
             .operand(input_id)
             .map(|o| o.descriptor.data_type)
