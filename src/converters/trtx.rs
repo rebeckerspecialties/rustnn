@@ -29,7 +29,7 @@ use super::{ConvertedGraph, GraphConverter};
 use crate::error::GraphError;
 use crate::executors::trtx::{create_trtx_logger, ensure_trtx_loaded};
 use crate::graph::{DataType, GraphInfo, OperandKind, get_static_or_max_size};
-use crate::operator_options::MLDimension;
+use crate::operator_options::{MLDimension, MLPool2dOptions};
 use crate::operators::Operation;
 use crate::shape_inference::infer_arg_reduce_shape;
 use trtx::{
@@ -607,9 +607,11 @@ impl TrtxConverter {
 
             // Pooling operations
             "averagePool2d" => {
-                Self::add_pooling_op(network, tensor_map, operation, PoolingType::kAVERAGE)?
+                Self::add_pooling_op(graph, network, tensor_map, operation, PoolingType::kAVERAGE)?
             }
-            "maxPool2d" => Self::add_pooling_op(network, tensor_map, operation, PoolingType::kMAX)?,
+            "maxPool2d" => {
+                Self::add_pooling_op(graph, network, tensor_map, operation, PoolingType::kMAX)?
+            }
             "globalAveragePool" => {
                 Self::add_global_pooling_op(network, tensor_map, operation, PoolingType::kAVERAGE)?
             }
@@ -737,7 +739,7 @@ impl TrtxConverter {
             "isInfinite" => Self::add_is_infinite_op(network, tensor_map, operation)?,
             "roundEven" => Self::add_round_even_op(network, tensor_map, operation)?,
             "gatherElements" => Self::add_gather_elements_op(network, tensor_map, operation)?,
-            "l2Pool2d" => Self::add_l2_pool2d_op(network, tensor_map, operation)?,
+            "l2Pool2d" => Self::add_l2_pool2d_op(graph, network, tensor_map, operation)?,
             "reverse" => Self::add_reverse_op(graph, network, tensor_map, operation)?,
             "cumulativeSum" => Self::add_cumulative_sum_op(graph, network, tensor_map, operation)?,
             "triangular" => Self::add_triangular_op(graph, network, tensor_map, operation)?,
@@ -7875,40 +7877,116 @@ impl TrtxConverter {
         Ok(())
     }
 
+    /// Pool kernel `[H, W]` from [`MLPool2dOptions`] and input tensor descriptor.
+    /// When `window_dimensions` is omitted, WebNN uses the full spatial extent (matches ONNX
+    /// `create_pool2d_attributes_with_graph`).
+    fn pool2d_window_from_graph_input(
+        graph: &GraphInfo,
+        input_id: u32,
+        op: &Operation,
+        opts: &MLPool2dOptions,
+    ) -> Result<[i64; 2], GraphError> {
+        let has_explicit_window = opts
+            .window_dimensions
+            .as_ref()
+            .is_some_and(|w| w.len() >= 2);
+        if let Some(wd) = opts.window_dimensions.as_ref()
+            && wd.len() >= 2
+        {
+            return Ok([wd[0] as i64, wd[1] as i64]);
+        }
+
+        let in_operand = graph.operand(input_id).ok_or_else(|| GraphError::ConversionFailed {
+            format: "trtx".to_string(),
+            reason: format!("Pool2d input operand {} not found", input_id),
+        })?;
+
+        let layout = opts.layout.to_ascii_lowercase();
+        let layout = if layout.is_empty() {
+            "nchw"
+        } else {
+            layout.as_str()
+        };
+
+        let shape = &in_operand.descriptor.shape;
+        if shape.len() != 4 {
+            return Err(GraphError::ConversionFailed {
+                format: "trtx".to_string(),
+                reason: format!(
+                    "Pool2d default window requires 4D input, got {}D",
+                    shape.len()
+                ),
+            });
+        }
+
+        let mut h = if layout == "nhwc" {
+            get_static_or_max_size(&shape[1]) as i64
+        } else {
+            get_static_or_max_size(&shape[2]) as i64
+        };
+        let mut w = if layout == "nhwc" {
+            get_static_or_max_size(&shape[2]) as i64
+        } else {
+            get_static_or_max_size(&shape[3]) as i64
+        };
+
+        // Align with ONNX converter: averagePool2d with dilations and no explicit window uses
+        // full input spatial extent as the kernel.
+        if matches!(op, Operation::AveragePool2d { .. })
+            && !opts.dilations.is_empty()
+            && !has_explicit_window
+            && let Some(out_id) = op.output_operand()
+            && let Some(out_operand) = graph.operand(out_id)
+            && out_operand.descriptor.shape.len() == 4
+        {
+            let (in_h, in_w) = if layout == "nhwc" {
+                (
+                    get_static_or_max_size(&shape[1]),
+                    get_static_or_max_size(&shape[2]),
+                )
+            } else {
+                (
+                    get_static_or_max_size(&shape[2]),
+                    get_static_or_max_size(&shape[3]),
+                )
+            };
+            h = in_h as i64;
+            w = in_w as i64;
+        }
+
+        Ok([h, w])
+    }
+
     /// Add pooling operation
     fn add_pooling_op<'a>(
+        graph: &GraphInfo,
         network: &mut trtx::NetworkDefinition<'a>,
         tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
         pool_type: PoolingType,
     ) -> Result<(), GraphError> {
+        let (input_id, opts_ref) = match operation {
+            Operation::AveragePool2d { input, options, .. }
+            | Operation::MaxPool2d { input, options, .. } => (*input, options.as_ref()),
+            _ => {
+                return Err(GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: "add_pooling_op: expected AveragePool2d or MaxPool2d".to_string(),
+                });
+            }
+        };
+
+        let default_pool = MLPool2dOptions::default();
+        let opts = opts_ref.unwrap_or(&default_pool);
+
         let input = tensor_map
-            .get(&operation.input_operands()[0])
+            .get(&input_id)
             .ok_or_else(|| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
-                reason: format!("Input operand {} not found", operation.input_operands()[0]),
+                reason: format!("Input operand {} not found", input_id),
             })?;
 
-        let attrs = operation.attributes();
-        let pool_opts = attrs
-            .as_pool2d()
-            .ok_or_else(|| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: "Pool2d operation missing options".to_string(),
-            })?;
-        let window_size = pool_opts
-            .window_dimensions
-            .as_ref()
-            .filter(|w| !w.is_empty())
-            .ok_or_else(|| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: "Missing windowDimensions attribute".to_string(),
-            })?;
-
-        let window: [i64; 2] = [
-            window_size.get(0).copied().unwrap_or(2) as i64,
-            window_size.get(1).copied().unwrap_or(2) as i64,
-        ];
+        let window = Self::pool2d_window_from_graph_input(graph, input_id, operation, opts)?;
 
         let layer = network
             .add_pooling(input, pool_type, &window)
@@ -8489,15 +8567,26 @@ impl TrtxConverter {
 
     /// Add l2Pool2d operation (L2 pooling: square → avgPool → sqrt)
     fn add_l2_pool2d_op<'a>(
+        graph: &GraphInfo,
         network: &mut trtx::NetworkDefinition<'a>,
         tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
     ) -> Result<(), GraphError> {
+        let (input_id, opts_ref) = match operation {
+            Operation::L2Pool2d { input, options, .. } => (*input, options.as_ref()),
+            _ => {
+                return Err(GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: "add_l2_pool2d_op: expected L2Pool2d".to_string(),
+                });
+            }
+        };
+
         let input_tensor = tensor_map
-            .get(&operation.input_operands()[0])
+            .get(&input_id)
             .ok_or_else(|| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
-                reason: format!("Input operand {} not found", operation.input_operands()[0]),
+                reason: format!("Input operand {} not found", input_id),
             })?;
 
         // Step 1: Square the input (x^2)
@@ -8516,20 +8605,10 @@ impl TrtxConverter {
                     reason: format!("Failed to get squared output: {}", e),
                 })?;
 
-        // Step 2: Apply average pooling (use same parameters as maxPool2d/averagePool2d)
-        let window_size = operation
-            .attributes()
-            .get("windowDimensions")
-            .and_then(|v| v.as_array().cloned())
-            .ok_or_else(|| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: "Missing windowDimensions for l2Pool2d".to_string(),
-            })?;
-
-        let window: [i64; 2] = [
-            window_size[0].as_i64().unwrap_or(1),
-            window_size[1].as_i64().unwrap_or(1),
-        ];
+        // Step 2: Apply average pooling (same window resolution as averagePool2d / ONNX)
+        let default_pool = MLPool2dOptions::default();
+        let opts = opts_ref.unwrap_or(&default_pool);
+        let window = Self::pool2d_window_from_graph_input(graph, input_id, operation, opts)?;
 
         let pool_layer = network
             .add_pooling(&squared, PoolingType::kAVERAGE, &window)
