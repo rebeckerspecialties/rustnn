@@ -164,6 +164,50 @@ impl TrtxConverter {
         Ok(dst)
     }
 
+    /// `IShuffleLayer::setFirstTranspose`: output axis `i` reads input axis `order[i]`.
+    /// WebNN conv2d filter rank-4 layout to TensorRT kernel **OIHW**.
+    fn conv_dynamic_filter_first_transpose(filter_layout: &str) -> Result<[i32; 4], GraphError> {
+        let order = match filter_layout {
+            "oihw" => [0, 1, 2, 3],
+            "hwio" => [3, 2, 0, 1],
+            "ohwi" => [0, 3, 1, 2],
+            "ihwo" => [3, 0, 1, 2],
+            "hwoi" => [2, 3, 0, 1],
+            _ => {
+                return Err(GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!(
+                        "Unsupported filter_layout for dynamic conv2d kernel: {}",
+                        filter_layout
+                    ),
+                });
+            }
+        };
+        Ok(order)
+    }
+
+    /// WebNN convTranspose2d filter to TensorRT deconv kernel **IOHW** (matches `deconv_filter_to_iohw`).
+    fn deconv_dynamic_filter_first_transpose(filter_layout: &str) -> Result<[i32; 4], GraphError> {
+        let order = match filter_layout {
+            "iohw" => [0, 1, 2, 3],
+            "oihw" => [1, 0, 2, 3],
+            "hwio" => [2, 3, 0, 1],
+            "ohwi" => [3, 0, 1, 2],
+            "ihwo" => [0, 3, 1, 2],
+            "hwoi" => [3, 2, 0, 1],
+            _ => {
+                return Err(GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!(
+                        "Unsupported filter_layout for dynamic convTranspose2d kernel: {}",
+                        filter_layout
+                    ),
+                });
+            }
+        };
+        Ok(order)
+    }
+
     /// Transpose 4D deconv filter (f32) from given layout to IOHW for TensorRT (C,K,R,S = input channels, output maps, H, W).
     /// Layouts: iohw [I,O,H,W], oihw [O,I,H,W], hwio [H,W,I,O], ohwi [O,H,W,I], ihwo [I,H,W,O], hwoi [H,W,O,I].
     fn deconv_filter_to_iohw(
@@ -5614,6 +5658,185 @@ impl TrtxConverter {
         Ok(())
     }
 
+    /// Shared argMin/argMax via TopK: indices tensor reshaped to WebNN output, still INT32 (caller casts).
+    ///
+    /// TensorRT `ITopKLayer` for rank &gt;= 5 only allows reduction on one of the **last four**
+    /// dimensions. When WebNN `axis` lies outside that set, swap that axis with the last axis,
+    /// run TopK on the last axis, then apply the same transpose to the index tensor (swap is self-inverse).
+    fn add_arg_reduce_common<'a>(
+        graph: &GraphInfo,
+        network: &mut trtx::NetworkDefinition<'a>,
+        input_id: u32,
+        input: &trtx::Tensor<'a>,
+        axis: u32,
+        keep_dims: bool,
+        topk_op: TopKOperation,
+        label: &'static str,
+    ) -> Result<trtx::Tensor<'a>, GraphError> {
+        let input_shape = graph
+            .operand(input_id)
+            .ok_or_else(|| GraphError::ConversionFailed {
+                format: "trtx".to_string(),
+                reason: format!("{} input operand {} not in graph", label, input_id),
+            })?
+            .descriptor
+            .static_or_max_shape();
+        let rank = input_shape.len();
+        if rank > 8 {
+            return Err(GraphError::ConversionFailed {
+                format: "trtx".to_string(),
+                reason: format!(
+                    "{}: TensorRT shuffle transpose uses at most 8 axes, got rank {}",
+                    label, rank
+                ),
+            });
+        }
+        let axis_u = axis as usize;
+        if axis_u >= rank {
+            return Err(GraphError::ConversionFailed {
+                format: "trtx".to_string(),
+                reason: format!("{}: axis {} out of range for rank {}", label, axis, rank),
+            });
+        }
+
+        let target_shape_u32 = infer_arg_reduce_shape(&input_shape, axis, keep_dims)?;
+        let target_shape_i64: Vec<i64> = target_shape_u32.iter().map(|&d| d as i64).collect();
+
+        let indices_pre_reshape = if rank == 1 {
+            let n = input_shape[0] as i64;
+            let mut shuffle_in =
+                network
+                    .add_shuffle(input)
+                    .map_err(|e| GraphError::ConversionFailed {
+                        format: "trtx".to_string(),
+                        reason: format!("{}: unsqueeze 1D input for TopK: {}", label, e),
+                    })?;
+            shuffle_in
+                .set_reshape_dimensions(network, &[n, 1])
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("{}: set [N,1] reshape: {}", label, e),
+                })?;
+            let rank2 =
+                shuffle_in
+                    .get_output(&*network, 0)
+                    .map_err(|e| GraphError::ConversionFailed {
+                        format: "trtx".to_string(),
+                        reason: format!("{}: rank-2 TopK input: {}", label, e),
+                    })?;
+            let layer = network
+                .add_topk(&rank2, topk_op, 1, Axes::from_bits(1u32))
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("{}: topK layer: {}", label, e),
+                })?;
+            layer
+                .get_output(&*network, 1)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("{}: topK indices output: {}", label, e),
+                })?
+        } else if rank >= 5 && axis_u < rank - 4 {
+            let last = rank - 1;
+            let mut perm: Vec<i32> = (0..rank as i32).collect();
+            perm[axis_u] = last as i32;
+            perm[last] = axis as i32;
+
+            let mut shuffle_pre =
+                network
+                    .add_shuffle(input)
+                    .map_err(|e| GraphError::ConversionFailed {
+                        format: "trtx".to_string(),
+                        reason: format!("{}: pre-transpose shuffle for TopK: {}", label, e),
+                    })?;
+            shuffle_pre
+                .set_first_transpose(network, &perm)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("{}: set pre-transpose: {}", label, e),
+                })?;
+            let shuffled =
+                shuffle_pre
+                    .get_output(&*network, 0)
+                    .map_err(|e| GraphError::ConversionFailed {
+                        format: "trtx".to_string(),
+                        reason: format!("{}: pre-shuffle output: {}", label, e),
+                    })?;
+
+            let layer = network
+                .add_topk(
+                    &shuffled,
+                    topk_op,
+                    1,
+                    Axes::from_bits(1u32 << (last as u32)),
+                )
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("{}: topK layer: {}", label, e),
+                })?;
+            let idx =
+                layer
+                    .get_output(&*network, 1)
+                    .map_err(|e| GraphError::ConversionFailed {
+                        format: "trtx".to_string(),
+                        reason: format!("{}: topK indices output: {}", label, e),
+                    })?;
+
+            let mut shuffle_post =
+                network
+                    .add_shuffle(&idx)
+                    .map_err(|e| GraphError::ConversionFailed {
+                        format: "trtx".to_string(),
+                        reason: format!("{}: post-transpose shuffle: {}", label, e),
+                    })?;
+            shuffle_post
+                .set_first_transpose(network, &perm)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("{}: set post-transpose: {}", label, e),
+                })?;
+            shuffle_post
+                .get_output(&*network, 0)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("{}: post-shuffle output: {}", label, e),
+                })?
+        } else {
+            let layer = network
+                .add_topk(input, topk_op, 1, Axes::from_bits(1u32 << axis))
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("{}: topK layer: {}", label, e),
+                })?;
+            layer
+                .get_output(&*network, 1)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("{}: topK indices output: {}", label, e),
+                })?
+        };
+
+        let mut shuffle_layer =
+            network
+                .add_shuffle(&indices_pre_reshape)
+                .map_err(|e| GraphError::ConversionFailed {
+                    format: "trtx".to_string(),
+                    reason: format!("{}: shuffle for output shape: {}", label, e),
+                })?;
+        shuffle_layer
+            .set_reshape_dimensions(network, &target_shape_i64)
+            .map_err(|e| GraphError::ConversionFailed {
+                format: "trtx".to_string(),
+                reason: format!("{}: set reshape dimensions: {}", label, e),
+            })?;
+        shuffle_layer
+            .get_output(&*network, 0)
+            .map_err(|e| GraphError::ConversionFailed {
+                format: "trtx".to_string(),
+                reason: format!("{}: shuffle output: {}", label, e),
+            })
+    }
+
     /// Add argMax operation (find indices of maximum values)
     fn add_arg_max_op<'a>(
         graph: &GraphInfo,
@@ -5642,88 +5865,17 @@ impl TrtxConverter {
             }
         };
 
-        let input_shape = graph
-            .operand(input_id)
-            .ok_or_else(|| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("ArgMax input operand {} not in graph", input_id),
-            })?
-            .descriptor
-            .static_or_max_shape();
-        let target_shape_u32 = infer_arg_reduce_shape(&input_shape, axis, keep_dims)?;
-        let target_shape_i64: Vec<i64> = target_shape_u32.iter().map(|&d| d as i64).collect();
+        let shaped_output = Self::add_arg_reduce_common(
+            graph,
+            network,
+            input_id,
+            input,
+            axis,
+            keep_dims,
+            TopKOperation::kMAX,
+            "ArgMax",
+        )?;
 
-        // TensorRT TopK requires at least 2 input dimensions. For 1D [N], use [N, 1] and reduce axis 0.
-        let layer = if input_shape.len() == 1 {
-            let n = input_shape[0] as i64;
-            let mut shuffle_in =
-                network
-                    .add_shuffle(input)
-                    .map_err(|e| GraphError::ConversionFailed {
-                        format: "trtx".to_string(),
-                        reason: format!("ArgMax: unsqueeze 1D input for TopK: {}", e),
-                    })?;
-            shuffle_in
-                .set_reshape_dimensions(network, &[n, 1])
-                .map_err(|e| GraphError::ConversionFailed {
-                    format: "trtx".to_string(),
-                    reason: format!("ArgMax: set [N,1] reshape: {}", e),
-                })?;
-            let rank2 =
-                shuffle_in
-                    .get_output(&*network, 0)
-                    .map_err(|e| GraphError::ConversionFailed {
-                        format: "trtx".to_string(),
-                        reason: format!("ArgMax: rank-2 TopK input: {}", e),
-                    })?;
-            network
-                .add_topk(&rank2, TopKOperation::kMAX, 1, Axes::from_bits(1u32)) // kMAX along axis 0 of [N,1]
-                .map_err(|e| GraphError::ConversionFailed {
-                    format: "trtx".to_string(),
-                    reason: format!("Failed to add topK layer: {}", e),
-                })?
-        } else {
-            network
-                .add_topk(input, TopKOperation::kMAX, 1, Axes::from_bits(1u32 << axis)) // kMAX, k=1, axes bitmask
-                .map_err(|e| GraphError::ConversionFailed {
-                    format: "trtx".to_string(),
-                    reason: format!("Failed to add topK layer: {}", e),
-                })?
-        };
-
-        // TopK returns two outputs: values and indices
-        // We want indices (output 1)
-        let indices_output =
-            layer
-                .get_output(&*network, 1)
-                .map_err(|e| GraphError::ConversionFailed {
-                    format: "trtx".to_string(),
-                    reason: format!("Failed to get topK indices output: {}", e),
-                })?;
-
-        // TopK keeps the reduced axis as size k (=1). Reshape to WebNN argMax output rank.
-        let mut shuffle_layer =
-            network
-                .add_shuffle(&indices_output)
-                .map_err(|e| GraphError::ConversionFailed {
-                    format: "trtx".to_string(),
-                    reason: format!("ArgMax: shuffle for output shape: {}", e),
-                })?;
-        shuffle_layer
-            .set_reshape_dimensions(network, &target_shape_i64)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("ArgMax: set reshape dimensions: {}", e),
-            })?;
-        let shaped_output =
-            shuffle_layer
-                .get_output(&*network, 0)
-                .map_err(|e| GraphError::ConversionFailed {
-                    format: "trtx".to_string(),
-                    reason: format!("ArgMax: shuffle output: {}", e),
-                })?;
-
-        // Cast INT32 indices to Float32 for WebNN compatibility
         let final_output = Self::cast_int32_to_float32(network, &shaped_output)?;
 
         let output_ids = operation.output_operands_slice();
@@ -5760,86 +5912,17 @@ impl TrtxConverter {
             }
         };
 
-        let input_shape = graph
-            .operand(input_id)
-            .ok_or_else(|| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("ArgMin input operand {} not in graph", input_id),
-            })?
-            .descriptor
-            .static_or_max_shape();
-        let target_shape_u32 = infer_arg_reduce_shape(&input_shape, axis, keep_dims)?;
-        let target_shape_i64: Vec<i64> = target_shape_u32.iter().map(|&d| d as i64).collect();
+        let shaped_output = Self::add_arg_reduce_common(
+            graph,
+            network,
+            input_id,
+            input,
+            axis,
+            keep_dims,
+            TopKOperation::kMIN,
+            "ArgMin",
+        )?;
 
-        let layer = if input_shape.len() == 1 {
-            let n = input_shape[0] as i64;
-            let mut shuffle_in =
-                network
-                    .add_shuffle(input)
-                    .map_err(|e| GraphError::ConversionFailed {
-                        format: "trtx".to_string(),
-                        reason: format!("ArgMin: unsqueeze 1D input for TopK: {}", e),
-                    })?;
-            shuffle_in
-                .set_reshape_dimensions(network, &[n, 1])
-                .map_err(|e| GraphError::ConversionFailed {
-                    format: "trtx".to_string(),
-                    reason: format!("ArgMin: set [N,1] reshape: {}", e),
-                })?;
-            let rank2 =
-                shuffle_in
-                    .get_output(&*network, 0)
-                    .map_err(|e| GraphError::ConversionFailed {
-                        format: "trtx".to_string(),
-                        reason: format!("ArgMin: rank-2 TopK input: {}", e),
-                    })?;
-            network
-                .add_topk(&rank2, TopKOperation::kMIN, 1, Axes::from_bits(1u32)) // kMIN along axis 0 of [N,1]
-                .map_err(|e| GraphError::ConversionFailed {
-                    format: "trtx".to_string(),
-                    reason: format!("Failed to add topK layer: {}", e),
-                })?
-        } else {
-            network
-                .add_topk(input, TopKOperation::kMIN, 1, Axes::from_bits(1u32 << axis))
-                .map_err(|e| GraphError::ConversionFailed {
-                    format: "trtx".to_string(),
-                    reason: format!("Failed to add topK layer: {}", e),
-                })?
-        };
-
-        // TopK returns two outputs: values and indices
-        // We want indices (output 1)
-        let indices_output =
-            layer
-                .get_output(&*network, 1)
-                .map_err(|e| GraphError::ConversionFailed {
-                    format: "trtx".to_string(),
-                    reason: format!("Failed to get topK indices output: {}", e),
-                })?;
-
-        let mut shuffle_layer =
-            network
-                .add_shuffle(&indices_output)
-                .map_err(|e| GraphError::ConversionFailed {
-                    format: "trtx".to_string(),
-                    reason: format!("ArgMin: shuffle for output shape: {}", e),
-                })?;
-        shuffle_layer
-            .set_reshape_dimensions(network, &target_shape_i64)
-            .map_err(|e| GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: format!("ArgMin: set reshape dimensions: {}", e),
-            })?;
-        let shaped_output =
-            shuffle_layer
-                .get_output(&*network, 0)
-                .map_err(|e| GraphError::ConversionFailed {
-                    format: "trtx".to_string(),
-                    reason: format!("ArgMin: shuffle output: {}", e),
-                })?;
-
-        // Cast INT32 indices to Float32 for WebNN compatibility
         let final_output = Self::cast_int32_to_float32(network, &shaped_output)?;
 
         let output_ids = operation.output_operands_slice();
@@ -6891,14 +6974,7 @@ impl TrtxConverter {
                 (Some(filter_data), bias_raw, None)
             }
         } else {
-            // Non-constant filter: use tensor inputs (setInput(1)=kernel, setInput(2)=bias). TensorRT expects OIHW for kernel.
-            if filter_layout != "oihw" {
-                return Err(GraphError::ConversionFailed {
-                    format: "trtx".to_string(),
-                    reason: "conv2d with non-constant filter requires filter_layout \"oihw\""
-                        .to_string(),
-                });
-            }
+            // Non-constant filter: TensorRT kernel tensor is OIHW; shuffle from WebNN layout when needed.
             if let Some(id) = bias_id {
                 if graph.constant_operand_ids_to_handles.contains_key(&id) {
                     return Err(GraphError::ConversionFailed {
@@ -7122,6 +7198,36 @@ impl TrtxConverter {
                     };
                 let bias_tensor_to_use = bias_tensor_for_conv.as_ref().or(bias_tensor_raw);
 
+                let filter_layout_shuffle_out: Option<trtx::Tensor<'a>> =
+                    if filter_layout != "oihw" {
+                        let perm = Self::conv_dynamic_filter_first_transpose(filter_layout)?;
+                        let mut shuffle = network
+                            .add_shuffle(filter_tensor_to_use)
+                            .map_err(|e| GraphError::ConversionFailed {
+                                format: "trtx".to_string(),
+                                reason: format!("Conv2d dynamic filter layout shuffle: {}", e),
+                            })?;
+                        shuffle
+                            .set_first_transpose(network, &perm)
+                            .map_err(|e| GraphError::ConversionFailed {
+                                format: "trtx".to_string(),
+                                reason: format!("Conv2d dynamic filter set_first_transpose: {}", e),
+                            })?;
+                        Some(
+                            shuffle
+                                .get_output(&*network, 0)
+                                .map_err(|e| GraphError::ConversionFailed {
+                                    format: "trtx".to_string(),
+                                    reason: format!("Conv2d dynamic filter shuffle output: {}", e),
+                                })?,
+                        )
+                    } else {
+                        None
+                    };
+                let filter_for_set_input = filter_layout_shuffle_out
+                    .as_ref()
+                    .unwrap_or(filter_tensor_to_use);
+
                 let conv_weights = trtx::ConvWeights {
                     kernel_weights: &[],
                     kernel_dtype: TrtDataType::kFLOAT,
@@ -7135,7 +7241,7 @@ impl TrtxConverter {
                         reason: format!("Failed to add convolution (tensor weights): {}", e),
                     })?;
                 layer
-                    .set_input(network, 1, filter_tensor_to_use)
+                    .set_input(network, 1, filter_for_set_input)
                     .map_err(|e| GraphError::ConversionFailed {
                         format: "trtx".to_string(),
                         reason: format!("Conv2d set_input(1) filter: {}", e),
@@ -7377,14 +7483,6 @@ impl TrtxConverter {
                 (Some(filter_data), bias_raw, None)
             }
         } else {
-            if filter_layout != "iohw" {
-                return Err(GraphError::ConversionFailed {
-                    format: "trtx".to_string(),
-                    reason:
-                        "convTranspose2d with non-constant filter requires filter_layout \"iohw\""
-                            .to_string(),
-                });
-            }
             if let Some(id) = bias_id {
                 if graph.constant_operand_ids_to_handles.contains_key(&id) {
                     return Err(GraphError::ConversionFailed {
@@ -7594,6 +7692,45 @@ impl TrtxConverter {
                 };
                 let bias_tensor_to_use = bias_tensor_for_conv.as_ref().or(bias_tensor_raw);
 
+                let filter_layout_shuffle_out: Option<trtx::Tensor<'a>> =
+                    if filter_layout != "iohw" {
+                        let perm = Self::deconv_dynamic_filter_first_transpose(filter_layout)?;
+                        let mut shuffle = network
+                            .add_shuffle(filter_tensor_to_use)
+                            .map_err(|e| GraphError::ConversionFailed {
+                                format: "trtx".to_string(),
+                                reason: format!(
+                                    "convTranspose2d dynamic filter layout shuffle: {}",
+                                    e
+                                ),
+                            })?;
+                        shuffle
+                            .set_first_transpose(network, &perm)
+                            .map_err(|e| GraphError::ConversionFailed {
+                                format: "trtx".to_string(),
+                                reason: format!(
+                                    "convTranspose2d dynamic filter set_first_transpose: {}",
+                                    e
+                                ),
+                            })?;
+                        Some(
+                            shuffle
+                                .get_output(&*network, 0)
+                                .map_err(|e| GraphError::ConversionFailed {
+                                    format: "trtx".to_string(),
+                                    reason: format!(
+                                        "convTranspose2d dynamic filter shuffle output: {}",
+                                        e
+                                    ),
+                                })?,
+                        )
+                    } else {
+                        None
+                    };
+                let filter_for_set_input = filter_layout_shuffle_out
+                    .as_ref()
+                    .unwrap_or(filter_tensor_to_use);
+
                 let deconv_weights = trtx::ConvWeights {
                     kernel_weights: &[],
                     kernel_dtype: TrtDataType::kFLOAT,
@@ -7612,7 +7749,7 @@ impl TrtxConverter {
                         reason: format!("Failed to add deconvolution (tensor weights): {}", e),
                     })?;
                 layer
-                    .set_input(network, 1, filter_tensor_to_use)
+                    .set_input(network, 1, filter_for_set_input)
                     .map_err(|e| GraphError::ConversionFailed {
                         format: "trtx".to_string(),
                         reason: format!("convTranspose2d set_input(1) filter: {}", e),
@@ -7725,14 +7862,45 @@ impl TrtxConverter {
 
         // When outputSizes (or output_shape) is specified, the graph output has explicit spatial
         // dimensions. Resize deconv output to match: slice if larger, pad if smaller.
+        // Prefer options.output_sizes when present so spatial targets are correct even if the
+        // output operand descriptor lacks static dims (get_static_or_max_size would yield 0).
         let output_id = operation.output_operands_slice()[0];
-        let spatial_adjusted = match (graph.operand(input_id), graph.operand(output_id)) {
-            (Some(input_operand), Some(output_operand)) => {
+        let spatial_adjusted = match graph.operand(input_id) {
+            Some(input_operand) => {
                 let in_shape = &input_operand.descriptor.shape;
-                let out_shape = &output_operand.descriptor.shape;
-                if in_shape.len() != 4 || out_shape.len() != 4 {
+                if in_shape.len() != 4 {
                     deconv_output
                 } else {
+                    let targets: Option<(i32, i32, i32)> =
+                        if let Some(sizes) = deconv_opts.and_then(|o| o.output_sizes.as_ref())
+                            && sizes.len() >= 2
+                        {
+                            Some((sizes[0] as i32, sizes[1] as i32, num_output_maps))
+                        } else if let Some(output_operand) = graph.operand(output_id) {
+                            let out_shape = &output_operand.descriptor.shape;
+                            if out_shape.len() != 4 {
+                                None
+                            } else if input_layout == "nhwc" {
+                                Some((
+                                    get_static_or_max_size(&out_shape[1]) as i32,
+                                    get_static_or_max_size(&out_shape[2]) as i32,
+                                    get_static_or_max_size(&out_shape[3]) as i32,
+                                ))
+                            } else {
+                                Some((
+                                    get_static_or_max_size(&out_shape[2]) as i32,
+                                    get_static_or_max_size(&out_shape[3]) as i32,
+                                    get_static_or_max_size(&out_shape[1]) as i32,
+                                ))
+                            }
+                        } else {
+                            None
+                        };
+
+                    match targets {
+                        Some((target_h, target_w, out_c))
+                            if target_h > 0 && target_w > 0 =>
+                        {
                     let (input_h, input_w): (i32, i32) = if input_layout == "nhwc" {
                         (
                             get_static_or_max_size(&in_shape[1]) as i32,
@@ -7744,23 +7912,7 @@ impl TrtxConverter {
                             get_static_or_max_size(&in_shape[3]) as i32,
                         )
                     };
-                    let (target_h, target_w, out_c): (i32, i32, i32) = if input_layout == "nhwc" {
-                        (
-                            get_static_or_max_size(&out_shape[1]) as i32,
-                            get_static_or_max_size(&out_shape[2]) as i32,
-                            get_static_or_max_size(&out_shape[3]) as i32,
-                        )
-                    } else {
-                        (
-                            get_static_or_max_size(&out_shape[2]) as i32,
-                            get_static_or_max_size(&out_shape[3]) as i32,
-                            get_static_or_max_size(&out_shape[1]) as i32,
-                        )
-                    };
                     let out_batch = get_static_or_max_size(&in_shape[0]) as i32;
-                    if target_h <= 0 || target_w <= 0 {
-                        deconv_output
-                    } else {
                         let effective_kernel_h = (kernel_size[0] - 1) * dilations[0] + 1;
                         let effective_kernel_w = (kernel_size[1] - 1) * dilations[1] + 1;
                         // Output = (Input - 1) * Stride + (Filter - 1) * Dilation + 1 - PrePadding - PostPadding + outputPadding.
@@ -7825,9 +7977,11 @@ impl TrtxConverter {
                             current
                         }
                     }
+                        _ => deconv_output,
+                    }
                 }
             }
-            _ => deconv_output,
+            None => deconv_output,
         };
 
         let conv_output = if input_dtype == DataType::Float16 {
