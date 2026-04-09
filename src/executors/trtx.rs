@@ -141,6 +141,9 @@ fn is_onnx_format(bytes: &[u8]) -> bool {
 /// Run ONNX model or TensorRT engine with zero-filled inputs
 /// This is useful for validation and testing graph structure
 ///
+/// For native WebNN [`crate::converters::TrtxConverter`] engines (not ONNX), input tensor names
+/// must be [`TrtxConverter::engine_binding_name`] for each graph input operand id.
+///
 /// If model_bytes appears to be ONNX format, it will be parsed as ONNX and built into an engine.
 /// Otherwise, it will be treated as a pre-serialized TensorRT engine.
 pub fn run_trtx_zeroed(
@@ -212,10 +215,10 @@ fn execute_trtx_engine(
 ) -> Result<Vec<TrtxOutputWithData>, trtx::Error> {
     // Create logger and runtime
     let logger = create_trtx_logger().map_err(|e| trtx::Error::Runtime(e.to_string()))?;
-    let runtime = trtx::Runtime::new(&logger)?;
+    let mut runtime = trtx::Runtime::new(&logger)?;
 
     // Deserialize engine
-    let engine = runtime.deserialize_cuda_engine(engine_bytes)?;
+    let mut engine = runtime.deserialize_cuda_engine(engine_bytes)?;
     let mut context = engine.create_execution_context()?;
 
     // Get tensor information

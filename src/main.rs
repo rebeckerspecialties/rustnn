@@ -7,6 +7,8 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use clap::Parser;
+#[cfg(any(feature = "trtx-runtime-mock", feature = "trtx-runtime"))]
+use rustnn::converters::TrtxConverter;
 #[cfg(any(
     feature = "onnx-runtime",
     feature = "trtx-runtime-mock",
@@ -213,11 +215,26 @@ fn run() -> Result<(), GraphError> {
                     format: converted.format.to_string(),
                 });
             }
-            // Build zeroed byte inputs (size from descriptor dtype and shape)
-            let inputs: Vec<rustnn::TrtxInput> = artifacts
-                .input_names_to_descriptors
-                .iter()
-                .map(|(name, desc)| {
+            // Native WebNN->TRT engines use `TrtxConverter::engine_binding_name(operand_id)` so TRT's
+            // QDQ optimizer does not match user names (e.g. WPT `quantizeLinearZeroPoint`). ONNX models
+            // keep protobuf I/O names from `artifacts`.
+            let inputs: Vec<rustnn::TrtxInput> = if converted.format == "trtx" {
+                let mut v = Vec::with_capacity(graph.input_operands.len());
+                for &op_id in &graph.input_operands {
+                    let logical = graph
+                        .operand(op_id)
+                        .and_then(|o| o.name.as_deref())
+                        .ok_or_else(|| GraphError::ConversionFailed {
+                            format: "trtx".to_string(),
+                            reason: format!("input operand {op_id} has no name"),
+                        })?;
+                    let desc = artifacts
+                        .input_names_to_descriptors
+                        .get(logical)
+                        .ok_or_else(|| GraphError::ConversionFailed {
+                            format: "trtx".to_string(),
+                            reason: format!("missing descriptor for input `{logical}`"),
+                        })?;
                     let total: usize = desc
                         .shape
                         .iter()
@@ -225,12 +242,31 @@ fn run() -> Result<(), GraphError> {
                         .product::<usize>()
                         .max(1);
                     let byte_len = total * desc.data_type.bytes_per_element();
-                    rustnn::TrtxInput {
-                        name: name.clone(),
+                    v.push(rustnn::TrtxInput {
+                        name: TrtxConverter::engine_binding_name(op_id),
                         data: vec![0u8; byte_len],
-                    }
-                })
-                .collect();
+                    });
+                }
+                v
+            } else {
+                artifacts
+                    .input_names_to_descriptors
+                    .iter()
+                    .map(|(name, desc)| {
+                        let total: usize = desc
+                            .shape
+                            .iter()
+                            .map(|dim| get_static_or_max_size(dim) as usize)
+                            .product::<usize>()
+                            .max(1);
+                        let byte_len = total * desc.data_type.bytes_per_element();
+                        rustnn::TrtxInput {
+                            name: name.clone(),
+                            data: vec![0u8; byte_len],
+                        }
+                    })
+                    .collect()
+            };
 
             let outputs = rustnn::run_trtx_with_inputs(&converted.data, inputs)?;
 

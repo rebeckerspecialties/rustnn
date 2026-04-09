@@ -130,10 +130,10 @@ impl OperationExtras {
             }
             "expand" => {
                 let _ = obj.remove("axes");
-                if let Some(s) = obj.remove("newShape").or_else(|| obj.remove("new_shape")) {
-                    if let Ok(parsed) = serde_json::from_value::<Vec<MLDimension>>(s) {
-                        out.expand_new_shape = parsed;
-                    }
+                if let Some(s) = obj.remove("newShape").or_else(|| obj.remove("new_shape"))
+                    && let Ok(parsed) = serde_json::from_value::<Vec<MLDimension>>(s)
+                {
+                    out.expand_new_shape = parsed;
                 }
             }
             "cumulativeSum" => {
@@ -180,10 +180,10 @@ impl OperationExtras {
             }
             "slice" => {
                 out.starts = remove_u32_vec(obj, "starts");
-                if let Some(s) = obj.remove("sizes") {
-                    if let Ok(parsed) = serde_json::from_value::<Vec<MLDimension>>(s) {
-                        out.sizes = parsed;
-                    }
+                if let Some(s) = obj.remove("sizes")
+                    && let Ok(parsed) = serde_json::from_value::<Vec<MLDimension>>(s)
+                {
+                    out.sizes = parsed;
                 }
             }
             "split" => {
@@ -205,10 +205,10 @@ impl OperationExtras {
                 out.repetitions = remove_u32_vec(obj, "repetitions");
             }
             "reshape" => {
-                if let Some(s) = obj.remove("newShape").or_else(|| obj.remove("new_shape")) {
-                    if let Ok(parsed) = serde_json::from_value::<Vec<MLDimension>>(s) {
-                        out.reshape_new_shape = parsed;
-                    }
+                if let Some(s) = obj.remove("newShape").or_else(|| obj.remove("new_shape"))
+                    && let Ok(parsed) = serde_json::from_value::<Vec<MLDimension>>(s)
+                {
+                    out.reshape_new_shape = parsed;
                 }
             }
             _ => {}

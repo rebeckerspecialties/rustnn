@@ -775,9 +775,10 @@ fn infer_output_shapes(graph: &mut GraphInfo) -> Result<(), GraphError> {
                     if let Some(input_shape) = input_shapes.first() {
                         match &op {
                             Operation::Slice { starts, sizes, .. } => {
-                                if starts.is_empty() || sizes.is_empty() {
-                                    None
-                                } else if starts.len() != sizes.len() {
+                                if starts.is_empty()
+                                    || sizes.is_empty()
+                                    || starts.len() != sizes.len()
+                                {
                                     None
                                 } else {
                                     let mut output = input_shape.clone();
@@ -805,6 +806,66 @@ fn infer_output_shapes(graph: &mut GraphInfo) -> Result<(), GraphError> {
                     }
                 }
 
+                // Pool2d (WebNN defaults for window / strides / dilations / padding)
+                "averagepool2d" | "maxpool2d" | "l2pool2d" => {
+                    if let Some(input_shape) = input_shapes.first() {
+                        let default_pool = crate::operator_options::MLPool2dOptions::default();
+                        let o = match &op {
+                            Operation::AveragePool2d { options, .. }
+                            | Operation::MaxPool2d { options, .. }
+                            | Operation::L2Pool2d { options, .. } => {
+                                options.as_ref().unwrap_or(&default_pool)
+                            }
+                            _ => &default_pool,
+                        };
+                        infer_pool2d_shape_dimensions(
+                            input_shape,
+                            &o.layout,
+                            o.window_dimensions.as_deref(),
+                            &o.strides,
+                            &o.dilations,
+                            &o.padding,
+                            o.output_sizes.as_deref(),
+                            o.output_shape_rounding.eq_ignore_ascii_case("ceil"),
+                        )
+                        .ok()
+                    } else {
+                        None
+                    }
+                }
+
+                "globalaveragepool" | "globalmaxpool" => {
+                    if let Some(input_shape) = input_shapes.first() {
+                        let default_pool = crate::operator_options::MLPool2dOptions::default();
+                        let o = match &op {
+                            Operation::GlobalAveragePool { options, .. }
+                            | Operation::GlobalMaxPool { options, .. } => {
+                                options.as_ref().unwrap_or(&default_pool)
+                            }
+                            _ => &default_pool,
+                        };
+                        let layout_enum = if o.layout.eq_ignore_ascii_case("nhwc") {
+                            Conv2dInputLayout::Nhwc
+                        } else {
+                            Conv2dInputLayout::Nchw
+                        };
+                        let input_u32: Vec<u32> = input_shape
+                            .iter()
+                            .map(crate::graph::get_static_or_max_size)
+                            .collect();
+                        infer_global_pool_shape(
+                            &input_u32,
+                            &GlobalPoolOptions {
+                                layout: layout_enum,
+                            },
+                        )
+                        .ok()
+                        .map(|v| to_dimension_vector(&v))
+                    } else {
+                        None
+                    }
+                }
+
                 // Constant: shape from operator options
                 "constant" => match &op {
                     Operation::Constant { options, .. } => options
@@ -818,6 +879,22 @@ fn infer_output_shapes(graph: &mut GraphInfo) -> Result<(), GraphError> {
                         .or_else(|| Some(Vec::new())),
                     _ => Some(Vec::new()),
                 },
+
+                "tile" => {
+                    if let (Some(input_shape), Operation::Tile { repetitions, .. }) =
+                        (input_shapes.first(), op)
+                    {
+                        let input_u32: Vec<u32> = input_shape
+                            .iter()
+                            .map(crate::graph::get_static_or_max_size)
+                            .collect();
+                        infer_tile_shape(&input_u32, repetitions)
+                            .ok()
+                            .map(|v| to_dimension_vector(&v))
+                    } else {
+                        None
+                    }
+                }
 
                 // For other operations, leave shape empty (will be handled later or is dynamic)
                 _ => None,
