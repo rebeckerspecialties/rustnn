@@ -2105,13 +2105,16 @@ impl CoremlMlProgramConverter {
                 // WebNN modes: "constant", "edge", "reflection", "symmetric"
             }
 
-            Operation::Gelu { .. }
-                // gelu: x (mode is optional, defaults to "EXACT")
-                if !input_names.is_empty() => {
+            Operation::Gelu { .. } => {
+                // gelu: x, mode
+                if !input_names.is_empty() {
                     inputs.insert("x".to_string(), Self::create_argument(&input_names[0]));
                 }
-                // CoreML GELU supports "EXACT" and "TANH_APPROXIMATION" modes
-                // WebNN GELU has no mode parameter (uses exact by default)
+                // watchOS MIL loader rejects gelu without an explicit mode ("Required
+                // param 'mode' is missing"); iOS/macOS loaders accept the default.
+                // WebNN spec has no mode parameter — exact (erf) is the implicit default.
+                inputs.insert("mode".to_string(), Self::create_immediate_string("EXACT"));
+            }
 
             Operation::Squeeze { options, .. } => {
                 if !input_names.is_empty() {
@@ -4566,5 +4569,98 @@ mod tests {
             .expect("CoreML7 block");
 
         assert!(main_block.operations.iter().any(|op| op.r#type == "cumsum"));
+    }
+
+    #[test]
+    fn test_gelu_emits_explicit_mode_input() {
+        // The watchOS MIL loader rejects gelu without an explicit `mode` input
+        // ("Required param 'mode' is missing"); iOS/macOS loaders accept the
+        // default. WebNN gelu has no mode parameter — spec default is exact
+        // (erf), so emitting mode=EXACT is correct on every platform.
+        let graph = GraphInfo {
+            input_operands: vec![0],
+            output_operands: vec![1],
+            operands: vec![
+                Operand {
+                    name: Some("input".to_string()),
+                    kind: OperandKind::Input,
+                    descriptor: OperandDescriptor {
+                        data_type: DataType::Float32,
+                        shape: s(&[1, 4]),
+                        pending_permutation: vec![],
+                    },
+                },
+                Operand {
+                    name: Some("output".to_string()),
+                    kind: OperandKind::Output,
+                    descriptor: OperandDescriptor {
+                        data_type: DataType::Float32,
+                        shape: s(&[1, 4]),
+                        pending_permutation: vec![],
+                    },
+                },
+            ],
+            operations: vec![op_from_operator_options(
+                "gelu",
+                vec![0],
+                Some(1),
+                vec![],
+                OperatorOptions::from_json_with_op_type("gelu", &serde_json::json!({}))
+                    .expect("gelu options"),
+            )],
+            constant_operand_ids_to_handles: HashMap::new(),
+            id_to_constant_tensor_operand_map: HashMap::new(),
+            quantized: false,
+        };
+
+        let converted = CoremlMlProgramConverter
+            .convert(&graph)
+            .expect("coreml gelu conversion should succeed");
+        let model = Model::decode(converted.data.as_slice()).expect("decode coreml model");
+        let program = match model.r#type.expect("model type") {
+            crate::protos::coreml::specification::model::Type::MlProgram(program) => program,
+            _ => panic!("expected MLProgram model"),
+        };
+        let main_fn = program.functions.get("main").expect("main function");
+        let main_block = main_fn
+            .block_specializations
+            .get("CoreML7")
+            .expect("CoreML7 block");
+
+        let gelu = main_block
+            .operations
+            .iter()
+            .find(|op| op.r#type == "gelu")
+            .expect("gelu op");
+
+        let mode_arg = gelu
+            .inputs
+            .get("mode")
+            .expect("gelu must emit a `mode` input for the watchOS MIL loader");
+        let binding = mode_arg
+            .arguments
+            .first()
+            .expect("mode arg should have a binding");
+        let value = match binding.binding.as_ref().expect("mode arg binding present") {
+            crate::protos::coreml::mil_spec::argument::binding::Binding::Value(v) => v.clone(),
+            _ => panic!("mode input should be an immediate Value, not a variable reference"),
+        };
+        let immediate = match value.value.as_ref().expect("mode value present") {
+            crate::protos::coreml::mil_spec::value::Value::ImmediateValue(iv) => iv,
+            _ => panic!("mode input should be an ImmediateValue"),
+        };
+        let tensor = match immediate.value.as_ref().expect("immediate value present") {
+            crate::protos::coreml::mil_spec::value::immediate_value::Value::Tensor(t) => t,
+            _ => panic!("mode input should wrap a TensorValue"),
+        };
+        let strings = match tensor.value.as_ref().expect("tensor value present") {
+            crate::protos::coreml::mil_spec::tensor_value::Value::Strings(s) => s,
+            _ => panic!("mode input tensor should be Strings-typed"),
+        };
+        assert_eq!(
+            strings.values.as_slice(),
+            ["EXACT"],
+            "mode must be the scalar string \"EXACT\" to match the WebNN spec default",
+        );
     }
 }
