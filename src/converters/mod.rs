@@ -33,6 +33,54 @@ pub(crate) fn operand_name(graph: &GraphInfo, id: u32) -> String {
         .unwrap_or_else(|| format!("operand_{}", id))
 }
 
+/// Sanitise an operand name so it is a valid MIL text identifier:
+/// `[A-Za-z_][A-Za-z0-9_]*`.
+///
+/// Apple's CoreML loader parses model.mil with a strict tokeniser — names
+/// containing embedded quotes, emoji, hyphens, or leading digits produce
+/// `Unexpected token. Expected ID, got "` errors at load time (the WPT
+/// "add float32 with special character names" test uses inputs like
+/// `12-L#!.☺` and `🤦🏼‍♂️124DS#!F`).
+///
+/// Policy:
+/// - ASCII alphanumerics and `_` are kept.
+/// - Anything else (including multi-byte unicode scalars, operators, quotes)
+///   is replaced with `_`.
+/// - If the resulting name would start with a digit, we prepend `_`.
+/// - Empty result maps to `_operand`.
+///
+/// The transform is deterministic, idempotent, and collision-resistant
+/// enough for small graphs — but if you hand rustnn a graph with two
+/// operands named `"a!"` and `"a?"` they'll collide on `a_`. The caller is
+/// responsible for supplying unique names in that corner case.
+pub fn sanitize_mil_identifier(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut first = true;
+    for c in name.chars() {
+        let is_ascii_alpha = c.is_ascii_alphabetic();
+        let is_ascii_digit = c.is_ascii_digit();
+        if first {
+            if is_ascii_alpha || c == '_' {
+                out.push(c);
+            } else if is_ascii_digit {
+                out.push('_');
+                out.push(c);
+            } else {
+                out.push('_');
+            }
+            first = false;
+        } else if is_ascii_alpha || is_ascii_digit || c == '_' {
+            out.push(c);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        return "_operand".to_string();
+    }
+    out
+}
+
 #[derive(Debug, Clone)]
 pub struct ConvertedGraph {
     pub format: &'static str,

@@ -169,7 +169,16 @@ fn run_impl_zeroed_with_weights(
             let dict: *mut Object = msg_send![class!(NSMutableDictionary), dictionary];
             let mut feature_err: Option<String> = None;
             for (name, descriptor) in inputs {
-                let key = nsstring_from_str(name)?;
+                // Match the sanitisation that `CoremlMlProgramConverter`
+                // applies to operand names in the emitted MIL — graphs with
+                // unicode / hyphen / leading-digit names get rewritten so
+                // they tokenise as MIL identifiers, and the model's
+                // `MLModelDescription.inputDescriptionsByName` exposes the
+                // sanitised form. Feed it the same key here, otherwise the
+                // CoreML loader reports
+                //   "Feature <sanitised> is required but not specified."
+                let sanitised_name = crate::converters::sanitize_mil_identifier(name);
+                let key = nsstring_from_str(&sanitised_name)?;
                 let desc_obj: *mut Object = msg_send![input_descs, objectForKey: key];
                 let (shape, data_type_code) = if desc_obj.is_null() {
                     (
@@ -328,7 +337,10 @@ fn run_impl_with_inputs_with_weights(
 
             // Create input features with actual data
             for input in &inputs {
-                let key = nsstring_from_str(&input.name)?;
+                // Same sanitisation as the zeroed path above — the model
+                // exposes inputs under their MIL-sanitised names.
+                let sanitised_name = crate::converters::sanitize_mil_identifier(&input.name);
+                let key = nsstring_from_str(&sanitised_name)?;
                 let shape_i64: Vec<i64> = input.shape.iter().map(|&s| s as i64).collect();
 
                 // Query model's expected data type for this input
