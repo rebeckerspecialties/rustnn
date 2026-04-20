@@ -3078,11 +3078,20 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                     hardsigmoid_inputs
                         .insert("beta".to_string(), Self::create_immediate_float(0.5));
 
-                    // Create tensor type for hardsigmoid output
+                    // Create tensor type for hardsigmoid output.
+                    // Use `scalar_as_one_dim: true` to match the promotion the
+                    // rest of the converter applies to rank-0 operands — with
+                    // `false`, a rank-0 input gives hardsigmoid an rank-0
+                    // intermediate while the graph's declared output is
+                    // `tensor<fp32, [1]>`, and Apple's loader rejects the
+                    // following `mul` with
+                    //   "Output '0' has unexpected type 'ios17.mul'.
+                    //    Expected tensor<fp32, [1]>; got fp32."
+                    // (surfaced by WPT "hardSwish float32 0D scalar default options").
                     let dtype = Self::mil_data_type(&input_operand.descriptor.data_type)?;
                     let dimensions = Self::mil_dimensions_from_graph_shape(
                         &input_operand.descriptor.shape,
-                        false,
+                        true,
                     );
 
                     let value_type = ValueType {
@@ -3131,9 +3140,14 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         })?;
 
                     let output_dtype = Self::mil_data_type(&output_operand.descriptor.data_type)?;
+                    // Same promotion as the hardsigmoid intermediate above: the
+                    // mul output must have the same rank as its inputs, and
+                    // the graph's input/output operands already went through
+                    // the `scalar_as_one_dim: true` pass when they were
+                    // declared in `main` block — so rank-0 becomes [1] here too.
                     let output_dimensions = Self::mil_dimensions_from_graph_shape(
                         &output_operand.descriptor.shape,
-                        false,
+                        true,
                     );
 
                     let output_value_type = ValueType {
