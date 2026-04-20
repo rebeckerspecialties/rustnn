@@ -3547,6 +3547,58 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                 continue;
             }
 
+            // Rank-0 scalar short-circuit for transpose and slice. MIL's
+            // `transpose` validates that `perm.shape == [rank(x)]`, and MIL's
+            // `slice_by_size` validates that `begin.shape == [rank(x)]` with
+            // `rank(x) >= 1`. For a rank-0 scalar input (WebNN allows it, WPT
+            // exercises it: "transpose float32 0D constant tensor default
+            // options", "slicing float32 0D constant tensor with empty starts
+            // and sizes should be a no-op") both operations are semantic
+            // no-ops — the output equals the input. Lower to MIL `identity`
+            // so CoreML's loader accepts the model. Apple's loader otherwise
+            // rejects with
+            //   transpose: "Perm must have shape [rank of x]."
+            //   slice:     "Dimension 0 of tensor parameter begin[0] has
+            //               unexpected length 0; expected 1."
+            if op_type_lower == "transpose" || op_type_lower == "slice" {
+                if let Some(input_id) = op.input_operands().first().copied() {
+                    if let Some(input_operand) = graph_info.operand(input_id) {
+                        if input_operand.descriptor.shape.is_empty() {
+                            if let Some(output_id) = op.output_operand() {
+                                // Consult `operand_name_overrides` — graphs with
+                                // an interface type cast (e.g. uint8 exposed as
+                                // float32) rename the post-cast operand to
+                                // `{name}_graph`, and bypassing the override
+                                // here would make this identity read the
+                                // pre-cast tensor and produce a mismatched MIL
+                                // type flow.
+                                let input_name = operand_name_overrides
+                                    .get(&input_id)
+                                    .cloned()
+                                    .unwrap_or_else(|| operand_name(graph_info, input_id));
+                                let (output_name, output_type) = Self::create_output_value(
+                                    graph_info,
+                                    output_id,
+                                    &operand_name_overrides,
+                                )?;
+                                let _ = output_name;
+                                let mut identity_inputs: HashMap<String, Argument> = HashMap::new();
+                                identity_inputs.insert(
+                                    "x".to_string(),
+                                    Self::create_name_argument(input_name),
+                                );
+                                main_block.operations.push(Self::create_mil_operation(
+                                    mil_ops::IDENTITY,
+                                    identity_inputs,
+                                    vec![output_type],
+                                ));
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+
             let mil_op =
                 self.convert_operation_with_overrides(graph_info, op, &operand_name_overrides)?;
             main_block.operations.push(mil_op);
