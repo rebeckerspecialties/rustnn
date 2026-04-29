@@ -1947,24 +1947,26 @@ impl CoremlMlProgramConverter {
                 options,
                 ..
             } => {
-                // slice_by_size: x, begin, size
+                // slice_by_size: x, begin, size. Both `begin` and `size` are
+                // declared required inputs in MIL's slice_by_size schema. Apple
+                // rejects the model with "Required param 'size' is missing"
+                // when an empty-shape no-op slice (0D scalar, WPT surfaces this)
+                // is emitted without the fields. Emit them as empty int32 arrays
+                // in that case so the MIL loader sees the param even though the
+                // tensor is rank-0.
                 if !input_names.is_empty() {
                     inputs.insert("x".to_string(), Self::create_argument(&input_names[0]));
                 }
 
-                if !starts.is_empty() {
-                    inputs.insert(
-                        "begin".to_string(),
-                        Self::create_immediate_int_array(starts),
-                    );
-                }
-                if !sizes.is_empty() {
-                    let sizes_u32: Vec<u32> = sizes.iter().map(|d| d.static_or_max()).collect();
-                    inputs.insert(
-                        "size".to_string(),
-                        Self::create_immediate_int_array(&sizes_u32),
-                    );
-                }
+                inputs.insert(
+                    "begin".to_string(),
+                    Self::create_immediate_int_array(starts),
+                );
+                let sizes_u32: Vec<u32> = sizes.iter().map(|d| d.static_or_max()).collect();
+                inputs.insert(
+                    "size".to_string(),
+                    Self::create_immediate_int_array(&sizes_u32),
+                );
                 let _ = options;
             }
 
