@@ -25,8 +25,23 @@
 /// - Better optimization
 ///
 /// This replaces the legacy NeuralNetwork format.
-use crate::converters::operand_name;
+use crate::converters::operand_name as raw_operand_name;
+use crate::converters::sanitize_mil_identifier;
 use crate::error::GraphError;
+
+/// CoreML-specific wrapper around `converters::operand_name` that sanitises
+/// the resulting string so it is a valid MIL text identifier
+/// (`[A-Za-z_][A-Za-z0-9_]*`). WebNN allows arbitrary unicode in operand
+/// names (the WPT conformance suite exercises emoji, hyphens, leading
+/// digits, embedded quotes, etc.) — if we pass those through to model.mil
+/// Apple's parser errors out with `Unexpected token. Expected ID, got "`.
+///
+/// This shadowing redefinition means every call-site in this file uses the
+/// sanitised form without needing to plumb a new helper through ~24 call
+/// sites. See `converters::sanitize_mil_identifier` for the policy.
+fn operand_name(graph: &GraphInfo, id: u32) -> String {
+    sanitize_mil_identifier(&raw_operand_name(graph, id))
+}
 use crate::graph::{DataType, Dimension as GraphDimension, GraphInfo};
 use crate::operator_enums::MLOperandDataType;
 use crate::operator_options::MLDimension;
