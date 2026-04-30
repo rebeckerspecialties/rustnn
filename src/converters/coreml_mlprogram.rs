@@ -1532,10 +1532,7 @@ impl CoremlMlProgramConverter {
                 }
 
                 // MIL `reshape` declares `shape` as a required input. Always emit
-                // it, including the scalar-output case (`new_shape = []`) which is
-                // valid WebNN — the WPT "reshape (squeeze) 4D to scalar" test
-                // surfaces this: Apple's loader rejects the model with
-                // "Required param 'shape' is missing" otherwise.
+                // it, including the valid WebNN scalar-output case (`new_shape = []`)
                 let shape_values = if new_shape.is_empty() {
                     Vec::new()
                 } else {
