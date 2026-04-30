@@ -662,6 +662,46 @@ impl CoremlMlProgramConverter {
         }
     }
 
+    /// Like `create_immediate_float` but produces a rank-1 `tensor<fp32,[1]>`
+    /// rather than a rank-0 scalar. MIL ops like `mul` preserve rank rather
+    /// than broadcasting scalars up, so when an operation's declared output
+    /// rank is 1 and one of its inputs is the scalar -1 (as in the `neg`
+    /// lowering), we need the constant to have matching rank.
+    fn create_immediate_float_1d(value: f32) -> Argument {
+        use crate::protos::coreml::mil_spec::{
+            DataType as MilDataType, TensorType, TensorValue, Value, ValueType, dimension,
+            tensor_value, value, value_type,
+        };
+        let tensor_value = TensorValue {
+            value: Some(tensor_value::Value::Floats(tensor_value::RepeatedFloats {
+                values: vec![value],
+            })),
+        };
+        let val = Value {
+            doc_string: String::new(),
+            r#type: Some(ValueType {
+                r#type: Some(value_type::Type::TensorType(TensorType {
+                    data_type: MilDataType::Float32 as i32,
+                    rank: 1,
+                    dimensions: vec![Dimension {
+                        dimension: Some(dimension::Dimension::Constant(
+                            dimension::ConstantDimension { size: 1 },
+                        )),
+                    }],
+                    attributes: HashMap::new(),
+                })),
+            }),
+            value: Some(value::Value::ImmediateValue(value::ImmediateValue {
+                value: Some(value::immediate_value::Value::Tensor(tensor_value)),
+            })),
+        };
+        Argument {
+            arguments: vec![crate::protos::coreml::mil_spec::argument::Binding {
+                binding: Some(Binding::Value(val)),
+            }],
+        }
+    }
+
     /// Create an Argument from an immediate float scalar value
     fn create_immediate_float(value: f32) -> Argument {
         use crate::protos::coreml::mil_spec::{
@@ -1947,24 +1987,26 @@ impl CoremlMlProgramConverter {
                 options,
                 ..
             } => {
-                // slice_by_size: x, begin, size
+                // slice_by_size: x, begin, size. Both `begin` and `size` are
+                // declared required inputs in MIL's slice_by_size schema. Apple
+                // rejects the model with "Required param 'size' is missing"
+                // when an empty-shape no-op slice (0D scalar, WPT surfaces this)
+                // is emitted without the fields. Emit them as empty int32 arrays
+                // in that case so the MIL loader sees the param even though the
+                // tensor is rank-0.
                 if !input_names.is_empty() {
                     inputs.insert("x".to_string(), Self::create_argument(&input_names[0]));
                 }
 
-                if !starts.is_empty() {
-                    inputs.insert(
-                        "begin".to_string(),
-                        Self::create_immediate_int_array(starts),
-                    );
-                }
-                if !sizes.is_empty() {
-                    let sizes_u32: Vec<u32> = sizes.iter().map(|d| d.static_or_max()).collect();
-                    inputs.insert(
-                        "size".to_string(),
-                        Self::create_immediate_int_array(&sizes_u32),
-                    );
-                }
+                inputs.insert(
+                    "begin".to_string(),
+                    Self::create_immediate_int_array(starts),
+                );
+                let sizes_u32: Vec<u32> = sizes.iter().map(|d| d.static_or_max()).collect();
+                inputs.insert(
+                    "size".to_string(),
+                    Self::create_immediate_int_array(&sizes_u32),
+                );
                 let _ = options;
             }
 
@@ -3468,9 +3510,17 @@ impl super::GraphConverter for CoremlMlProgramConverter {
 
                 let input_name = operand_name(graph_info, op.input_operands()[0]);
 
-                // Create typed -1 constant matching input dtype
+                // Create typed -1 constant matching input dtype. MIL `mul`
+                // preserves rank rather than broadcasting scalars, so when
+                // the input operand was promoted from rank-0 to rank-1 `[1]`
+                // (the `scalar_as_one_dim: true` rule applied to all graph
+                // inputs/outputs), the multiplier must be rank-1 `[1]` too.
+                // Otherwise Apple's loader rejects with
+                //   "Output '0' has unexpected type 'ios17.mul'.
+                //    Expected tensor<fp32, [1]>; got fp32."
+                // (WPT "neg float32 positive 0D scalar" surfaces this.)
                 let neg_one_immediate = match input_operand.descriptor.data_type {
-                    DataType::Float32 => Self::create_immediate_float(-1.0f32),
+                    DataType::Float32 => Self::create_immediate_float_1d(-1.0f32),
                     DataType::Float16 => Self::create_immediate_float16(-1.0f32),
                     DataType::Int32 => {
                         // create_immediate_int accepts u32 but converts to i32 internally
@@ -3534,8 +3584,12 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                 })?;
 
                 let output_dtype = Self::mil_data_type(&output_operand.descriptor.data_type)?;
+                // Use `scalar_as_one_dim: true` so a rank-0 output is promoted
+                // to `tensor<fp32, [1]>`, matching the rank of the mul's
+                // (promoted) input/multiplier. See comment on the mul input
+                // above — this keeps the full op consistent.
                 let output_dimensions =
-                    Self::mil_dimensions_from_graph_shape(&output_operand.descriptor.shape, false);
+                    Self::mil_dimensions_from_graph_shape(&output_operand.descriptor.shape, true);
 
                 let output_value_type = ValueType {
                     r#type: Some(
