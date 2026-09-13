@@ -8717,8 +8717,16 @@ impl crate::converters::GraphConverter for OnnxConverter {
                         .iter()
                         .enumerate()
                         .map(|(i, sd)| {
-                            match sd {
-                                MLDimension::Static(s) => Dimension::Static((starts[i] as u32) + s),
+                            let end_bound = starts_u32[i].checked_add(sd.static_or_max())
+                                .ok_or_else(|| GraphError::ConversionFailed {
+                                    format: "onnx".to_string(),
+                                    reason: format!(
+                                        "slice operation {idx} axis {i}: runtime end bound overflows u32; this backend cannot represent start {} plus size bound {}",
+                                        starts_u32[i], sd.static_or_max(),
+                                    ),
+                                })?;
+                            Ok(match sd {
+                                MLDimension::Static(_) => Dimension::Static(end_bound),
                                 MLDimension::Dynamic(dd) => {
                                     if starts[i] == 0 {
                                         // end = size (which is the dynamic dim directly)
@@ -8730,13 +8738,13 @@ impl crate::converters::GraphConverter for OnnxConverter {
                                         // end = start + size; encode as "dim_name + start"
                                         Dimension::Dynamic(GraphDynDim {
                                             name: format!("{} + {}", dd.name, starts[i]),
-                                            max_size: (starts[i] as u32) + dd.max_size,
+                                            max_size: end_bound,
                                         })
                                     }
                                 }
-                            }
+                            })
                         })
-                        .collect();
+                        .collect::<Result<Vec<_>, GraphError>>()?;
 
                     let ends_name = Self::build_runtime_shape_input(
                         &format!("{}_ends", op_name),
@@ -10393,6 +10401,68 @@ mod tests {
 
     fn s(shape: &[u32]) -> Vec<Dimension> {
         crate::graph::to_dimension_vector(shape)
+    }
+
+    #[cfg(feature = "dynamic-inputs")]
+    #[test]
+    fn test_runtime_slice_end_bound_overflow_is_a_conversion_error() {
+        use crate::operator_options::{MLDimension, MLDynamicDimension, MLSliceOptions};
+        for max_size in [16, u32::MAX] {
+            let window = Dimension::Dynamic(DynamicDimension {
+                name: "window".to_string(),
+                max_size,
+            });
+            let operand = |kind, name: &str, shape| Operand {
+                kind,
+                name: Some(name.to_string()),
+                descriptor: OperandDescriptor {
+                    data_type: DataType::Float32,
+                    shape,
+                    pending_permutation: vec![],
+                },
+            };
+            let graph = GraphInfo {
+                operands: vec![
+                    operand(OperandKind::Input, "input", s(&[8])),
+                    operand(OperandKind::Input, "size_source", vec![window.clone()]),
+                    operand(OperandKind::Output, "output", vec![window]),
+                ],
+                input_operands: vec![0, 1],
+                output_operands: vec![2],
+                operations: vec![Operation::Slice {
+                    input: 0,
+                    starts: vec![2],
+                    sizes: vec![MLDimension::Dynamic(MLDynamicDimension {
+                        name: "window".to_string(),
+                        max_size,
+                    })],
+                    options: Some(MLSliceOptions::default()),
+                    outputs: vec![2],
+                }],
+                ..Default::default()
+            };
+            let converted = OnnxConverter.convert(&graph);
+            if max_size == u32::MAX {
+                let error = converted.unwrap_err();
+                let GraphError::ConversionFailed { format, reason } = error else {
+                    panic!("expected a backend conversion error");
+                };
+                assert_eq!(format, "onnx");
+                assert!(reason.contains("slice operation 0 axis 0"));
+                assert!(reason.contains("runtime end bound overflows u32"));
+            } else {
+                let converted = converted.unwrap();
+                let model = ModelProto::decode(converted.data.as_slice()).unwrap();
+                assert!(
+                    model
+                        .graph
+                        .unwrap()
+                        .node
+                        .iter()
+                        .any(|node| { node.op_type == "Shape" && node.input == ["size_source"] })
+                );
+            }
+        }
     }
 
     #[test]

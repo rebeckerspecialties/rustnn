@@ -1,7 +1,9 @@
 /// Shape inference and validation for WebNN operations
 use crate::error::GraphError;
 use crate::graph::{Dimension, DynamicDimension, get_static_or_max_size, to_dimension_vector};
-use crate::operator_options::{MLConv2dOptions, MLConvTranspose2dOptions, MLPool2dOptions};
+use crate::operator_options::{
+    MLConv2dOptions, MLConvTranspose2dOptions, MLDimension, MLPool2dOptions,
+};
 
 /// Compute the broadcasted shape for two operands following NumPy broadcasting rules
 ///
@@ -1549,15 +1551,18 @@ pub fn infer_slice_shape(
             });
         }
 
-        if start + size > input_dim {
+        let end = start
+            .checked_add(size)
+            .ok_or_else(|| GraphError::ShapeInferenceFailed {
+                reason: format!(
+                    "Slice start {start} + size {size} for dimension {dim_idx} overflows u32"
+                ),
+            })?;
+        if end > input_dim {
             return Err(GraphError::ShapeInferenceFailed {
                 reason: format!(
                     "Slice end {} (start {} + size {}) for dimension {} exceeds input dimension size {}",
-                    start + size,
-                    start,
-                    size,
-                    dim_idx,
-                    input_dim
+                    end, start, size, dim_idx, input_dim
                 ),
             });
         }
@@ -1570,6 +1575,93 @@ pub fn infer_slice_shape(
         output_shape.push(out_dim);
     }
 
+    Ok(output_shape)
+}
+
+/// Infer slice dimensions without treating an allocation bound as an active size.
+///
+/// Numeric sizes always produce fixed dimensions. Explicitly named sizes preserve
+/// their equality label and bound; their concrete bounds are checked at dispatch.
+/// Runtime-sized slices currently require unit strides because a strided extent
+/// would need a distinct, computed output dimension rather than the input label.
+pub fn infer_slice_shape_dimensions(
+    input_shape: &[Dimension],
+    starts: &[u32],
+    sizes: &[MLDimension],
+    strides: Option<&[u32]>,
+) -> Result<Vec<Dimension>, GraphError> {
+    let invalid = |reason| GraphError::ShapeInferenceFailed { reason };
+    let rank = input_shape.len();
+    if starts.len() != rank || sizes.len() != rank {
+        return Err(invalid(format!(
+            "Slice starts and sizes lengths must match input rank {rank} (got {} and {})",
+            starts.len(),
+            sizes.len()
+        )));
+    }
+    let strides = strides.filter(|values| !values.is_empty());
+    if let Some(strides) = strides
+        && strides.len() != rank
+    {
+        return Err(invalid(format!(
+            "Slice strides length {} must match input rank {rank}",
+            strides.len()
+        )));
+    }
+    if strides.is_some_and(|values| values.contains(&0)) {
+        return Err(invalid(
+            "Slice strides must be greater than zero".to_string(),
+        ));
+    }
+    if sizes
+        .iter()
+        .any(|size| matches!(size, MLDimension::Dynamic(_)))
+        && strides.is_some_and(|values| values.iter().any(|&stride| stride != 1))
+    {
+        return Err(invalid(
+            "Runtime-sized slice currently requires unit strides".to_string(),
+        ));
+    }
+
+    let mut output_shape = Vec::with_capacity(rank);
+    for (axis, ((input, &start), size)) in input_shape.iter().zip(starts).zip(sizes).enumerate() {
+        let input_bound = get_static_or_max_size(input);
+        let stride = strides.map_or(1, |values| values[axis]);
+        match size {
+            MLDimension::Static(size) => {
+                // If this fixed window exceeds even the input's maximum extent,
+                // no assignment of active dimensions can make the slice valid.
+                let shape = infer_slice_shape(&[input_bound], &[start], &[*size], Some(&[stride]))?;
+                output_shape.push(Dimension::Static(shape[0]));
+            }
+            MLDimension::Dynamic(dynamic) => {
+                if dynamic.name.is_empty() {
+                    return Err(invalid(format!(
+                        "Slice size for dimension {axis} has an empty dynamic name"
+                    )));
+                }
+                if start >= input_bound {
+                    return Err(invalid(format!(
+                        "Slice start {start} for dimension {axis} exceeds input dimension bound {input_bound}"
+                    )));
+                }
+                // Do not compare start + maxSize with the input bound: maxSize
+                // describes capacity, and a smaller active size may be valid.
+                output_shape.push(Dimension::Dynamic(DynamicDimension {
+                    name: dynamic.name.clone(),
+                    max_size: dynamic.max_size,
+                }));
+            }
+        }
+    }
+
+    output_shape.iter().try_fold(1usize, |count, dimension| {
+        count
+            .checked_mul(get_static_or_max_size(dimension) as usize)
+            .ok_or_else(|| {
+                invalid("Slice maximum output element count overflows usize".to_string())
+            })
+    })?;
     Ok(output_shape)
 }
 
@@ -3320,6 +3412,133 @@ mod tests {
 
         // end out of bounds
         assert!(infer_slice_shape(&[4, 6], &[2, 2], &[3, 4], None).is_err());
+    }
+
+    #[test]
+    fn test_slice_rejects_end_overflow() {
+        let error = infer_slice_shape(&[u32::MAX], &[1], &[u32::MAX], None).unwrap_err();
+        assert!(error.to_string().contains("overflows u32"));
+    }
+
+    #[test]
+    fn test_slice_dimensions_preserve_explicit_sizes() {
+        let sequence = DynamicDimension {
+            name: "sequence".to_string(),
+            max_size: 8,
+        };
+        let input = vec![
+            Dimension::Static(1),
+            Dimension::Static(3),
+            Dimension::Dynamic(sequence.clone()),
+            Dimension::Static(64),
+        ];
+        let sizes = vec![
+            MLDimension::Static(1),
+            MLDimension::Static(3),
+            Dimension::Dynamic(sequence.clone()).into(),
+            MLDimension::Static(32),
+        ];
+        assert_eq!(
+            infer_slice_shape_dimensions(&input, &[0, 0, 0, 32], &sizes, None).unwrap(),
+            vec![
+                Dimension::Static(1),
+                Dimension::Static(3),
+                Dimension::Dynamic(sequence),
+                Dimension::Static(32),
+            ]
+        );
+        for size in [2, 8] {
+            assert_eq!(
+                infer_slice_shape_dimensions(
+                    &input[2..3],
+                    &[0],
+                    &[MLDimension::Static(size)],
+                    None
+                )
+                .unwrap(),
+                vec![Dimension::Static(size)]
+            );
+        }
+    }
+
+    #[test]
+    fn test_slice_dimensions_defer_active_bounds_without_interpreting_names() {
+        let size = crate::operator_options::MLDynamicDimension {
+            name: "sequence + 1".to_string(),
+            max_size: u32::MAX,
+        };
+        // A bound larger than the input does not rule out a valid active size.
+        // Even start + maxSize overflowing does not describe the active end.
+        assert_eq!(
+            infer_slice_shape_dimensions(
+                &[Dimension::Static(8)],
+                &[2],
+                &[MLDimension::Dynamic(size.clone())],
+                None,
+            )
+            .unwrap(),
+            vec![Dimension::Dynamic(DynamicDimension {
+                name: size.name,
+                max_size: size.max_size,
+            })]
+        );
+    }
+
+    #[test]
+    fn test_slice_dimensions_reject_invalid_options_and_static_contradictions() {
+        let input = [Dimension::Dynamic(DynamicDimension {
+            name: "sequence".to_string(),
+            max_size: 8,
+        })];
+        let sizes = [MLDimension::Dynamic(
+            crate::operator_options::MLDynamicDimension {
+                name: "sequence".to_string(),
+                max_size: 8,
+            },
+        )];
+        assert!(infer_slice_shape_dimensions(&input, &[], &sizes, None).is_err());
+        assert!(infer_slice_shape_dimensions(&input, &[0], &[], None).is_err());
+        assert!(infer_slice_shape_dimensions(&input, &[0], &sizes, Some(&[1, 1])).is_err());
+        assert!(infer_slice_shape_dimensions(&input, &[0], &sizes, Some(&[0])).is_err());
+        let error = infer_slice_shape_dimensions(&input, &[0], &sizes, Some(&[2])).unwrap_err();
+        assert!(error.to_string().contains("requires unit strides"));
+        assert!(infer_slice_shape_dimensions(&input, &[8], &sizes, None).is_err());
+        assert!(
+            infer_slice_shape_dimensions(&input, &[1], &[MLDimension::Static(8)], None).is_err()
+        );
+        assert!(
+            infer_slice_shape_dimensions(
+                &input,
+                &[0],
+                &[MLDimension::Dynamic(
+                    crate::operator_options::MLDynamicDimension {
+                        name: String::new(),
+                        max_size: 8,
+                    }
+                )],
+                None,
+            )
+            .is_err()
+        );
+        // Fixed slices retain existing nonunit-stride semantics.
+        assert_eq!(
+            infer_slice_shape_dimensions(&input, &[1], &[MLDimension::Static(7)], Some(&[2]))
+                .unwrap(),
+            vec![Dimension::Static(4)]
+        );
+    }
+
+    #[test]
+    fn test_slice_dimensions_reject_maximum_element_count_overflow() {
+        assert!(
+            infer_slice_shape_dimensions(
+                &[u32::MAX; 3].map(Dimension::Static),
+                &[0; 3],
+                &[u32::MAX; 3].map(MLDimension::Static),
+                None,
+            )
+            .is_err()
+        );
     }
 
     // Expand tests

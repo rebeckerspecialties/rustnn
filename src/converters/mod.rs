@@ -50,6 +50,40 @@ pub(crate) fn operand_name(graph: &GraphInfo, id: u32) -> String {
         .unwrap_or_else(|| format!("operand_{}", id))
 }
 
+/// Reject runtime slice sizes in converters that only emit fixed size tensors.
+///
+/// This is a backend limitation, not a graph-validity rule. Numeric sizes remain
+/// numeric even when the input descriptor contains dynamic dimensions.
+#[cfg(any(
+    test,
+    feature = "litert-runtime",
+    feature = "trtx-runtime",
+    feature = "trtx-runtime-mock",
+    feature = "cann-runtime",
+    feature = "cann-runtime-mock",
+))]
+pub(crate) fn require_static_slice_sizes(
+    graph: &GraphInfo,
+    format: &str,
+) -> Result<(), GraphError> {
+    for (index, operation) in graph.operations.iter().enumerate() {
+        if let crate::operators::Operation::Slice { sizes, .. } = operation
+            && sizes
+                .iter()
+                .any(|size| matches!(size, crate::operator_options::MLDimension::Dynamic(_)))
+        {
+            return Err(GraphError::ConversionFailed {
+                format: format.to_string(),
+                reason: format!(
+                    "slice operation {index} ({:?}): runtime-sized slices are not supported by this backend; allocation maxima cannot replace active sizes",
+                    operation.display_name(),
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct ConvertedGraph {
     pub format: &'static str,
@@ -114,6 +148,107 @@ mod tests {
 
     fn s(shape: &[u32]) -> Vec<crate::graph::Dimension> {
         crate::graph::to_dimension_vector(shape)
+    }
+
+    fn slice_graph(size: crate::operator_options::MLDimension) -> GraphInfo {
+        use crate::graph::{Dimension, DynamicDimension};
+        GraphInfo {
+            operands: vec![
+                Operand {
+                    kind: OperandKind::Input,
+                    name: Some("input".to_string()),
+                    descriptor: OperandDescriptor {
+                        data_type: DataType::Float32,
+                        shape: vec![Dimension::Dynamic(DynamicDimension {
+                            name: "sequence".to_string(),
+                            max_size: 8,
+                        })],
+                        pending_permutation: vec![],
+                    },
+                },
+                Operand {
+                    kind: OperandKind::Output,
+                    name: Some("output".to_string()),
+                    descriptor: OperandDescriptor {
+                        data_type: DataType::Float32,
+                        shape: vec![size.clone().into()],
+                        pending_permutation: vec![],
+                    },
+                },
+            ],
+            input_operands: vec![0],
+            output_operands: vec![1],
+            operations: vec![crate::operators::Operation::Slice {
+                input: 0,
+                starts: vec![0],
+                sizes: vec![size],
+                options: None,
+                outputs: vec![1],
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn static_slice_size_guard_distinguishes_fixed_and_named_sizes() {
+        use crate::operator_options::{MLDimension, MLDynamicDimension};
+        let fixed = slice_graph(MLDimension::Static(8));
+        assert!(fixed.has_dynamic_dimensions());
+        super::require_static_slice_sizes(&fixed, "test-backend").unwrap();
+
+        let dynamic = slice_graph(MLDimension::Dynamic(MLDynamicDimension {
+            name: "sequence".to_string(),
+            max_size: 8,
+        }));
+        let error = super::require_static_slice_sizes(&dynamic, "test-backend").unwrap_err();
+        let GraphError::ConversionFailed { format, reason } = error else {
+            panic!("expected a backend conversion error");
+        };
+        assert_eq!(format, "test-backend");
+        assert!(reason.contains("slice operation 0"));
+        assert!(reason.contains("runtime-sized slices are not supported"));
+    }
+
+    #[cfg(any(
+        feature = "litert-runtime",
+        feature = "trtx-runtime",
+        feature = "trtx-runtime-mock",
+        feature = "cann-runtime",
+        feature = "cann-runtime-mock",
+    ))]
+    #[test]
+    fn fixed_size_converters_reject_dynamic_slices_before_backend_initialization() {
+        use crate::operator_options::{MLDimension, MLDynamicDimension};
+        let graph = slice_graph(MLDimension::Dynamic(MLDynamicDimension {
+            name: "sequence".to_string(),
+            max_size: 8,
+        }));
+        let converters: Vec<Box<dyn GraphConverter>> = vec![
+            #[cfg(feature = "litert-runtime")]
+            Box::new(super::LiteRtConverter::new()),
+            #[cfg(any(feature = "trtx-runtime", feature = "trtx-runtime-mock"))]
+            Box::new(super::TrtxConverter::new()),
+            #[cfg(any(feature = "cann-runtime", feature = "cann-runtime-mock"))]
+            Box::new(super::CannConverter),
+        ];
+        for converter in converters {
+            let error = converter.convert(&graph).unwrap_err();
+            let GraphError::ConversionFailed { format, reason } = error else {
+                panic!("expected a backend conversion error");
+            };
+            assert_eq!(format, converter.format());
+            assert!(
+                reason.contains("runtime-sized slices are not supported"),
+                "{reason}"
+            );
+        }
+        #[cfg(any(feature = "cann-runtime", feature = "cann-runtime-mock"))]
+        assert!(
+            super::cann::encode_via_adapter(&graph)
+                .unwrap_err()
+                .to_string()
+                .contains("runtime-sized slices are not supported")
+        );
     }
 
     struct DummyConverter;
