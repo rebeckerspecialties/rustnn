@@ -975,33 +975,12 @@ fn infer_output_shapes(graph: &mut GraphInfo) -> Result<(), GraphError> {
                                         shape
                                             .into_iter()
                                             .zip(sizes)
-                                            .enumerate()
-                                            .map(|(axis, (max_size, size))| match size {
-                                                crate::operator_options::MLDimension::Static(
-                                                    requested_size,
-                                                ) => match input_shape.get(axis) {
-                                                    // Imported symbolic graphs use the dynamic
-                                                    // input's max as a placeholder for "through
-                                                    // the active end". Preserve that symbol for a
-                                                    // full-axis, unit-stride slice.
-                                                    Some(Dimension::Dynamic(dynamic))
-                                                        if starts[axis] == 0
-                                                            && strides
-                                                                .and_then(|values| {
-                                                                    values.get(axis).copied()
-                                                                })
-                                                                .unwrap_or(1)
-                                                                == 1
-                                                            && *requested_size
-                                                                == dynamic.max_size =>
-                                                    {
-                                                        Dimension::Dynamic(DynamicDimension {
-                                                            name: dynamic.name.clone(),
-                                                            max_size,
-                                                        })
-                                                    }
-                                                    _ => Dimension::Static(max_size),
-                                                },
+                                            .map(|(max_size, size)| match size {
+                                                // A fixed size remains fixed even when it equals
+                                                // the input's maximum dynamic extent.
+                                                crate::operator_options::MLDimension::Static(_) => {
+                                                    Dimension::Static(max_size)
+                                                }
                                                 crate::operator_options::MLDimension::Dynamic(
                                                     dynamic,
                                                 ) => {
@@ -2604,7 +2583,7 @@ mod tests {
     }
 
     #[test]
-    fn test_from_graph_json_slice_preserves_dynamic_full_axis_placeholder() {
+    fn test_from_graph_json_slice_keeps_fixed_size_equal_to_dynamic_input_maximum() {
         use webnn_graph::ast::{
             DataType as WDataType, Dimension as WDimension, DynamicDimension as WDynamicDimension,
             OperandDesc,
@@ -2615,21 +2594,16 @@ mod tests {
             "x".to_string(),
             OperandDesc {
                 data_type: WDataType::Float32,
-                shape: vec![
-                    WDimension::Static(1),
-                    WDimension::Static(9),
-                    WDimension::Dynamic(WDynamicDimension {
-                        name: "sequence_length".to_string(),
-                        max_size: 4096,
-                    }),
-                    WDimension::Static(64),
-                ],
+                shape: vec![WDimension::Dynamic(WDynamicDimension {
+                    name: "sequence_length".to_string(),
+                    max_size: 8,
+                })],
             },
         );
         let mut options = serde_json::Map::new();
-        options.insert("starts".to_string(), serde_json::json!([0, 0, 0, 0]));
-        options.insert("sizes".to_string(), serde_json::json!([1, 9, 4096, 32]));
-        options.insert("strides".to_string(), serde_json::json!([1, 1, 1, 1]));
+        options.insert("starts".to_string(), serde_json::json!([0]));
+        options.insert("sizes".to_string(), serde_json::json!([8]));
+        options.insert("strides".to_string(), serde_json::json!([1]));
         let nodes = vec![Node {
             id: "n0".to_string(),
             op: "slice".to_string(),
@@ -2641,7 +2615,7 @@ mod tests {
         outputs.insert("y".to_string(), "y".to_string());
 
         let graph = from_graph_json(&GraphJson {
-            name: Some("dynamic_slice_full_axis_subset".to_string()),
+            name: Some("fixed_slice_dynamic_input_subset".to_string()),
             format: "webnn-graph-json".to_string(),
             version: 2,
             quantized: false,
@@ -2652,19 +2626,23 @@ mod tests {
         })
         .expect("from_graph_json");
 
-        let output = &graph.operands[graph.output_operands[0] as usize].descriptor;
+        let input = &graph.operands[graph.input_operands[0] as usize].descriptor;
         assert_eq!(
-            output.shape,
-            vec![
-                Dimension::Static(1),
-                Dimension::Static(9),
-                Dimension::Dynamic(DynamicDimension {
-                    name: "sequence_length".to_string(),
-                    max_size: 4096,
-                }),
-                Dimension::Static(32),
-            ]
+            input.shape,
+            vec![Dimension::Dynamic(DynamicDimension {
+                name: "sequence_length".to_string(),
+                max_size: 8,
+            })]
         );
+        // At an active input length of four this still requests eight elements;
+        // importing it must not turn it into a full-axis, length-four slice.
+        let output = &graph.operands[graph.output_operands[0] as usize].descriptor;
+        assert_eq!(output.shape, vec![Dimension::Static(8)]);
+        let Operation::Slice { starts, sizes, .. } = &graph.operations[0] else {
+            panic!("expected slice operation");
+        };
+        assert_eq!(starts, &[0]);
+        assert_eq!(sizes, &[crate::operator_options::MLDimension::Static(8)]);
     }
 
     #[test]
