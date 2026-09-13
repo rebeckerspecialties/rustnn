@@ -1907,15 +1907,19 @@ mod adapter {
     }
 }
 
-#[cfg(feature = "cann-runtime")]
-pub(crate) use adapter::encode_via_adapter;
-
-#[cfg(not(feature = "cann-runtime"))]
-pub(crate) fn encode_via_adapter(_graph: &GraphInfo) -> Result<Vec<u8>, GraphError> {
-    Err(GraphError::ConversionFailed {
-        format: "cann".into(),
-        reason: "CANN shim not available (mock mode)".into(),
-    })
+pub(crate) fn encode_via_adapter(graph: &GraphInfo) -> Result<Vec<u8>, GraphError> {
+    super::require_static_slice_sizes(graph, "cann")?;
+    #[cfg(feature = "cann-runtime")]
+    {
+        adapter::encode_via_adapter(graph)
+    }
+    #[cfg(not(feature = "cann-runtime"))]
+    {
+        Err(GraphError::ConversionFailed {
+            format: "cann".into(),
+            reason: "CANN shim not available (mock mode)".into(),
+        })
+    }
 }
 
 pub struct CannConverter;
@@ -1926,6 +1930,7 @@ impl GraphConverter for CannConverter {
     }
 
     fn convert(&self, graph: &GraphInfo) -> Result<ConvertedGraph, GraphError> {
+        super::require_static_slice_sizes(graph, self.format())?;
         // Call CANN shim layer.
         if let Ok(bytes) = encode_via_adapter(graph) {
             return Ok(ConvertedGraph {

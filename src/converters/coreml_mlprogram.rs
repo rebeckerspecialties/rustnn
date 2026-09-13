@@ -658,8 +658,10 @@ impl CoremlMlProgramConverter {
                 // int64 has no MIL tensor type; emit as int32 values (narrowing).
                 let values: Vec<i32> = constant_data
                     .data
-                    .chunks_exact(8)
-                    .map(|chunk| i64::from_le_bytes(chunk.try_into().unwrap()) as i32)
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|chunk| i64::from_le_bytes(*chunk) as i32)
                     .collect();
                 TensorValue {
                     value: Some(tensor_value::Value::Ints(tensor_value::RepeatedInts {
@@ -671,8 +673,10 @@ impl CoremlMlProgramConverter {
                 // uint32 has no MIL tensor type; emit as int32 (bit-preserving).
                 let values: Vec<i32> = constant_data
                     .data
-                    .chunks_exact(4)
-                    .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()) as i32)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|chunk| u32::from_le_bytes(*chunk) as i32)
                     .collect();
                 TensorValue {
                     value: Some(tensor_value::Value::Ints(tensor_value::RepeatedInts {
@@ -684,8 +688,10 @@ impl CoremlMlProgramConverter {
                 // uint64 has no MIL tensor type; emit as int32 (narrowing).
                 let values: Vec<i32> = constant_data
                     .data
-                    .chunks_exact(8)
-                    .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()) as i32)
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|chunk| u64::from_le_bytes(*chunk) as i32)
                     .collect();
                 TensorValue {
                     value: Some(tensor_value::Value::Ints(tensor_value::RepeatedInts {
@@ -2070,6 +2076,126 @@ impl CoremlMlProgramConverter {
         ))
     }
 
+    fn emit_dynamic_slice(
+        block: &mut Block,
+        graph: &GraphInfo,
+        op: &Operation,
+        operand_name_overrides: &HashMap<u32, String>,
+    ) -> Result<(), GraphError> {
+        let Operation::Slice {
+            input,
+            starts,
+            sizes,
+            options,
+            ..
+        } = op
+        else {
+            return Err(GraphError::ConversionFailed {
+                format: "coreml_mlprogram".to_string(),
+                reason: "dynamic slice helper received another operation".to_string(),
+            });
+        };
+        let input_operand = graph
+            .operand(*input)
+            .ok_or_else(|| GraphError::ConversionFailed {
+                format: "coreml_mlprogram".to_string(),
+                reason: format!("slice input operand {input} not found"),
+            })?;
+        let strides = options
+            .as_ref()
+            .map(|options| options.strides.as_slice())
+            .filter(|strides| !strides.is_empty());
+        if strides.is_some_and(|strides| strides.iter().any(|&stride| stride != 1)) {
+            return Err(GraphError::ConversionFailed {
+                format: "coreml_mlprogram".to_string(),
+                reason: "CoreML runtime-sized slice currently requires unit strides".to_string(),
+            });
+        }
+        let begin = starts
+            .iter()
+            .enumerate()
+            .map(|(axis, &start)| {
+                i32::try_from(start).map_err(|_| GraphError::ConversionFailed {
+                    format: "coreml_mlprogram".to_string(),
+                    reason: format!(
+                        "runtime slice start {start} on axis {axis} exceeds CoreML int32 range"
+                    ),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        // Runtime validation binds these opaque labels from graph inputs. Do
+        // not guess derived-only extents from names or their maximum bounds.
+        let dimension_names = input_operand
+            .descriptor
+            .shape
+            .iter()
+            .filter_map(|dimension| match dimension {
+                GraphDimension::Dynamic(dynamic) => Some(dynamic.name.as_str()),
+                GraphDimension::Static(_) => None,
+            })
+            .chain(sizes.iter().filter_map(|dimension| match dimension {
+                MLDimension::Dynamic(dynamic) => Some(dynamic.name.as_str()),
+                MLDimension::Static(_) => None,
+            }));
+        for name in dimension_names {
+            let input_bound = !name.is_empty() && graph.input_operands.iter().any(|&operand_id| {
+                graph.operand(operand_id).is_some_and(|operand| {
+                    operand.descriptor.shape.iter().any(|dimension| {
+                        matches!(dimension, GraphDimension::Dynamic(dynamic) if dynamic.name == name)
+                    })
+                })
+            });
+            if !input_bound {
+                return Err(GraphError::ConversionFailed {
+                    format: "coreml_mlprogram".to_string(),
+                    reason: format!(
+                        "CoreML runtime-sized slice requires dynamic dimension {name:?} \
+                         to be bound by a graph input"
+                    ),
+                });
+            }
+        }
+        crate::shape_inference::infer_slice_shape_dimensions(
+            &input_operand.descriptor.shape,
+            starts,
+            sizes,
+            strides,
+        )?;
+        let output_id = op
+            .output_operand()
+            .ok_or_else(|| GraphError::ConversionFailed {
+                format: "coreml_mlprogram".to_string(),
+                reason: "slice has no output operand".to_string(),
+            })?;
+        let (output_name, output_type) =
+            Self::create_output_value(graph, output_id, operand_name_overrides)?;
+        let size_name = Self::emit_runtime_dimension_vector(
+            block,
+            graph,
+            op,
+            operand_name_overrides,
+            sizes,
+            &format!("{output_name}_slice_size"),
+        )?;
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "x".to_string(),
+            Self::create_name_argument(Self::output_name_for_operand(
+                graph,
+                *input,
+                operand_name_overrides,
+            )),
+        );
+        inputs.insert("begin".to_string(), Self::create_int_array_argument(begin));
+        inputs.insert("size".to_string(), Self::create_name_argument(size_name));
+        block.operations.push(Self::create_mil_operation(
+            mil_ops::SLICE,
+            inputs,
+            vec![output_type],
+        ));
+        Ok(())
+    }
+
     fn dynamic_expand_repetitions(
         input_shape: &[GraphDimension],
         target_shape: &[MLDimension],
@@ -2691,8 +2817,10 @@ impl CoremlMlProgramConverter {
                     value: Some(tensor_value::Value::Floats(tensor_value::RepeatedFloats {
                         values: constant
                             .data
-                            .chunks_exact(4)
-                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|c| f32::from_le_bytes(*c))
                             .collect(),
                     })),
                 },
@@ -6937,6 +7065,22 @@ impl super::GraphConverter for CoremlMlProgramConverter {
 
                     continue;
                 }
+            }
+
+            if let Operation::Slice { sizes, .. } = op
+                && sizes
+                    .iter()
+                    .any(|dimension| matches!(dimension, MLDimension::Dynamic(_)))
+            {
+                Self::emit_dynamic_slice(&mut main_block, graph_info, op, &operand_name_overrides)?;
+                if let Some(output_id) = op.output_operand()
+                    && let Some((pending_ops, transposed_name)) =
+                        deferred_transposes.remove(&output_id)
+                {
+                    main_block.operations.extend(pending_ops);
+                    operand_name_overrides.insert(output_id, transposed_name);
+                }
+                continue;
             }
 
             if let Operation::Expand {
@@ -12813,6 +12957,292 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    #[cfg(feature = "dynamic-inputs")]
+    #[test]
+    fn test_runtime_sized_slice_uses_named_sizes_and_unknown_output_dimensions() {
+        for data_type in [DataType::Float32, DataType::Int64] {
+            let mut graph = runtime_slice_graph("sequence", "sequence");
+            for operand in &mut graph.operands {
+                operand.descriptor.data_type = data_type;
+            }
+            let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+            let block = decode_main_block(&converted.data);
+            let slice = block
+                .operations
+                .iter()
+                .find(|operation| {
+                    operation.r#type == mil_ops::SLICE
+                        && operation
+                            .outputs
+                            .iter()
+                            .any(|output| output.name == "result")
+                })
+                .expect("runtime-sized slice");
+            assert_eq!(
+                immediate_int_values(slice.inputs.get("begin").unwrap()),
+                [0, 1]
+            );
+            assert!(matches!(
+                slice.inputs.get("size")
+                    .and_then(|argument| argument.arguments.first())
+                    .and_then(|binding| binding.binding.as_ref()),
+                Some(Binding::Name(name)) if name == "result_slice_size_shape"
+            ));
+            let output_type = slice.outputs[0]
+                .r#type
+                .as_ref()
+                .and_then(|value| value.r#type.as_ref())
+                .unwrap();
+            let crate::protos::coreml::mil_spec::value_type::Type::TensorType(tensor) = output_type
+            else {
+                panic!("slice output must be a tensor");
+            };
+            assert!(matches!(
+                tensor.dimensions[0].dimension,
+                Some(dimension::Dimension::Unknown(_))
+            ));
+            assert!(
+                matches!(tensor.dimensions[1].dimension, Some(dimension::Dimension::Constant(ref size)) if size.size == 2)
+            );
+            assert_eq!(
+                tensor.data_type,
+                CoremlMlProgramConverter::graph_value_mil_type(&data_type).unwrap()
+            );
+            assert!(
+                block
+                    .operations
+                    .iter()
+                    .any(|operation| operation.r#type == mil_ops::SHAPE)
+            );
+            for operation in &block.operations {
+                for value in operation.attributes.values() {
+                    if let Some(crate::protos::coreml::mil_spec::value::Value::ImmediateValue(
+                        immediate,
+                    )) = &value.value
+                        && let Some(
+                            crate::protos::coreml::mil_spec::value::immediate_value::Value::Tensor(
+                                tensor,
+                            ),
+                        ) = &immediate.value
+                        && let Some(crate::protos::coreml::mil_spec::tensor_value::Value::Ints(
+                            values,
+                        )) = &tensor.value
+                    {
+                        assert!(
+                            !values.values.contains(&4096),
+                            "a dynamic maximum must not become a runtime size constant"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "dynamic-inputs")]
+    fn runtime_slice_graph(input_label: &str, size_label: &str) -> GraphInfo {
+        let mut graph = dynamic_reshape_label_graph(input_label, size_label);
+        for (operand, trailing_size) in graph.operands.iter_mut().zip([4, 2]) {
+            let GraphDimension::Dynamic(dynamic) = &mut operand.descriptor.shape[0] else {
+                unreachable!();
+            };
+            dynamic.max_size = 4096;
+            operand
+                .descriptor
+                .shape
+                .push(GraphDimension::Static(trailing_size));
+        }
+        graph.operations[0] = Operation::Slice {
+            input: 0,
+            starts: vec![0, 1],
+            sizes: vec![
+                MLDimension::Dynamic(crate::operator_options::MLDynamicDimension {
+                    name: size_label.to_string(),
+                    max_size: 4096,
+                }),
+                MLDimension::Static(2),
+            ],
+            options: None,
+            outputs: vec![1],
+        };
+        graph
+    }
+
+    #[cfg(feature = "dynamic-inputs")]
+    #[test]
+    fn test_runtime_sized_slice_uses_opaque_input_bound_labels() {
+        for label in ["sequence + 1", "sequence - 1", " sequence "] {
+            let graph = runtime_slice_graph(label, label);
+            let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+            let block = decode_main_block(&converted.data);
+            assert!(
+                block
+                    .operations
+                    .iter()
+                    .all(|operation| operation.r#type != mil_ops::ADD)
+            );
+        }
+        for label in ["sequence + 1", " sequence ", "unknown", ""] {
+            let graph = runtime_slice_graph("sequence", label);
+            let error = CoremlMlProgramConverter
+                .convert(&graph)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("bound by a graph input"),
+                "{label:?}: {error}"
+            );
+        }
+
+        let mut graph = runtime_slice_graph("sequence", "sequence");
+        let mut derived = graph.operands[0].clone();
+        derived.name = Some("derived".to_string());
+        derived.kind = OperandKind::Output;
+        let GraphDimension::Dynamic(dynamic) = &mut derived.descriptor.shape[0] else {
+            unreachable!();
+        };
+        dynamic.name = "derived + 1".to_string();
+        graph.operands.push(derived);
+        let Operation::Slice { input, .. } = &mut graph.operations[0] else {
+            unreachable!();
+        };
+        *input = 2;
+        graph.operations.insert(
+            0,
+            Operation::Identity {
+                input: 0,
+                options: None,
+                outputs: vec![2],
+            },
+        );
+        let error = CoremlMlProgramConverter
+            .convert(&graph)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("derived + 1") && error.contains("bound by a graph input"),
+            "{error}"
+        );
+    }
+
+    #[cfg(feature = "dynamic-inputs")]
+    #[test]
+    fn test_runtime_sized_slice_rejects_nonunit_strides_and_int32_overflow() {
+        for stride in [0, 2] {
+            let mut graph = runtime_slice_graph("sequence", "sequence");
+            let Operation::Slice { options, .. } = &mut graph.operations[0] else {
+                unreachable!();
+            };
+            *options = Some(crate::operator_options::MLSliceOptions {
+                strides: vec![1, stride],
+                ..Default::default()
+            });
+            let error = CoremlMlProgramConverter
+                .convert(&graph)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("requires unit strides"), "{error}");
+        }
+        for oversized_start in [true, false] {
+            let mut graph = runtime_slice_graph("sequence", "sequence");
+            let Operation::Slice { starts, sizes, .. } = &mut graph.operations[0] else {
+                unreachable!();
+            };
+            if oversized_start {
+                starts[0] = i32::MAX as u32 + 1;
+            } else {
+                let MLDimension::Dynamic(dynamic) = &mut sizes[0] else {
+                    unreachable!();
+                };
+                dynamic.max_size = i32::MAX as u32 + 1;
+            }
+            let error = CoremlMlProgramConverter
+                .convert(&graph)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("exceeds CoreML int32 range"), "{error}");
+        }
+    }
+
+    #[cfg(feature = "dynamic-inputs")]
+    #[test]
+    fn test_literal_slice_size_equal_to_dynamic_max_stays_static() {
+        let mut graph = runtime_slice_graph("sequence", "sequence");
+        graph.operands[1].descriptor.shape[0] = GraphDimension::Static(4096);
+        let Operation::Slice { sizes, .. } = &mut graph.operations[0] else {
+            unreachable!();
+        };
+        sizes[0] = MLDimension::Static(4096);
+        let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+        let block = decode_main_block(&converted.data);
+        let slice = block
+            .operations
+            .iter()
+            .find(|operation| operation.r#type == mil_ops::SLICE)
+            .unwrap();
+        assert_eq!(
+            immediate_int_values(slice.inputs.get("size").unwrap()),
+            [4096, 2]
+        );
+        assert!(
+            block
+                .operations
+                .iter()
+                .all(|operation| operation.r#type != mil_ops::SHAPE)
+        );
+    }
+
+    #[cfg(feature = "dynamic-inputs")]
+    #[test]
+    fn test_scalar_static_slice_preserves_no_op_lowering_and_empty_parameters() {
+        let mut graph = runtime_slice_graph("sequence", "sequence");
+        for operand in &mut graph.operands {
+            operand.descriptor.shape.clear();
+        }
+        let Operation::Slice { starts, sizes, .. } = &mut graph.operations[0] else {
+            unreachable!();
+        };
+        starts.clear();
+        sizes.clear();
+        let inputs = CoremlMlProgramConverter
+            .create_operation_inputs(&graph, &graph.operations[0], &["input".to_string()])
+            .unwrap();
+        assert!(immediate_int_values(inputs.get("begin").unwrap()).is_empty());
+        assert!(immediate_int_values(inputs.get("size").unwrap()).is_empty());
+
+        // The full converter preserves the existing scalar no-op optimization:
+        // its rank-0 WebNN value is copied through the [1] CoreML interface.
+        let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+        let block = decode_main_block(&converted.data);
+        let reshape = block
+            .operations
+            .iter()
+            .find(|operation| {
+                operation.r#type == mil_ops::RESHAPE
+                    && operation
+                        .outputs
+                        .iter()
+                        .any(|output| output.name == "result")
+            })
+            .unwrap();
+        assert_eq!(
+            immediate_int_values(reshape.inputs.get("shape").unwrap()),
+            [1]
+        );
+        assert!(matches!(
+            reshape.inputs.get("x")
+                .and_then(|argument| argument.arguments.first())
+                .and_then(|binding| binding.binding.as_ref()),
+            Some(Binding::Name(name)) if name == "input"
+        ));
+        assert!(
+            block
+                .operations
+                .iter()
+                .all(|operation| operation.r#type != mil_ops::SHAPE
+                    && operation.r#type != mil_ops::SLICE)
+        );
     }
 
     #[cfg(feature = "dynamic-inputs")]

@@ -890,6 +890,7 @@ impl TrtxConverter {
         graph: &'a GraphInfo,
         network: &mut trtx::NetworkDefinition<'a>,
     ) -> Result<(), GraphError> {
+        super::require_static_slice_sizes(graph, "trtx")?;
         let mut tensor_map: HashMap<u32, trtx::Tensor<'a>> = HashMap::new();
         let mut non_refittable_constants = Self::gather_baked_constant_operand_ids(graph);
         let io_binding_names = Self::engine_io_binding_names(graph);
@@ -15127,6 +15128,7 @@ impl GraphConverter for TrtxConverter {
     }
 
     fn convert(&self, graph_info: &GraphInfo) -> Result<ConvertedGraph, GraphError> {
+        super::require_static_slice_sizes(graph_info, self.format())?;
         trtx::dynamically_load_tensorrt(None::<&str>).map_err(|e| {
             GraphError::ConversionFailed {
                 format: "trtx".to_string(),

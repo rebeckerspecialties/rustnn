@@ -38,6 +38,7 @@ impl GraphConverter for LiteRtConverter {
     }
 
     fn convert(&self, graph: &GraphInfo) -> Result<ConvertedGraph, GraphError> {
+        super::require_static_slice_sizes(graph, self.format())?;
         let bytes = build_native(graph)?;
         Ok(ConvertedGraph {
             format: "litert",

@@ -169,7 +169,7 @@ fn graph_operation_to_webnn_node_with_overrides(
     };
 
     let mut options: serde_json::Map<String, serde_json::Value> = operation
-        .attributes_value()
+        .attributes_json_value()
         .as_object()
         .cloned()
         .unwrap_or_else(serde_json::Map::new);
@@ -951,47 +951,28 @@ fn infer_output_shapes(graph: &mut GraphInfo) -> Result<(), GraphError> {
                                 options,
                                 ..
                             } => {
-                                if starts.is_empty()
-                                    || sizes.is_empty()
-                                    || starts.len() != sizes.len()
-                                {
+                                if input_shape.is_empty() && !starts.is_empty() {
+                                    // An intermediate input may still await shape inference.
                                     None
                                 } else {
-                                    let sizes_u32: Vec<u32> =
-                                        sizes.iter().map(|d| d.static_or_max()).collect();
                                     let strides = options.as_ref().map(|o| o.strides.as_slice());
-                                    let input_dims: Vec<u32> = input_shape
-                                        .iter()
-                                        .map(crate::graph::get_static_or_max_size)
-                                        .collect();
-                                    infer_slice_shape(
-                                        &input_dims,
+                                    let shape = infer_slice_shape_dimensions(
+                                        input_shape,
                                         starts,
-                                        &sizes_u32,
+                                        sizes,
                                         strides,
-                                    )
-                                    .ok()
-                                    .map(|shape| {
-                                        shape
-                                            .into_iter()
-                                            .zip(sizes)
-                                            .map(|(max_size, size)| match size {
-                                                // A fixed size remains fixed even when it equals
-                                                // the input's maximum dynamic extent.
-                                                crate::operator_options::MLDimension::Static(_) => {
-                                                    Dimension::Static(max_size)
-                                                }
-                                                crate::operator_options::MLDimension::Dynamic(
-                                                    dynamic,
-                                                ) => {
-                                                    Dimension::Dynamic(DynamicDimension {
-                                                        name: dynamic.name.clone(),
-                                                        max_size,
-                                                    })
-                                                }
-                                            })
-                                            .collect::<Vec<_>>()
-                                    })
+                                    )?;
+                                    let descriptor = OperandDescriptor {
+                                        data_type: input_types[0],
+                                        shape: shape.clone(),
+                                        pending_permutation: vec![],
+                                    };
+                                    if descriptor.byte_length().is_none() {
+                                        return Err(GraphError::ShapeInferenceFailed {
+                                            reason: "Slice maximum output byte length overflows usize".to_string(),
+                                        });
+                                    }
+                                    Some(shape)
                                 }
                             }
                             _ => None,
@@ -2580,6 +2561,31 @@ mod tests {
                 max_size: 4096,
             })
         );
+        let exported = to_graph_json(&graph, false).unwrap();
+        assert_eq!(
+            exported.nodes[0].options["starts"],
+            serde_json::json!([0, 0, 0, 0])
+        );
+        assert_eq!(
+            exported.nodes[0].options["sizes"],
+            serde_json::json!([
+                1, 1, 4096, { "name": "past_sequence_length + 1", "maxSize": 4096 }
+            ])
+        );
+        let round_trip = from_graph_json(&exported).unwrap();
+        assert_eq!(round_trip.operations, graph.operations);
+        assert_eq!(
+            round_trip.operands[round_trip.output_operands[0] as usize]
+                .descriptor
+                .shape,
+            output.shape,
+        );
+        assert_eq!(
+            round_trip.operands[round_trip.output_operands[0] as usize]
+                .descriptor
+                .data_type,
+            output.data_type,
+        );
     }
 
     #[test]
@@ -2643,6 +2649,81 @@ mod tests {
         };
         assert_eq!(starts, &[0]);
         assert_eq!(sizes, &[crate::operator_options::MLDimension::Static(8)]);
+        let exported = to_graph_json(&graph, false).unwrap();
+        assert_eq!(exported.nodes[0].options["starts"], serde_json::json!([0]));
+        assert_eq!(exported.nodes[0].options["sizes"], serde_json::json!([8]));
+        assert_eq!(exported.nodes[0].options["strides"], serde_json::json!([1]));
+        let round_trip = from_graph_json(&exported).unwrap();
+        assert_eq!(round_trip.operations, graph.operations);
+        assert_eq!(
+            round_trip.operands[round_trip.output_operands[0] as usize]
+                .descriptor
+                .shape,
+            vec![Dimension::Static(8)],
+        );
+    }
+
+    #[test]
+    fn test_from_graph_json_slice_defers_dynamic_bounds_and_rejects_bad_strides() {
+        use webnn_graph::ast::{DataType as WDataType, OperandDesc};
+
+        let mut inputs = BTreeMap::new();
+        inputs.insert(
+            "x".to_string(),
+            OperandDesc {
+                data_type: WDataType::Float32,
+                shape: wshape(&[8]),
+            },
+        );
+        let mut options = serde_json::Map::new();
+        options.insert("starts".to_string(), serde_json::json!([2]));
+        options.insert(
+            "sizes".to_string(),
+            serde_json::json!([
+                { "name": "sequence", "maxSize": 16 }
+            ]),
+        );
+        let mut graph_json = GraphJson {
+            name: Some("runtime_slice_bounds".to_string()),
+            format: "webnn-graph-json".to_string(),
+            version: 2,
+            quantized: false,
+            inputs,
+            consts: BTreeMap::new(),
+            nodes: vec![Node {
+                id: "n0".to_string(),
+                op: "slice".to_string(),
+                inputs: vec!["x".to_string()],
+                options,
+                outputs: Some(vec!["y".to_string()]),
+            }],
+            outputs: BTreeMap::from([("y".to_string(), "y".to_string())]),
+        };
+        let graph = from_graph_json(&graph_json).unwrap();
+        assert_eq!(
+            graph.operands[graph.output_operands[0] as usize]
+                .descriptor
+                .shape,
+            vec![Dimension::Dynamic(DynamicDimension {
+                name: "sequence".to_string(),
+                max_size: 16,
+            })],
+        );
+        for strides in [
+            serde_json::json!([0]),
+            serde_json::json!([2]),
+            serde_json::json!([1, 1]),
+        ] {
+            graph_json.nodes[0]
+                .options
+                .insert("strides".to_string(), strides);
+            assert!(from_graph_json(&graph_json).is_err());
+        }
+        graph_json.nodes[0].options.remove("strides");
+        graph_json.nodes[0]
+            .options
+            .insert("sizes".to_string(), serde_json::json!([8]));
+        assert!(from_graph_json(&graph_json).is_err());
     }
 
     #[test]

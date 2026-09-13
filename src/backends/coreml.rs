@@ -27,6 +27,9 @@ use crate::mlcontext::{
 };
 use crate::operators::Operation;
 
+mod slice;
+use slice::SliceConstraints;
+
 /// Number of bytes required to store a tensor described by `descriptor`.
 fn tensor_byte_len(descriptor: &MLTensorDescriptor) -> usize {
     descriptor.rustnn_required_bytes()
@@ -63,6 +66,7 @@ pub(crate) struct CoremlTensor {
 /// A compiled CoreML model held by [`MLGraph`] (mirrors `OrtGraph`).
 pub(crate) struct CoremlGraph {
     model: CompiledCoremlModel,
+    slice_constraints: SliceConstraints,
 }
 
 impl fmt::Debug for CoremlGraph {
@@ -87,6 +91,8 @@ impl fmt::Debug for CoremlBuilder {
 
 impl<'context, 'builder> MLBackendBuilder<'context, 'builder> for CoremlBuilder {
     fn build(&mut self, graph_info: GraphInfo) -> crate::error::Result<MLGraph<'context>> {
+        let slice_constraints = SliceConstraints::new(&graph_info)
+            .map_err(|e| Error::GraphBuildError { source: e.into() })?;
         let converted = CoremlMlProgramConverter
             .convert(&graph_info)
             .map_err(|e| Error::GraphBuildError { source: e.into() })?;
@@ -98,7 +104,10 @@ impl<'context, 'builder> MLBackendBuilder<'context, 'builder> for CoremlBuilder 
         )
         .map_err(|e| Error::GraphBuildError { source: e.into() })?;
         MLGraph::new(
-            MLBackendGraph::CoremlModel(CoremlGraph { model }),
+            MLBackendGraph::CoremlModel(CoremlGraph {
+                model,
+                slice_constraints,
+            }),
             &graph_info,
         )
     }
@@ -259,6 +268,11 @@ impl<'context> MLBackendContext<'context> for CoremlContext {
                     ))
                 })
                 .collect::<crate::error::Result<HashMap<_, _>>>()?;
+
+            coreml_graph
+                .slice_constraints
+                .validate(&runtime_descriptors)
+                .map_err(|e| Error::GraphDispatchError { source: e.into() })?;
 
             let mut byte_inputs: HashMap<String, CoremlByteInput> =
                 HashMap::with_capacity(graph.input_descriptors.len());
@@ -467,6 +481,177 @@ mod test {
         assert_eq!(overflowing.byte_length(), None);
         let scalar = super::runtime_input_descriptor(&descriptor, &[]).unwrap();
         assert_eq!(scalar.byte_length(), Some(4));
+    }
+
+    #[cfg(feature = "dynamic-inputs")]
+    #[test]
+    fn coreml_runtime_slice_preserves_half_head_values_across_dispatches() {
+        let sequence = Dimension::Dynamic(DynamicDimension {
+            name: "sequence".to_string(),
+            max_size: 4,
+        });
+        let operand = |kind, name: &str, width| Operand {
+            kind,
+            name: Some(name.to_string()),
+            descriptor: OperandDescriptor {
+                data_type: DataType::Float32,
+                shape: vec![
+                    Dimension::Static(1),
+                    Dimension::Static(3),
+                    sequence.clone(),
+                    Dimension::Static(width),
+                ],
+                pending_permutation: vec![],
+            },
+        };
+        let info = GraphInfo {
+            operands: vec![
+                operand(OperandKind::Input, "input", 64),
+                operand(OperandKind::Output, "output", 32),
+            ],
+            input_operands: vec![0],
+            output_operands: vec![1],
+            operations: vec![Operation::Slice {
+                input: 0,
+                starts: vec![0, 0, 0, 32],
+                sizes: vec![
+                    MLDimension::Static(1),
+                    MLDimension::Static(3),
+                    MLDimension::Dynamic(MLDynamicDimension {
+                        name: "sequence".to_string(),
+                        max_size: 4,
+                    }),
+                    MLDimension::Static(32),
+                ],
+                options: None,
+                outputs: vec![1],
+            }],
+            ..Default::default()
+        };
+        let mut context =
+            super::CoremlContext::new_from_device_type(DeviceType::Cpu, None).unwrap();
+        let mut graph = context.create_builder().unwrap().build(info).unwrap();
+        for (step, sequence) in [1u64, 4, 2, 1].into_iter().enumerate() {
+            let data: Vec<f32> = (0..3 * sequence * 64)
+                .map(|index| index as f32 + step as f32 * 1000.0)
+                .collect();
+            let expected: Vec<f32> = data
+                .as_chunks::<64>()
+                .0
+                .iter()
+                .flat_map(|row| row[32..].iter().copied())
+                .collect();
+            let input = context
+                .create_tensor(&MLTensorDescriptor::new(
+                    MLOperandDataType::Float32,
+                    vec![1, 3, sequence, 64],
+                ))
+                .unwrap();
+            let output = context
+                .create_tensor(&MLTensorDescriptor::new(
+                    MLOperandDataType::Float32,
+                    vec![1, 3, sequence, 32],
+                ))
+                .unwrap();
+            context
+                .write_tensor(&input, bytemuck::cast_slice(&data))
+                .unwrap();
+            context
+                .dispatch(
+                    &mut graph,
+                    &MLNamedTensors::from([("input", &input)]),
+                    &MLNamedTensors::from([("output", &output)]),
+                )
+                .unwrap();
+            let mut actual = vec![0f32; expected.len()];
+            context
+                .read_tensor(&output, bytemuck::cast_slice_mut(&mut actual))
+                .unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(output.shape(), [1, 3, sequence, 32]);
+        }
+    }
+
+    #[cfg(feature = "dynamic-inputs")]
+    #[test]
+    fn coreml_fixed_slice_checks_active_bounds_before_prediction() {
+        let descriptor = |shape| OperandDescriptor {
+            data_type: DataType::Float32,
+            shape,
+            pending_permutation: vec![],
+        };
+        let info = GraphInfo {
+            operands: vec![
+                Operand {
+                    kind: OperandKind::Input,
+                    name: Some("input".to_string()),
+                    descriptor: descriptor(vec![Dimension::Dynamic(DynamicDimension {
+                        name: "sequence".to_string(),
+                        max_size: 8,
+                    })]),
+                },
+                Operand {
+                    kind: OperandKind::Output,
+                    name: Some("output".to_string()),
+                    descriptor: descriptor(vec![Dimension::Static(2)]),
+                },
+            ],
+            input_operands: vec![0],
+            output_operands: vec![1],
+            operations: vec![Operation::Slice {
+                input: 0,
+                starts: vec![0],
+                sizes: vec![MLDimension::Static(2)],
+                options: None,
+                outputs: vec![1],
+            }],
+            ..Default::default()
+        };
+        let mut context =
+            super::CoremlContext::new_from_device_type(DeviceType::Cpu, None).unwrap();
+        let mut graph = context.create_builder().unwrap().build(info).unwrap();
+        for size in [4u64, 2, 1, 4] {
+            let data: Vec<f32> = (0..size).map(|index| index as f32 + 0.5).collect();
+            let input = context
+                .create_tensor(&MLTensorDescriptor::new(
+                    MLOperandDataType::Float32,
+                    vec![size],
+                ))
+                .unwrap();
+            let output = context
+                .create_tensor(&MLTensorDescriptor::new(
+                    MLOperandDataType::Float32,
+                    vec![2],
+                ))
+                .unwrap();
+            context
+                .write_tensor(&input, bytemuck::cast_slice(&data))
+                .unwrap();
+            context
+                .write_tensor(&output, bytemuck::cast_slice(&[-99.0f32; 2]))
+                .unwrap();
+            let result = context.dispatch(
+                &mut graph,
+                &MLNamedTensors::from([("input", &input)]),
+                &MLNamedTensors::from([("output", &output)]),
+            );
+            let mut actual = [0f32; 2];
+            context
+                .read_tensor(&output, bytemuck::cast_slice_mut(&mut actual))
+                .unwrap();
+            if size == 1 {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("CoreML slice operation 0")
+                );
+                assert_eq!(actual, [-99.0; 2]);
+            } else {
+                result.unwrap();
+                assert_eq!(actual, [0.5, 1.5]);
+            }
+        }
     }
 
     #[cfg(feature = "dynamic-inputs")]

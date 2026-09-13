@@ -863,12 +863,16 @@ unsafe fn extract_multiarray_bytes(
         // Int32, not Float32 — do not route it through normalize_dtype_code here.
         let is_float = matches!(actual_dtype_code as i32, 32 | 65568 | 16 | 65552);
         let ints: Vec<i32> = if is_float {
-            raw.chunks_exact(4)
-                .map(|c| f32::from_le_bytes(c.try_into().unwrap()) as i32)
+            raw.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c) as i32)
                 .collect()
         } else {
-            raw.chunks_exact(4)
-                .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+            raw.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| i32::from_le_bytes(*c))
                 .collect()
         };
         let packed = if matches!(descriptor.data_type, DataType::Int4) {
