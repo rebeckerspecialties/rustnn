@@ -409,12 +409,28 @@ impl<'context> MLBackendContext<'context> for CoremlContext {
 
 #[cfg(test)]
 mod test {
+    #[cfg(feature = "dynamic-inputs")]
+    use crate::GraphInfo;
+    #[cfg(feature = "dynamic-inputs")]
+    use crate::backend_selection::DeviceType;
+    #[cfg(feature = "dynamic-inputs")]
+    use crate::graph::{
+        DataType, Dimension, DynamicDimension, Operand, OperandDescriptor, OperandKind,
+    };
+    #[cfg(feature = "dynamic-inputs")]
+    use crate::mlcontext::MLBackendContext;
     use crate::mlcontext::{
         Backend, MLContext, MLContextOptions, MLNamedOperands, MLNamedTensors, MLOperandDescriptor,
         MLPowerPreference, MLTensorDescriptor,
     };
     use crate::mlgraphbuilder::MLGraphBuilder;
     use crate::operator_enums::MLOperandDataType;
+    #[cfg(feature = "dynamic-inputs")]
+    use crate::operator_options::{MLDimension, MLDynamicDimension, MLGatherOptions};
+    #[cfg(feature = "dynamic-inputs")]
+    use crate::operators::Operation;
+    #[cfg(feature = "dynamic-inputs")]
+    use std::collections::HashMap;
 
     /// Build a context backed by CoreML. Returns `None` (test skipped) if no
     /// accelerated backend is available on this machine.
@@ -752,6 +768,235 @@ mod test {
             .read_tensor(&output, bytemuck::cast_slice_mut(&mut result))
             .unwrap();
         assert_eq!(result, [0.0, 3.5]);
+    }
+
+    #[cfg(feature = "dynamic-inputs")]
+    #[test]
+    fn coreml_dynamic_gather_uses_active_shape_and_values() {
+        let dynamic = |name: &str, max_size| {
+            Dimension::Dynamic(DynamicDimension {
+                name: name.to_string(),
+                max_size,
+            })
+        };
+        let graph_info = GraphInfo {
+            operands: vec![
+                Operand {
+                    kind: OperandKind::Input,
+                    descriptor: OperandDescriptor {
+                        data_type: DataType::Float32,
+                        shape: vec![Dimension::Static(3), Dimension::Static(2)],
+                        pending_permutation: vec![],
+                    },
+                    name: Some("data".to_string()),
+                },
+                Operand {
+                    kind: OperandKind::Input,
+                    descriptor: OperandDescriptor {
+                        data_type: DataType::Int32,
+                        shape: vec![dynamic("batch", 2), dynamic("sequence", 4)],
+                        pending_permutation: vec![],
+                    },
+                    name: Some("indices".to_string()),
+                },
+                Operand {
+                    kind: OperandKind::Output,
+                    descriptor: OperandDescriptor {
+                        data_type: DataType::Float32,
+                        shape: vec![
+                            dynamic("batch", 2),
+                            dynamic("sequence", 4),
+                            Dimension::Static(2),
+                        ],
+                        pending_permutation: vec![],
+                    },
+                    name: Some("output".to_string()),
+                },
+            ],
+            input_operands: vec![0, 1],
+            output_operands: vec![2],
+            operations: vec![Operation::Gather {
+                input: 0,
+                indices: 1,
+                batch_dimensions: None,
+                options: Some(MLGatherOptions::default()),
+                outputs: vec![2],
+            }],
+            constant_operand_ids_to_handles: HashMap::new(),
+            id_to_constant_tensor_operand_map: HashMap::new(),
+            quantized: false,
+        };
+
+        let mut context =
+            super::CoremlContext::new_from_device_type(DeviceType::Gpu, None).unwrap();
+        let mut graph = context.create_builder().unwrap().build(graph_info).unwrap();
+        let data = context
+            .create_tensor(&MLTensorDescriptor::new(
+                MLOperandDataType::Float32,
+                vec![3, 2],
+            ))
+            .unwrap();
+        let indices = context
+            .create_tensor(&MLTensorDescriptor::new(
+                MLOperandDataType::Int32,
+                vec![1, 2],
+            ))
+            .unwrap();
+        let output = context
+            .create_tensor(&MLTensorDescriptor::new(
+                MLOperandDataType::Float32,
+                vec![1, 2, 2],
+            ))
+            .unwrap();
+        context
+            .write_tensor(
+                &data,
+                bytemuck::cast_slice(&[10.0f32, 11.0, 20.0, 21.0, 30.0, 31.0]),
+            )
+            .unwrap();
+        context
+            .write_tensor(&indices, bytemuck::cast_slice(&[0i32, -1]))
+            .unwrap();
+
+        context
+            .dispatch(
+                &mut graph,
+                &MLNamedTensors::from([("data", &data), ("indices", &indices)]),
+                &MLNamedTensors::from([("output", &output)]),
+            )
+            .unwrap();
+
+        let mut result = [0.0f32; 4];
+        context
+            .read_tensor(&output, bytemuck::cast_slice_mut(&mut result))
+            .unwrap();
+        assert_eq!(result, [10.0, 11.0, 30.0, 31.0]);
+    }
+
+    #[cfg(feature = "dynamic-inputs")]
+    #[test]
+    fn coreml_dynamic_expand_and_reshape_use_active_shape_and_values() {
+        let graph_dimension = || {
+            Dimension::Dynamic(DynamicDimension {
+                name: "batch".to_string(),
+                max_size: 4,
+            })
+        };
+        let ml_dimension = || {
+            MLDimension::Dynamic(MLDynamicDimension {
+                name: "batch".to_string(),
+                max_size: 4,
+            })
+        };
+        let graph_info = GraphInfo {
+            operands: vec![
+                Operand {
+                    kind: OperandKind::Input,
+                    descriptor: OperandDescriptor {
+                        data_type: DataType::Float32,
+                        shape: vec![graph_dimension()],
+                        pending_permutation: vec![],
+                    },
+                    name: Some("shape_source".to_string()),
+                },
+                Operand {
+                    kind: OperandKind::Input,
+                    descriptor: OperandDescriptor {
+                        data_type: DataType::Float32,
+                        shape: vec![Dimension::Static(1), Dimension::Static(2)],
+                        pending_permutation: vec![],
+                    },
+                    name: Some("value".to_string()),
+                },
+                Operand {
+                    kind: OperandKind::Intermediate,
+                    descriptor: OperandDescriptor {
+                        data_type: DataType::Float32,
+                        shape: vec![graph_dimension(), Dimension::Static(2)],
+                        pending_permutation: vec![],
+                    },
+                    name: None,
+                },
+                Operand {
+                    kind: OperandKind::Output,
+                    descriptor: OperandDescriptor {
+                        data_type: DataType::Float32,
+                        shape: vec![
+                            graph_dimension(),
+                            Dimension::Static(1),
+                            Dimension::Static(2),
+                        ],
+                        pending_permutation: vec![],
+                    },
+                    name: Some("output".to_string()),
+                },
+            ],
+            input_operands: vec![0, 1],
+            output_operands: vec![3],
+            operations: vec![
+                Operation::Expand {
+                    input: 1,
+                    new_shape: vec![ml_dimension(), MLDimension::Static(2)],
+                    options: None,
+                    outputs: vec![2],
+                },
+                Operation::Reshape {
+                    input: 2,
+                    new_shape: vec![
+                        ml_dimension(),
+                        MLDimension::Static(1),
+                        MLDimension::Static(2),
+                    ],
+                    options: None,
+                    outputs: vec![3],
+                },
+            ],
+            constant_operand_ids_to_handles: HashMap::new(),
+            id_to_constant_tensor_operand_map: HashMap::new(),
+            quantized: false,
+        };
+
+        let mut context =
+            super::CoremlContext::new_from_device_type(DeviceType::Gpu, None).unwrap();
+        let mut graph = context.create_builder().unwrap().build(graph_info).unwrap();
+        let shape_source = context
+            .create_tensor(&MLTensorDescriptor::new(
+                MLOperandDataType::Float32,
+                vec![3],
+            ))
+            .unwrap();
+        let value = context
+            .create_tensor(&MLTensorDescriptor::new(
+                MLOperandDataType::Float32,
+                vec![1, 2],
+            ))
+            .unwrap();
+        let output = context
+            .create_tensor(&MLTensorDescriptor::new(
+                MLOperandDataType::Float32,
+                vec![3, 1, 2],
+            ))
+            .unwrap();
+        context
+            .write_tensor(&shape_source, bytemuck::cast_slice(&[0.0f32, 0.0, 0.0]))
+            .unwrap();
+        context
+            .write_tensor(&value, bytemuck::cast_slice(&[2.5f32, -4.0]))
+            .unwrap();
+
+        context
+            .dispatch(
+                &mut graph,
+                &MLNamedTensors::from([("shape_source", &shape_source), ("value", &value)]),
+                &MLNamedTensors::from([("output", &output)]),
+            )
+            .unwrap();
+
+        let mut result = [0.0f32; 6];
+        context
+            .read_tensor(&output, bytemuck::cast_slice_mut(&mut result))
+            .unwrap();
+        assert_eq!(result, [2.5, -4.0, 2.5, -4.0, 2.5, -4.0]);
     }
 
     #[test]
