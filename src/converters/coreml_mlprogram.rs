@@ -2017,6 +2017,22 @@ impl CoremlMlProgramConverter {
                     let source_shape_name = if let Some(name) = shape_names.get(&source_id) {
                         name.clone()
                     } else {
+                        // MIL shape materializes every source axis as int32,
+                        // including axes that the following slice does not use.
+                        for (axis, dimension) in source_operand.descriptor.shape.iter().enumerate()
+                        {
+                            let size = match dimension {
+                                GraphDimension::Static(size) => *size,
+                                GraphDimension::Dynamic(dynamic) => dynamic.max_size,
+                            };
+                            i32::try_from(size).map_err(|_| GraphError::ConversionFailed {
+                                format: "coreml_mlprogram".to_string(),
+                                reason: format!(
+                                    "runtime shape source operand {source_id} axis {axis} \
+                                     bound {size} exceeds CoreML int32 range"
+                                ),
+                            })?;
+                        }
                         let source_name =
                             Self::output_name_for_operand(graph, source_id, operand_name_overrides);
                         let shape_name = Self::emit_runtime_operand_shape(
@@ -12889,6 +12905,60 @@ mod tests {
                         .to_string()
                         .contains("exceeds CoreML int32 range")
                 );
+            }
+        }
+    }
+
+    #[cfg(feature = "dynamic-inputs")]
+    #[test]
+    fn test_runtime_shape_checks_all_source_axis_bounds() {
+        let dynamic = |name: &str, max_size| {
+            GraphDimension::Dynamic(DynamicDimension {
+                name: name.to_string(),
+                max_size,
+            })
+        };
+        for size in [i32::MAX as u32, i32::MAX as u32 + 1, u32::MAX] {
+            for (source_shape, checked_axis) in [
+                (vec![dynamic("sequence", size)], 0),
+                (
+                    vec![dynamic("sequence", 8), GraphDimension::Static(size)],
+                    1,
+                ),
+                (vec![dynamic("sequence", 8), dynamic("unrelated", size)], 1),
+            ] {
+                let mut graph = dynamic_reshape_label_graph("sequence", "sequence");
+                graph.operands[0].descriptor.shape = source_shape;
+                let mut block = Block::default();
+                let result = CoremlMlProgramConverter::emit_runtime_dimension_vector(
+                    &mut block,
+                    &graph,
+                    &graph.operations[0],
+                    &HashMap::new(),
+                    &[MLDimension::Dynamic(
+                        crate::operator_options::MLDynamicDimension {
+                            name: "sequence".to_string(),
+                            max_size: 8,
+                        },
+                    )],
+                    "target",
+                );
+                if size == i32::MAX as u32 {
+                    assert!(result.is_ok());
+                } else {
+                    let error = result.unwrap_err().to_string();
+                    assert!(
+                        error.contains(&format!("source operand 0 axis {checked_axis}")),
+                        "{error}"
+                    );
+                    assert!(error.contains("exceeds CoreML int32 range"), "{error}");
+                    assert!(
+                        block
+                            .operations
+                            .iter()
+                            .all(|operation| operation.r#type != mil_ops::SHAPE)
+                    );
+                }
             }
         }
     }
