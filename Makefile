@@ -175,6 +175,10 @@ test-wpt-litert:
 test-wpt-coreml:
 	$(CARGO) test --test run_wpt_conformance --features coreml-runtime -- coreml --test-threads 1
 
+.PHONY: test-coreml-gather
+test-coreml-gather:
+	$(CARGO) test --features coreml-runtime,dynamic-inputs --test test_coreml_dynamic_gather --test test_coreml_gather_bounds -- --test-threads 1
+
 test-wpt-coreml-report:
 	@mkdir -p reports
 	WPT_REPORT_JSON=reports/wpt-conformance.json $(CARGO) test --test run_wpt_conformance --features coreml-runtime -- coreml --test-threads 1
