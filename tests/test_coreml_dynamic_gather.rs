@@ -473,8 +473,18 @@ fn gather_reports_actual_scalar_and_dynamic_nonindexed_output_shapes() {
             .unwrap();
             let mut cpu_succeeded = false;
             for attempt in attempts {
+                if let Err(error) = &attempt.result {
+                    eprintln!(
+                        "scalar={scalar}, rows={rows}, {}: {error}",
+                        attempt.compute_unit
+                    );
+                }
                 if attempt.compute_unit == "CPU_ONLY" {
-                    assert!(attempt.result.is_ok(), "{:?}", attempt.result);
+                    assert!(
+                        attempt.result.is_ok(),
+                        "scalar={scalar}, rows={rows}, CPU_ONLY: {:?}",
+                        attempt.result
+                    );
                     cpu_succeeded = true;
                 }
                 if let Ok(outputs) = attempt.result {
