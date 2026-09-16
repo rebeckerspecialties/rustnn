@@ -1231,7 +1231,7 @@ fn run_impl_zeroed_with_weights(
             // The shim returns a retained provider; release it after collecting.
             let _output_provider_guard = ReleaseOnDrop(output_provider);
 
-            match collect_outputs(output_provider) {
+            match collect_outputs(output_provider, model, None) {
                 Ok(outputs) => attempts.push(CoremlRunAttempt {
                     compute_unit: name,
                     result: Ok(outputs),
@@ -1421,7 +1421,7 @@ fn run_impl_with_inputs_with_weights(
             // The shim returns a retained provider; release it after collecting.
             let _output_provider_guard = ReleaseOnDrop(output_provider);
 
-            match collect_outputs(output_provider) {
+            match collect_outputs(output_provider, model, output_descriptors) {
                 Ok(outputs) => attempts.push(CoremlRunAttempt {
                     compute_unit: name,
                     result: Ok(outputs),
@@ -1489,21 +1489,67 @@ fn validate_attempt_outputs(
     }
 }
 
-unsafe fn collect_outputs(provider: *mut Object) -> Result<Vec<CoremlOutput>, GraphError> {
+fn collect_named_outputs(
+    mut advertised_names: Vec<String>,
+    expected: Option<&HashMap<String, OperandDescriptor>>,
+    mut lookup: impl FnMut(&str) -> Result<CoremlOutput, GraphError>,
+) -> Result<Vec<CoremlOutput>, GraphError> {
+    if let Some(expected) = expected {
+        advertised_names.extend(expected.keys().cloned());
+    }
+    // Query every expected name directly, but retain advertised extras so the
+    // checked path still rejects unexpected outputs instead of hiding them.
+    advertised_names.sort();
+    advertised_names.dedup();
+    advertised_names.iter().map(|name| lookup(name)).collect()
+}
+
+unsafe fn nsarray_to_strings(array: *mut Object) -> Vec<String> {
+    let count: usize = msg_send![array, count];
+    (0..count)
+        .map(|index| {
+            let name: *mut Object = msg_send![array, objectAtIndex: index];
+            unsafe { nsstring_to_string(name) }
+        })
+        .collect()
+}
+
+unsafe fn collect_outputs(
+    provider: *mut Object,
+    model: *mut Object,
+    expected: Option<&HashMap<String, OperandDescriptor>>,
+) -> Result<Vec<CoremlOutput>, GraphError> {
     let feature_names: *mut Object = msg_send![provider, featureNames];
     let names_array: *mut Object = msg_send![feature_names, allObjects];
-    let count: usize = msg_send![names_array, count];
+    let advertised_names = unsafe { nsarray_to_strings(names_array) };
 
-    let mut outputs = Vec::new();
-    for idx in 0..count {
-        let name_obj: *mut Object = msg_send![names_array, objectAtIndex: idx];
-        let rust_name = unsafe { nsstring_to_string(name_obj) };
+    let lookup_error = |name: &str, detail: &str| {
+        let model_description: *mut Object = msg_send![model, modelDescription];
+        let descriptions: *mut Object = msg_send![model_description, outputDescriptionsByName];
+        let keys: *mut Object = msg_send![descriptions, allKeys];
+        let declared_names = unsafe { nsarray_to_strings(keys) };
+        let class_name: *mut Object = msg_send![provider, className];
+        let class_name = unsafe { nsstring_to_string(class_name) };
+        GraphError::CoremlRuntimeFailed {
+            reason: format!(
+                "output `{name}` {detail}; provider class={class_name}, advertised outputs={advertised_names:?}, model-declared outputs={declared_names:?}"
+            ),
+        }
+    };
+
+    collect_named_outputs(advertised_names.clone(), expected, |name| {
+        let name_obj = unsafe { nsstring_from_str(name)? };
         let value: *mut Object = msg_send![provider, featureValueForName: name_obj];
+        if value.is_null() {
+            return Err(lookup_error(name, "direct lookup returned nil"));
+        }
         let array: *mut Object = msg_send![value, multiArrayValue];
         if array.is_null() {
-            return Err(GraphError::CoremlRuntimeFailed {
-                reason: format!("output `{}` is not a MLMultiArray", rust_name),
-            });
+            let feature_type: i64 = msg_send![value, type];
+            return Err(lookup_error(
+                name,
+                &format!("direct lookup returned feature type {feature_type}, not a MLMultiArray"),
+            ));
         }
         let data_type: i64 = msg_send![array, dataType];
         let shape_nsarray: *mut Object = msg_send![array, shape];
@@ -1512,14 +1558,13 @@ unsafe fn collect_outputs(provider: *mut Object) -> Result<Vec<CoremlOutput>, Gr
         // Extract actual data from MLMultiArray
         let data = unsafe { extract_mlmultiarray_data(array, data_type, &shape)? };
 
-        outputs.push(CoremlOutput {
-            name: rust_name,
+        Ok(CoremlOutput {
+            name: name.to_string(),
             shape,
             data_type_code: data_type,
             data,
-        });
-    }
-    Ok(outputs)
+        })
+    })
 }
 
 unsafe fn extract_mlmultiarray_data(
@@ -2138,6 +2183,63 @@ mod checked_attempt_tests {
             compute_unit,
             result: Ok(outputs),
         }
+    }
+
+    #[test]
+    fn collection_queries_expected_names_missing_from_advertisement() {
+        let descriptors =
+            HashMap::from([("result".into(), descriptor(vec![Dimension::Static(2)]))]);
+        let mut queried = Vec::new();
+        let outputs = collect_named_outputs(vec![], Some(&descriptors), |name| {
+            queried.push(name.to_string());
+            Ok(output(&[2]))
+        })
+        .unwrap();
+        assert_eq!(queried, ["result"]);
+        assert_eq!(outputs[0].name, "result");
+        assert_eq!(outputs[0].data, [42., 42.]);
+    }
+
+    #[test]
+    fn collection_retains_unexpected_advertised_outputs_for_validation() {
+        let descriptors =
+            HashMap::from([("result".into(), descriptor(vec![Dimension::Static(2)]))]);
+        let mut queried = Vec::new();
+        let outputs = collect_named_outputs(
+            vec!["result".into(), "extra".into()],
+            Some(&descriptors),
+            |name| {
+                queried.push(name.to_string());
+                let mut value = output(&[2]);
+                value.name = name.into();
+                Ok(value)
+            },
+        )
+        .unwrap();
+        assert_eq!(queried, ["extra", "result"]);
+        let mut attempts = [attempt("CPU_ONLY", outputs)];
+        validate_attempt_outputs(&mut attempts, &RuntimeShapeState::new(), &descriptors);
+        assert_eq!(
+            attempts[0].result.as_ref().unwrap_err(),
+            "unexpected runtime output tensor `extra`"
+        );
+    }
+
+    #[test]
+    fn collection_propagates_failed_direct_lookup() {
+        let descriptors =
+            HashMap::from([("result".into(), descriptor(vec![Dimension::Static(2)]))]);
+        let error = collect_named_outputs(vec![], Some(&descriptors), |name| {
+            Err(GraphError::CoremlRuntimeFailed {
+                reason: format!("{name}: direct lookup returned nil"),
+            })
+        })
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("result: direct lookup returned nil")
+        );
     }
 
     #[test]

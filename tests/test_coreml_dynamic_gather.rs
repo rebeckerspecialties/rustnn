@@ -404,6 +404,46 @@ fn gather_keeps_static_indexed_axis_when_other_axis_is_dynamic() {
 }
 
 #[test]
+fn scalar_index_gather_preserves_dynamic_nonindexed_output_on_dispatch() {
+    let mut context = context();
+    let rows = dynamic("rows", 8);
+    let graph_info = gather_graph(
+        "gather",
+        Some(1),
+        vec![rows.clone(), Dimension::Static(3)],
+        vec![],
+        vec![rows],
+        Some(&[-1]),
+    );
+    let mut graph = MLGraphBuilder::new(&mut context)
+        .unwrap()
+        .build_graph_info(graph_info)
+        .unwrap();
+    for rows in [4u64, 2, 1, 4] {
+        let values: Vec<f32> = (0..rows)
+            .flat_map(|row| {
+                [
+                    10. * row as f32 + 1.,
+                    10. * row as f32 + 2.,
+                    10. * row as f32 + 3.,
+                ]
+            })
+            .collect();
+        let expected: Vec<f32> = (0..rows).map(|row| 10. * row as f32 + 3.).collect();
+        let data = data_tensor(&mut context, &[rows, 3], &values);
+        check_dispatch(
+            &mut context,
+            &mut graph,
+            &data,
+            None,
+            &[rows],
+            &expected,
+            &format!("scalar-index gather, nonindexed rows={rows}"),
+        );
+    }
+}
+
+#[test]
 fn gather_reports_actual_scalar_and_dynamic_nonindexed_output_shapes() {
     // The direct executor exposes CoreML's output shape, unlike the public
     // tensor's preallocated descriptor. It compiles separately per invocation;
