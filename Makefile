@@ -86,7 +86,7 @@ CANN_CROSS_ENV = CC_aarch64_unknown_linux_ohos=$(OHOS_SDK_NATIVE)/llvm/bin/clang
 	coverage coverage-html coverage-lcov coverage-open coverage-clean \
 	docs-serve docs-build docs-clean ci-docs docs-backend-ops docs-backend-ops-check \
 	fetch-wpt require-wpt-cache test-wpt test-wpt-trtx test-wpt-litert test-wpt-coreml \
-	test-wpt-coreml-report test-wpt-op test-wpt-report \
+	test-wpt-coreml-report test-coreml-triangular test-wpt-op test-wpt-report \
 	wpt-sync-onnx wpt-sync-litert wpt-sync-coreml wpt-sync-trtx \
 	webnn-chromedriver test-webnn-wpt-chrome test-webnn-wpt-chrome-headless \
 	onnxruntime-download onnx onnx-validate coreml coreml-validate litert cann validate-all-env
@@ -174,6 +174,9 @@ test-wpt-litert:
 
 test-wpt-coreml:
 	$(CARGO) test --test run_wpt_conformance --features coreml-runtime -- coreml --test-threads 1
+
+test-coreml-triangular:
+	$(CARGO) test --test test_coreml_triangular --features coreml-runtime,dynamic-inputs -- --test-threads=1
 
 test-wpt-coreml-report:
 	@mkdir -p reports
