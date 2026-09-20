@@ -16,6 +16,7 @@ successful prediction as conformance.
 | Band plus subtraction (PR #235) | Exact tested values | Large integers rounded |
 | Integer multiply by a 0/1 mask | Exact tested values | Large integers rounded |
 | Gather-based mask | Exact tested values | Large integers rounded |
+| Reshape / transpose pair / full slice / gatherND controls | Large integers rounded | Large integers rounded |
 | `16777217 - 16777216` | `1` | `0` |
 
 Inputs read back exactly on both systems. Results are declared and returned as
@@ -35,6 +36,7 @@ Hosted evidence:
 - [Native operator controls](https://github.com/rebeckerspecialties/rustnn/actions/runs/35538433203)
 - [Output backings and small-result subtraction](https://github.com/rebeckerspecialties/rustnn/actions/runs/35538517758)
 - [Operator-set comparison](https://github.com/rebeckerspecialties/rustnn/actions/runs/35538610708)
+- [Data movement controls](https://github.com/rebeckerspecialties/rustnn/actions/runs/35538837883)
 
 The URL-compilation workaround in #235 is insufficient on the hosted runtime.
 Do not loosen the integer assertion, silently accept rounded values, or infer
