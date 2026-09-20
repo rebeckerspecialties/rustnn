@@ -106,6 +106,18 @@ cargo test validator
 cargo test -- --nocapture
 ```
 
+### CoreML Tests
+
+On macOS, `make build-coreml` builds all targets and `make test-coreml` runs
+library, binary, and ordinary integration tests with `coreml-runtime,dynamic-inputs`.
+Use `COREML_FEATURES=coreml-runtime` with either target to test without dynamic
+inputs; CI covers both configurations. Use `TEST_FILTER=triangular` to narrow
+the test names without adding an operator-specific target.
+
+Ordinary integration suites should be named `tests/test_*.rs` so the shared
+target includes them automatically. The live WPT and browser harnesses remain
+separate: use `make fetch-wpt` followed by `make test-wpt-coreml` for CoreML WPT.
+
 ## Feature Flags
 
 The project uses Cargo feature flags to control optional functionality. The Makefile handles these automatically:

@@ -1,6 +1,6 @@
 //! Exact CoreML triangular masking regressions, including non-finite values.
 //!
-//! Run with `make test-coreml-triangular` on macOS.
+//! Run with `make test-coreml TEST_FILTER=triangular` on macOS.
 
 #[cfg(all(target_os = "macos", feature = "coreml-runtime"))]
 mod runtime {
