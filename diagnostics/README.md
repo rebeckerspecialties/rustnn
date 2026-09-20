@@ -16,7 +16,8 @@ successful prediction as conformance.
 | Band plus subtraction (PR #235) | Exact tested values | Large integers rounded |
 | Integer multiply by a 0/1 mask | Exact tested values | Large integers rounded |
 | Gather-based mask | Exact tested values | Large integers rounded |
-| Reshape / transpose pair / full slice / gatherND controls | Large integers rounded | Large integers rounded |
+| Transpose pair | Exact tested values | Large integers rounded |
+| Reshape / full slice / gatherND controls | Large integers rounded | Large integers rounded |
 | `16777217 - 16777216` | `1` | `0` |
 
 Inputs read back exactly on both systems. Results are declared and returned as
