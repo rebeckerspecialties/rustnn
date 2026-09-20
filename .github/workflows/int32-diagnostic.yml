@@ -1,0 +1,14 @@
+name: Int32 CoreML isolation
+on:
+  push:
+    branches: [diagnostics/triangular-int32]
+jobs:
+  native:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          sw_vers
+          uname -m
+          xcodebuild -version
+      - run: make -f diagnostics/Makefile probe
