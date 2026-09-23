@@ -419,7 +419,7 @@ fn scalar_index_gather_preserves_dynamic_nonindexed_output_on_dispatch() {
         .unwrap()
         .build_graph_info(graph_info)
         .unwrap();
-    for rows in [4u64, 2, 1, 4] {
+    for rows in [4u64, 2, 1, 8, 4] {
         let values: Vec<f32> = (0..rows)
             .flat_map(|row| {
                 [
@@ -440,6 +440,72 @@ fn scalar_index_gather_preserves_dynamic_nonindexed_output_on_dispatch() {
             &expected,
             &format!("scalar-index gather, nonindexed rows={rows}"),
         );
+    }
+}
+
+#[test]
+fn scalar_index_gather_preserves_singletons_on_first_middle_and_last_axes() {
+    // Include rank five, where native scalar-index gather is also problematic.
+    // Both the indexed and a retained axis vary on the same loaded model.
+    for (rank, axis, row_axis) in [(3, 0, 2), (3, 1, 0), (3, 2, 1), (5, 2, 1), (5, 4, 1)] {
+        for constant_index in [Some(-100), Some(-1), Some(100), None] {
+            let mut context = context();
+            let mut shape = vec![Dimension::Static(1); rank];
+            shape[axis] = dynamic("columns", 5);
+            shape[row_axis] = dynamic("rows", 8);
+            let mut output_shape = shape.clone();
+            output_shape.remove(axis);
+            let graph_info = gather_graph(
+                "gather",
+                Some(axis as u32),
+                shape,
+                vec![],
+                output_shape,
+                constant_index.as_ref().map(std::slice::from_ref),
+            );
+            let mut graph = MLGraphBuilder::new(&mut context)
+                .unwrap()
+                .build_graph_info(graph_info)
+                .unwrap();
+            for (rows, columns) in [(1u64, 1u64), (4, 3), (8, 5), (2, 2), (1, 1)] {
+                let mut shape = vec![1; rank];
+                shape[axis] = columns;
+                shape[row_axis] = rows;
+                let values: Vec<f32> = (0..rows * columns).map(|i| i as f32 + 1.).collect();
+                let data = data_tensor(&mut context, &shape, &values);
+                let stride: u64 = shape[axis + 1..].iter().product();
+                let mut output_shape = shape.clone();
+                output_shape.remove(axis);
+                let indices = constant_index.map_or_else(|| vec![-100, -1, 0, 100], |i| vec![i]);
+                for index in indices {
+                    let selected = if index < 0 {
+                        (columns as i32 + index).max(0)
+                    } else {
+                        index.min(columns as i32 - 1)
+                    } as usize;
+                    let expected: Vec<f32> = values
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| (i / stride as usize) % columns as usize == selected)
+                        .map(|(_, &value)| value)
+                        .collect();
+                    let indices = constant_index
+                        .is_none()
+                        .then(|| index_tensor(&mut context, &[], &[index]));
+                    check_dispatch(
+                        &mut context,
+                        &mut graph,
+                        &data,
+                        indices.as_ref(),
+                        &output_shape,
+                        &expected,
+                        &format!(
+                            "rank={rank}, axis={axis}, rows={rows}, columns={columns}, index={index}, constant={constant_index:?}"
+                        ),
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -476,7 +542,7 @@ fn gather_reports_actual_scalar_and_dynamic_nonindexed_output_shapes() {
         }
         let input_descriptors = HashMap::from([("data".into(), descriptors[0].clone())]);
         let output_descriptors = HashMap::from([("result".into(), descriptors[2].clone())]);
-        for rows in [4usize, 2] {
+        for rows in [4usize, 2, 1, 8] {
             let (shape, values, expected_shape, expected) = if scalar {
                 (
                     vec![rows],

@@ -260,6 +260,7 @@ mod mil_ops {
 // Default epsilon value used by several CoreML operations for numerical stability.
 const DEFAULT_EPSILON: f32 = 1e-45;
 
+/// Converts a graph to a CoreML MLProgram (MIL) model.
 #[derive(Default)]
 pub struct CoremlMlProgramConverter;
 
@@ -423,6 +424,38 @@ impl CoremlMlProgramConverter {
             )?,
         )?;
         Ok((name, value_type))
+    }
+
+    /// Bounds for the retained band, or its complement when the main diagonal
+    /// is excluded. MIL treats every negative width as unlimited, not an offset.
+    fn triangular_band_bounds(
+        shape: &[GraphDimension],
+        upper: bool,
+        diagonal: i32,
+    ) -> Result<(i32, i32), GraphError> {
+        if shape.len() < 2 {
+            return Err(GraphError::ConversionFailed {
+                format: "coreml_mlprogram".to_string(),
+                reason: "triangular requires an input of rank at least two".to_string(),
+            });
+        }
+        let excludes_main = (upper && diagonal > 0) || (!upper && diagonal < 0);
+        let limits_lower = upper != excludes_main;
+        let axis = shape.len() - if limits_lower { 2 } else { 1 };
+        let largest_offset = shape[axis].get_static_or_max_size().saturating_sub(1);
+        // Promote before abs so i32::MIN is valid. A wider band is equivalent
+        // for every active shape within this bound; no runtime extent is frozen.
+        let width =
+            (i64::from(diagonal).abs() - i64::from(excludes_main)).min(i64::from(largest_offset));
+        let width = i32::try_from(width).map_err(|_| GraphError::ConversionFailed {
+            format: "coreml_mlprogram".to_string(),
+            reason: "triangular band width exceeds the CoreML int32 range".to_string(),
+        })?;
+        Ok(if limits_lower {
+            (width, -1)
+        } else {
+            (-1, width)
+        })
     }
 
     fn interface_mil_data_type(data_type: &DataType) -> i32 {
@@ -5301,7 +5334,7 @@ impl CoremlMlProgramConverter {
                 );
             }
 
-            Operation::Triangular { options, .. } => {
+            Operation::Triangular { input, options, .. } => {
                 // band_part: x, lower, upper
                 if !input_names.is_empty() {
                     inputs.insert("x".to_string(), Self::create_argument(&input_names[0]));
@@ -5309,18 +5342,14 @@ impl CoremlMlProgramConverter {
 
                 // CoreML band_part uses lower and upper bounds instead of upper/diagonal
                 let is_upper = options.as_ref().and_then(|o| o.upper).unwrap_or(true);
-                let diagonal = options.as_ref().map(|o| o.diagonal as i64).unwrap_or(0);
-
-                // Convert WebNN (upper, diagonal) to CoreML (lower, upper)
-                // For upper triangle: keep diagonal and above
-                // For lower triangle: keep diagonal and below
-                let (lower_bound, upper_bound) = if is_upper {
-                    // Upper triangle: remove elements below diagonal+k
-                    (diagonal as i32, -1) // keep from diagonal+k upward
-                } else {
-                    // Lower triangle: remove elements above diagonal+k
-                    (-1, diagonal as i32) // keep from diagonal+k downward
-                };
+                let diagonal = options.as_ref().map(|o| o.diagonal).unwrap_or(0);
+                let operand = graph.operand(*input).ok_or_else(|| GraphError::ConversionFailed {
+                    format: "coreml_mlprogram".to_string(),
+                    reason: format!("triangular input operand {input} not found"),
+                })?;
+                let (lower_bound, upper_bound) = Self::triangular_band_bounds(
+                    &operand.descriptor.shape, is_upper, diagonal,
+                )?;
 
                 inputs.insert(
                     "lower".to_string(),
@@ -6210,6 +6239,49 @@ impl super::GraphConverter for CoremlMlProgramConverter {
 
                 let mut input_names =
                     Self::input_names_for_operation(graph_info, op, &operand_name_overrides);
+
+                // WebNN allows every operand data type for comparisons, but only requires
+                // float32, float16, and int32 support. CoreML's comparison operations reject
+                // int8/uint8 inputs, so losslessly promote those values to int32 in the
+                // backend-specific MIL program. Keep this legalization here rather than in the
+                // recorded GraphInfo so other backends retain their native 8-bit comparisons.
+                if matches!(
+                    op_type_lower.as_str(),
+                    "equal"
+                        | "greater"
+                        | "greaterorequal"
+                        | "lesser"
+                        | "lesserorequal"
+                        | "notequal"
+                ) {
+                    for (index, &input_id) in op.input_operands().iter().enumerate() {
+                        let input_operand = graph_info.operand(input_id).ok_or_else(|| {
+                            GraphError::ConversionFailed {
+                                format: "coreml_mlprogram".to_string(),
+                                reason: format!("Input operand {} not found", input_id),
+                            }
+                        })?;
+                        if matches!(
+                            input_operand.descriptor.data_type,
+                            DataType::Int8 | DataType::Uint8
+                        ) {
+                            let promoted_name =
+                                format!("{}_int32_{}_{}", input_names[index], output_id, index);
+                            let promoted_type = Self::create_value_with_mil_type(
+                                graph_info,
+                                input_id,
+                                promoted_name.clone(),
+                                MilDataType::Int32 as i32,
+                            )?;
+                            main_block.operations.push(Self::create_cast_operation(
+                                input_names[index].clone(),
+                                promoted_type,
+                                "int32",
+                            ));
+                            input_names[index] = promoted_name;
+                        }
+                    }
+                }
 
                 if matches!(
                     op_type_lower.as_str(),
@@ -7666,17 +7738,14 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                 }
             }
 
-            // Special handling for triangular with non-zero diagonal k.
-            // CoreML band_part(x, lower, upper) keeps the band -lower <= row-col <= upper.
-            // For upper=true, k>0: the result is input minus the band up to diagonal k-1.
-            //   result = input - band_part(input, -1, k-1)
-            // For upper=false, k<0: the result is input minus the band from diagonal -(|k|-1).
-            //   result = input - band_part(input, |k|-1, -1)
+            // band_part always retains the main diagonal. To exclude it, build
+            // the complementary band from ones and select the input or zero.
+            // Subtracting band_part(x) from x would turn masked NaN/Inf into NaN.
             if op_type_lower == "triangular" {
                 let (is_upper, diagonal) = match &op {
                     Operation::Triangular { options, .. } => (
                         options.as_ref().and_then(|o| o.upper).unwrap_or(true),
-                        options.as_ref().map(|o| o.diagonal as i64).unwrap_or(0),
+                        options.as_ref().map(|o| o.diagonal).unwrap_or(0),
                     ),
                     _ => (true, 0),
                 };
@@ -7707,63 +7776,111 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         input_id,
                         &operand_name_overrides,
                     );
-                    let dtype = Self::mil_data_type(&input_operand.descriptor.data_type)?;
-                    let dimensions = Self::mil_dimensions_from_graph_shape(
-                        &input_operand.descriptor.shape,
-                        false,
-                    );
-                    let band_value_type = ValueType {
-                        r#type: Some(
-                            crate::protos::coreml::mil_spec::value_type::Type::TensorType(
-                                TensorType {
-                                    rank: dimensions.len() as i64,
-                                    data_type: dtype,
-                                    dimensions,
-                                    attributes: HashMap::new(),
-                                },
-                            ),
-                        ),
-                    };
+                    let shape = &input_operand.descriptor.shape;
+                    let integer_input = input_operand.descriptor.data_type == DataType::Int32;
+                    let ones_name = format!("{output_name}_triangular_ones");
                     let band_name = format!("{}_triangular_band", output_name);
-
-                    // Compute band_part bounds for the subtracted region.
-                    // upper=true, k>0: subtract band_part(input, -1, k-1)
-                    // upper=false, k<0: subtract band_part(input, |k|-1, -1)
-                    let (band_lower, band_upper): (i64, i64) = if is_upper {
-                        (-1, diagonal - 1)
+                    let keep_name = format!("{output_name}_triangular_keep");
+                    let band_type = if integer_input {
+                        crate::protos::coreml::mil_spec::DataType::Int32 as i32
                     } else {
-                        ((-diagonal) - 1, -1)
+                        crate::protos::coreml::mil_spec::DataType::Float32 as i32
                     };
+                    let bool_type = crate::protos::coreml::mil_spec::DataType::Bool as i32;
+
+                    // fill_like follows the actual input shape, including both
+                    // dynamically sized matrix axes and any batch dimensions.
+                    if !integer_input {
+                        let mut fill_inputs = HashMap::new();
+                        fill_inputs.insert(
+                            "ref_tensor".to_string(),
+                            Self::create_name_argument(input_name.clone()),
+                        );
+                        fill_inputs.insert("value".to_string(), Self::create_immediate_float(1.0));
+                        main_block.operations.push(Self::create_mil_operation(
+                            "fill_like",
+                            fill_inputs,
+                            vec![Self::create_named_value_type(
+                                ones_name.clone(),
+                                band_type,
+                                shape,
+                                false,
+                            )],
+                        ));
+                    }
+
+                    let (band_lower, band_upper) =
+                        Self::triangular_band_bounds(shape, is_upper, diagonal)?;
 
                     let mut band_inputs: HashMap<String, Argument> = HashMap::new();
                     band_inputs.insert(
                         "x".to_string(),
-                        Self::create_name_argument(input_name.clone()),
+                        Self::create_name_argument(if integer_input {
+                            input_name.clone()
+                        } else {
+                            ones_name
+                        }),
                     );
                     band_inputs.insert(
                         "lower".to_string(),
-                        Self::create_immediate_int(band_lower as i32 as u32),
+                        Self::create_immediate_int(band_lower as u32),
                     );
                     band_inputs.insert(
                         "upper".to_string(),
-                        Self::create_immediate_int(band_upper as i32 as u32),
+                        Self::create_immediate_int(band_upper as u32),
                     );
                     main_block.operations.push(Self::create_mil_operation(
                         "band_part",
                         band_inputs,
-                        vec![NamedValueType {
-                            name: band_name.clone(),
-                            r#type: Some(band_value_type),
-                        }],
+                        vec![Self::create_named_value_type(
+                            band_name.clone(),
+                            band_type,
+                            shape,
+                            false,
+                        )],
                     ));
 
-                    // result = input - band
-                    let mut sub_inputs: HashMap<String, Argument> = HashMap::new();
-                    sub_inputs.insert("x".to_string(), Self::create_name_argument(input_name));
-                    sub_inputs.insert("y".to_string(), Self::create_name_argument(band_name));
+                    if integer_input {
+                        // Keep typed integer arithmetic: CoreML select can lose
+                        // int32 precision beyond 2^24 even with URL compilation.
+                        // x-x and x-0 are exact for integers and cannot overflow.
+                        let mut sub_inputs = HashMap::new();
+                        sub_inputs.insert("x".to_string(), Self::create_name_argument(input_name));
+                        sub_inputs.insert("y".to_string(), Self::create_name_argument(band_name));
+                        main_block.operations.push(Self::create_mil_operation(
+                            "sub",
+                            sub_inputs,
+                            vec![output_type],
+                        ));
+                        continue;
+                    }
+
+                    let mut equal_inputs = HashMap::new();
+                    equal_inputs.insert("x".to_string(), Self::create_name_argument(band_name));
+                    equal_inputs.insert("y".to_string(), Self::create_immediate_float(0.0));
                     main_block.operations.push(Self::create_mil_operation(
-                        "sub",
-                        sub_inputs,
+                        "equal",
+                        equal_inputs,
+                        vec![Self::create_named_value_type(
+                            keep_name.clone(),
+                            bool_type,
+                            shape,
+                            false,
+                        )],
+                    ));
+
+                    let zero = match input_operand.descriptor.data_type {
+                        DataType::Float16 => Self::create_immediate_float16(0.0),
+                        DataType::Float32 => Self::create_immediate_float(0.0),
+                        _ => Self::create_immediate_int(0),
+                    };
+                    let mut select_inputs = HashMap::new();
+                    select_inputs.insert("cond".to_string(), Self::create_name_argument(keep_name));
+                    select_inputs.insert("a".to_string(), Self::create_name_argument(input_name));
+                    select_inputs.insert("b".to_string(), zero);
+                    main_block.operations.push(Self::create_mil_operation(
+                        "select",
+                        select_inputs,
                         vec![output_type],
                     ));
 
@@ -9099,9 +9216,9 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         cast_idx_type,
                         "int32",
                     ));
-                    // Graph scalars are represented as [1] at the CoreML input
-                    // boundary. Normalize in that representation, then restore
-                    // the scalar index so gather still removes the selected axis.
+                    // Keep scalar indices as [1] through normalization and gather.
+                    // Native scalar-index gather can return an empty feature
+                    // provider for dynamic outputs on older CoreML runtimes.
                     let norm_shape = if idx_shape.is_empty() {
                         vec![GraphDimension::Static(1)]
                     } else {
@@ -9121,30 +9238,24 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         &bounds,
                         &output_name,
                     );
-                    let norm_idx = if idx_shape.is_empty() {
-                        Self::rnn_unary(
-                            &mut main_block,
-                            mil_ops::SQUEEZE,
-                            &norm_idx,
-                            format!("{output_name}_scalar_index"),
-                            MilDataType::Int32 as i32,
-                            &[],
-                        )
-                    } else {
-                        norm_idx
-                    };
-
-                    let scalar_output = graph_info
-                        .operand(output_id)
-                        .filter(|operand| operand.descriptor.shape.is_empty());
-                    let gather_output_type = if let Some(operand) = scalar_output {
+                    let squeeze_gather_axis = op_type_lower == "gather"
+                        && idx_shape.is_empty()
+                        && data_descriptor.shape.len() > 1;
+                    let gather_output_type = if squeeze_gather_axis {
+                        // The vector index retains one element on the indexed
+                        // axis. Preserve every other dimension, including unknown
+                        // extents; reshaping to their maxima would freeze them.
+                        let mut shape = data_descriptor.shape.clone();
+                        shape[axis as usize] = GraphDimension::Static(1);
                         Self::create_named_value_type(
-                            format!("{output_name}_scalar_gather"),
-                            Self::graph_value_mil_type(&operand.descriptor.data_type)?,
-                            &[],
+                            format!("{output_name}_gather_vector"),
+                            Self::graph_value_mil_type(&data_descriptor.data_type)?,
+                            &shape,
                             false,
                         )
                     } else {
+                        // A rank-one input and scalar index already produce [1],
+                        // which is also the CoreML representation of a WebNN scalar.
                         output_type.clone()
                     };
 
@@ -9167,14 +9278,23 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         gather_inputs,
                         vec![gather_output_type.clone()],
                     ));
-                    if let Some(operand) = scalar_output {
-                        Self::rnn_reshape(
-                            &mut main_block,
-                            &gather_output_type.name,
-                            &[1],
-                            output_name,
-                            Self::graph_value_mil_type(&operand.descriptor.data_type)?,
+                    if squeeze_gather_axis {
+                        let mut squeeze_inputs = HashMap::new();
+                        squeeze_inputs.insert(
+                            "x".to_string(),
+                            Self::create_name_argument(gather_output_type.name),
                         );
+                        // Do not squeeze all unit dimensions: unrelated static
+                        // ones and dynamic axes currently of size one must remain.
+                        squeeze_inputs.insert(
+                            "axes".to_string(),
+                            Self::create_immediate_int_array(&[axis]),
+                        );
+                        main_block.operations.push(Self::create_mil_operation(
+                            mil_ops::SQUEEZE,
+                            squeeze_inputs,
+                            vec![output_type],
+                        ));
                     }
                     continue;
                 }
@@ -10531,6 +10651,140 @@ mod tests {
         crate::graph::to_dimension_vector(shape)
     }
 
+    #[test]
+    fn triangular_band_widths_are_nonnegative_and_bounded() {
+        let shape = s(&[3, 5]);
+        for (upper, diagonal, expected) in [
+            (true, -1, (1, -1)),
+            (true, 0, (0, -1)),
+            (false, 0, (-1, 0)),
+            (false, 2, (-1, 2)),
+            // Excluded-main cases describe the complementary band.
+            (true, 2, (-1, 1)),
+            (false, -2, (1, -1)),
+            (true, i32::MIN, (2, -1)),
+            (false, i32::MIN, (2, -1)),
+            (true, i32::MAX, (-1, 4)),
+            (false, i32::MAX, (-1, 4)),
+        ] {
+            assert_eq!(
+                CoremlMlProgramConverter::triangular_band_bounds(&shape, upper, diagonal).unwrap(),
+                expected,
+                "upper={upper}, diagonal={diagonal}",
+            );
+        }
+        assert!(CoremlMlProgramConverter::triangular_band_bounds(&s(&[3]), true, 0).is_err());
+    }
+
+    fn triangular_graph(
+        dtype: DataType,
+        shape: Vec<GraphDimension>,
+        upper: bool,
+        diagonal: i32,
+    ) -> GraphInfo {
+        let descriptor = OperandDescriptor {
+            data_type: dtype,
+            shape,
+            pending_permutation: vec![],
+        };
+        GraphInfo {
+            operands: vec![
+                Operand {
+                    kind: OperandKind::Input,
+                    name: Some("input".into()),
+                    descriptor: descriptor.clone(),
+                },
+                Operand {
+                    kind: OperandKind::Output,
+                    name: Some("result".into()),
+                    descriptor,
+                },
+            ],
+            input_operands: vec![0],
+            output_operands: vec![1],
+            operations: vec![Operation::Triangular {
+                input: 0,
+                options: Some(crate::operator_options::MLTriangularOptions {
+                    upper: Some(upper),
+                    diagonal,
+                    ..Default::default()
+                }),
+                outputs: vec![1],
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn triangular_excluding_main_selects_instead_of_subtracting_input() {
+        for dtype in [DataType::Float16, DataType::Float32] {
+            for (upper, diagonal) in [(true, 1), (false, -1)] {
+                let graph = triangular_graph(dtype, s(&[3, 4]), upper, diagonal);
+                assert_eq!(
+                    main_operation_types(&graph),
+                    ["fill_like", "band_part", "equal", "select"]
+                );
+                let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+                let block = decode_main_block(&converted.data);
+                let select = block.operations.last().unwrap();
+                assert_eq!(
+                    select.inputs["a"],
+                    CoremlMlProgramConverter::create_argument("input")
+                );
+                let zero = match dtype {
+                    DataType::Float16 => CoremlMlProgramConverter::create_immediate_float16(0.0),
+                    _ => CoremlMlProgramConverter::create_immediate_float(0.0),
+                };
+                assert_eq!(select.inputs["b"], zero);
+                assert_eq!(
+                    block.operations[0].inputs["ref_tensor"],
+                    CoremlMlProgramConverter::create_argument("input")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn triangular_int32_excluding_main_retains_integer_subtraction() {
+        for (upper, diagonal) in [(true, 1), (false, -1)] {
+            let graph = triangular_graph(DataType::Int32, s(&[3, 4]), upper, diagonal);
+            assert_eq!(main_operation_types(&graph), ["band_part", "sub"]);
+        }
+    }
+
+    #[cfg(feature = "dynamic-inputs")]
+    #[test]
+    fn triangular_mask_keeps_symbolic_matrix_dimensions() {
+        let shape = vec![
+            GraphDimension::Static(2),
+            GraphDimension::Dynamic(DynamicDimension {
+                name: "rows".into(),
+                max_size: 8,
+            }),
+            GraphDimension::Dynamic(DynamicDimension {
+                name: "columns".into(),
+                max_size: 8,
+            }),
+        ];
+        let graph = triangular_graph(DataType::Float32, shape.clone(), true, 1);
+        let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+        let block = decode_main_block(&converted.data);
+        let expected = CoremlMlProgramConverter::mil_dimensions_from_graph_shape(&shape, false);
+        for op in &block.operations {
+            for output in &op.outputs {
+                let Some(crate::protos::coreml::mil_spec::value_type::Type::TensorType(tensor)) =
+                    output
+                        .r#type
+                        .as_ref()
+                        .and_then(|value| value.r#type.as_ref())
+                else {
+                    panic!("expected tensor");
+                };
+                assert_eq!(tensor.dimensions, expected, "{}", op.r#type);
+            }
+        }
+    }
+
     fn main_operation_types(graph: &GraphInfo) -> Vec<String> {
         let converted = CoremlMlProgramConverter
             .convert(graph)
@@ -11512,6 +11766,72 @@ mod tests {
         }
     }
 
+    #[test]
+    fn comparisons_promote_8_bit_inputs_to_int32() {
+        use crate::protos::coreml::mil_spec::DataType as MilDataType;
+
+        for data_type in [DataType::Int8, DataType::Uint8] {
+            for op_type in [
+                "equal",
+                "notEqual",
+                "greater",
+                "greaterOrEqual",
+                "lesser",
+                "lesserOrEqual",
+            ] {
+                let operand = |name: &str, kind, data_type| Operand {
+                    name: Some(name.to_string()),
+                    kind,
+                    descriptor: OperandDescriptor {
+                        data_type,
+                        shape: s(&[4]),
+                        pending_permutation: vec![],
+                    },
+                };
+                let graph = GraphInfo {
+                    operands: vec![
+                        operand("lhs", OperandKind::Input, data_type),
+                        operand("rhs", OperandKind::Input, data_type),
+                        operand("result", OperandKind::Output, DataType::Uint8),
+                    ],
+                    input_operands: vec![0, 1],
+                    output_operands: vec![2],
+                    operations: vec![op_from_operator_options(
+                        op_type,
+                        vec![0, 1],
+                        Some(2),
+                        vec![],
+                        OperatorOptions::default(),
+                    )],
+                    constant_operand_ids_to_handles: HashMap::new(),
+                    id_to_constant_tensor_operand_map: HashMap::new(),
+                    quantized: false,
+                };
+
+                let converted = CoremlMlProgramConverter
+                    .convert(&graph)
+                    .expect("CoreML 8-bit comparison conversion");
+                let main_block = decode_main_block(&converted.data);
+                let promotions: Vec<_> = main_block
+                    .operations
+                    .iter()
+                    .filter(|op| {
+                        op.r#type == mil_ops::CAST
+                            && op
+                                .outputs
+                                .first()
+                                .is_some_and(|output| output.name.contains("_int32_"))
+                    })
+                    .collect();
+                assert_eq!(promotions.len(), 2, "one promotion per {op_type} input");
+                assert!(promotions.iter().all(|op| {
+                    mil_tensor_type(op.outputs.first().expect("cast output")).data_type
+                        == MilDataType::Int32 as i32
+                }));
+            }
+        }
+    }
+
     #[cfg(feature = "dynamic-inputs")]
     #[test]
     fn test_gather_family_normalization_preserves_mixed_index_dimensions() {
@@ -11661,20 +11981,30 @@ mod tests {
                 );
                 let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
                 let block = decode_main_block(&converted.data);
-                let scalar_index = block
-                    .operations
-                    .iter()
-                    .flat_map(|operation| &operation.outputs)
-                    .find(|output| output.name == "result_scalar_index")
-                    .expect("normalized index must be restored to a scalar");
-                assert!(mil_tensor_type(scalar_index).dimensions.is_empty());
                 let gather = block
                     .operations
                     .iter()
                     .find(|operation| operation.r#type == mil_ops::GATHER)
                     .expect("gather operation");
+                let Some(Binding::Name(index_name)) =
+                    gather.inputs["indices"].arguments[0].binding.as_ref()
+                else {
+                    panic!("expected named gather indices");
+                };
+                let indices = block
+                    .operations
+                    .iter()
+                    .flat_map(|op| &op.outputs)
+                    .find(|output| &output.name == index_name)
+                    .expect("normalized gather indices");
+                let dimensions = &mil_tensor_type(indices).dimensions;
+                assert_eq!(dimensions.len(), 1);
+                assert!(matches!(
+                    dimensions[0].dimension.as_ref(),
+                    Some(dimension::Dimension::Constant(size)) if size.size == 1
+                ));
                 let tensor = mil_tensor_type(&gather.outputs[0]);
-                assert_eq!(tensor.dimensions.len(), output_shape.len());
+                assert_eq!(tensor.dimensions.len(), data_shape.len());
                 let expected_dtype = if data_type == DataType::Float32 {
                     MilDataType::Float32
                 } else {
@@ -11682,6 +12012,16 @@ mod tests {
                 };
                 assert_eq!(tensor.data_type, expected_dtype as i32);
                 assert_eq!(immediate_int_argument(&gather.inputs["axis"]), axis);
+                let output = block.operations.last().unwrap();
+                assert_eq!(output.outputs[0].name, "result");
+                assert_eq!(
+                    mil_tensor_type(&output.outputs[0]).dimensions.len(),
+                    output_shape.len().max(1)
+                );
+                if !output_shape.is_empty() {
+                    assert_eq!(output.r#type, mil_ops::SQUEEZE);
+                    assert_eq!(immediate_int_argument(&output.inputs["axes"]), axis);
+                }
             }
         }
     }

@@ -301,7 +301,7 @@ fn gather_nd_broadcasts_active_bounds_per_tuple_component() {
 }
 
 #[test]
-fn scalar_gather_normalizes_with_runtime_bounds_before_squeezing() {
+fn scalar_gather_keeps_vector_indices_and_scalar_boundary_shape() {
     let graph = graph(
         "gather",
         DataType::Float32,
@@ -324,9 +324,10 @@ fn scalar_gather_normalizes_with_runtime_bounds_before_squeezing() {
         .find(|op| op.r#type == "gather")
         .unwrap();
     let index = producer(block, named_input(gather, "indices"));
-    assert_eq!(index.r#type, "squeeze");
-    assert_type(&index.outputs[0], MilDataType::Int32, &[]);
-    assert_type(&gather.outputs[0], MilDataType::Float32, &[]);
+    assert_eq!(index.outputs[0].name, "result_gcl");
+    assert_type(&index.outputs[0], MilDataType::Int32, &[Some(1)]);
+    assert_type(&gather.outputs[0], MilDataType::Float32, &[Some(1)]);
+    assert_eq!(gather.outputs[0].name, "result");
     assert!(graph.operands[1].descriptor.shape.is_empty());
     assert!(graph.operands[2].descriptor.shape.is_empty());
     let output = &model.description.as_ref().unwrap().output[0];
@@ -336,6 +337,53 @@ fn scalar_gather_normalizes_with_runtime_bounds_before_squeezing() {
         panic!("expected array output feature");
     };
     assert_eq!(array.shape, [1]);
+}
+
+#[test]
+fn scalar_gather_squeezes_only_the_indexed_axis_and_keeps_dynamic_dimensions() {
+    for axis in 0..5 {
+        let mut data_shape = vec![
+            dynamic("batch", 4),
+            Dimension::Static(1),
+            dynamic("sequence", 8),
+            Dimension::Static(1),
+            dynamic("channels", 3),
+        ];
+        data_shape[axis] = Dimension::Static(3);
+        let mut output_shape = data_shape.clone();
+        output_shape.remove(axis);
+        let model = convert(&graph(
+            "gather",
+            DataType::Float32,
+            data_shape.clone(),
+            vec![],
+            output_shape,
+            axis as u32,
+        ));
+        let block = block(&model);
+        let gather = producer(block, "result_gather_vector");
+        assert_eq!(gather.r#type, "gather");
+        assert_type(
+            &producer(block, named_input(gather, "indices")).outputs[0],
+            MilDataType::Int32,
+            &[Some(1)],
+        );
+        let mut dimensions: Vec<_> = data_shape
+            .iter()
+            .map(|dim| match dim {
+                Dimension::Static(size) => Some(u64::from(*size)),
+                Dimension::Dynamic(_) => None,
+            })
+            .collect();
+        dimensions[axis] = Some(1);
+        assert_type(&gather.outputs[0], MilDataType::Float32, &dimensions);
+        let squeeze = producer(block, "result");
+        assert_eq!(squeeze.r#type, "squeeze");
+        assert_eq!(named_input(squeeze, "x"), gather.outputs[0].name);
+        assert_eq!(immediate_ints(&squeeze.inputs["axes"]), [axis as i32]);
+        dimensions.remove(axis);
+        assert_type(&squeeze.outputs[0], MilDataType::Float32, &dimensions);
+    }
 }
 
 #[test]
