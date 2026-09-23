@@ -21,6 +21,7 @@ use webnn_graph::serialize::SerializeOptions;
 
 use crate::error::{GraphBuilderError, GraphError, ShapeInferenceError};
 use crate::graph::{Dimension, get_static_or_max_size, to_dimension_vector};
+use crate::graph_recorder::GraphRecorder;
 use crate::mlcontext::{MLGraph, MLNamedOperands, MLOperand, MLOperandDescriptor, MLTensor};
 use crate::operator_enums::MLOperandDataType;
 use crate::operator_options::{
@@ -62,7 +63,7 @@ pub type Result<T> = std::result::Result<T, GraphBuilderError>;
 pub struct MLGraphBuilder<'context, 'builder> {
     backend: Box<dyn MLBackendBuilder<'context, 'builder> + 'builder>,
 
-    graph: Option<GraphInfo>,
+    recorder: Option<GraphRecorder>,
 }
 
 #[derive(Debug)]
@@ -263,6 +264,16 @@ fn constant_shape(
     })?;
     let shape = options
         .shape
+        .as_ref()
+        .ok_or_else(|| {
+            Box::new(ShapeInferenceError::InferError {
+                op_name: "constant",
+                operation: operation.clone(),
+                source: GraphError::ShapeInferenceFailed {
+                    reason: "constant is missing its required shape".to_string(),
+                },
+            })
+        })?
         .iter()
         .copied()
         .map(Dimension::Static)
@@ -1393,37 +1404,31 @@ fn lstm_cell_output_shapes(
 }
 
 fn gru_cell_shape(
-    input: MLOperand,
+    _input: MLOperand,
     hidden_state: MLOperand,
-    hidden_size: u32,
+    _hidden_size: u32,
     operation: &Operation,
     graph: &GraphInfo,
 ) -> Result<OperandDescriptor> {
     let hidden_state_desc = &graph.operands[hidden_state.id].descriptor;
-    if !hidden_state_desc.shape.is_empty() {
+    if hidden_state_desc.shape.len() == 2 {
         return Ok(hidden_state_desc.clone());
-    }
-
-    let input_shape = &graph.operands[input.id].descriptor.shape;
-    if input_shape.len() == 2 && hidden_size > 0 {
-        return Ok(OperandDescriptor {
-            data_type: graph.operands[input.id].descriptor.data_type,
-            shape: to_dimension_vector(&[get_static_or_max_size(&input_shape[0]), hidden_size]),
-            pending_permutation: vec![],
-        });
     }
 
     Err(Box::new(ShapeInferenceError::InferError {
         op_name: "gruCell",
         operation: operation.clone(),
         source: GraphError::ShapeInferenceFailed {
-            reason: "unable to infer gruCell output shape".to_string(),
+            reason: format!(
+                "gruCell hiddenState must be rank 2, got rank {}",
+                hidden_state_desc.shape.len()
+            ),
         },
     })
     .into())
 }
 
-fn shape_inference_multi_output(
+fn infer_descriptors_unchecked(
     operation: &Operation,
     graph: &GraphInfo,
 ) -> Result<Vec<OperandDescriptor>> {
@@ -1465,6 +1470,28 @@ fn shape_inference_multi_output(
         } => lstm_cell_output_shapes(*hidden_state, *cell_state, graph),
         op => Ok(vec![shape_inference_single_output(op, graph)?]),
     }
+}
+
+/// Canonical operation inference used by every graph construction path.
+///
+/// The operation must already contain its prospective output ids. No graph
+/// mutation occurs here.
+pub(crate) fn infer_operation_descriptors(
+    operation: &Operation,
+    graph: &GraphInfo,
+) -> Result<Vec<OperandDescriptor>> {
+    let descriptors = infer_descriptors_unchecked(operation, graph)?;
+    let expected = operation.output_operands().len();
+    if descriptors.len() != expected {
+        return Err(GraphBuilderError::InconsistentGraphInfo {
+            message: format!(
+                "operation {} inferred {} descriptors for {expected} outputs",
+                operation.op_type(),
+                descriptors.len()
+            ),
+        });
+    }
+    Ok(descriptors)
 }
 
 #[expect(unused_variables)]
@@ -2048,7 +2075,7 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
     pub fn new_uncompiled() -> MLGraphBuilder<'static, 'static> {
         MLGraphBuilder {
             backend: Box::new(UncompiledBackendBuilder),
-            graph: Some(Default::default()),
+            recorder: Some(GraphRecorder::new()),
         }
     }
 
@@ -2061,7 +2088,7 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
         let backend = context.backend.create_builder()?;
         Ok(Self {
             backend,
-            graph: Some(Default::default()),
+            recorder: Some(GraphRecorder::new()),
         })
     }
 
@@ -2077,23 +2104,16 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
 
     /// Serialize the in-progress graph (with outputs marked) as `.webnn` text for debugging.
     pub fn rustnn_webnn_text_for_outputs(&self, outputs: &MLNamedOperands) -> Option<String> {
-        let graph = self.graph.as_ref()?;
+        let mut recorder = self.recorder.as_ref()?.clone();
         if outputs.is_empty() {
             return None;
         }
-
-        let mut graph = graph.clone();
-        graph.output_operands.clear();
         for (name, operand) in outputs {
-            let op = graph.operands.get_mut(operand.id)?;
-            if op.kind == OperandKind::Input || op.kind == OperandKind::Constant {
-                return None;
-            }
-            op.kind = OperandKind::Output;
-            op.name = Some(name.to_string());
-            graph.output_operands.push(operand.id as u32);
+            recorder
+                .mark_output(operand.id as u32, name.to_string())
+                .ok()?;
         }
-        graph.output_operands.sort_unstable();
+        let graph = recorder.into_graph().ok()?;
 
         let graph_json = to_graph_json(&graph, false).ok()?;
         webnn_graph::serialize::serialize_graph_to_wg_text(
@@ -2123,7 +2143,7 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
             return Err(GraphBuilderError::EmptyOutputHashMap.into());
         }
         let graph = self
-            .graph
+            .recorder
             .as_ref()
             .ok_or(GraphBuilderError::GraphAlreadyBuilt)?;
 
@@ -2191,7 +2211,7 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
         }
 
         let mut graph = self
-            .graph
+            .recorder
             .take()
             .ok_or(GraphBuilderError::GraphAlreadyBuilt)?;
 
@@ -2211,35 +2231,8 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
                 }
             }
 
-            if let Some(op) = graph.operands.get_mut(operand.id) {
-                // spec: If operand is in this’s graph’s inputs or constants, then return a new promise in realm rejected with a TypeError.
-                if op.kind == OperandKind::Input {
-                    return Err(GraphBuilderError::RequestedInputAsOutput {
-                        operand: op.clone(),
-                        id: operand.id,
-                    }
-                    .into());
-                } else if op.kind == OperandKind::Constant {
-                    return Err(GraphBuilderError::RequestedConstantAsOutput {
-                        operand: op.clone(),
-                        id: operand.id,
-                    }
-                    .into());
-                }
-                op.kind = OperandKind::Output;
-                op.name = Some(name.to_string());
-            } else {
-                return Err(GraphBuilderError::BuildWithInvalidOperand {
-                    operand: *operand,
-                    name: name.to_string(),
-                }
-                .into());
-            }
-            graph.output_operands.push(operand.id as u32);
+            graph.mark_output(operand.id as u32, name.to_string())?;
         }
-        // HashMap iteration order is nondeterministic; keep output_operands in operand-index order.
-        graph.output_operands.sort_unstable();
-
         debug!("Building graph with {} operands", graph.operands.len());
         // Verbose info for small graphs
         if graph.operands.len() < 20 {
@@ -2257,7 +2250,7 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
             });
         }
 
-        Ok(graph)
+        graph.into_graph().map_err(Into::into)
     }
 
     /// Debug tool to check operand shape
@@ -2268,7 +2261,7 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
         // this should be either &[MLDimension] or &[u32], &[u64], whatever shape the public API has
     ) -> crate::error::Result<Vec<u64>> {
         let graph = self
-            .graph
+            .recorder
             .as_mut()
             .ok_or(GraphBuilderError::GraphAlreadyBuilt)?;
         operand.shape(graph)
@@ -2282,7 +2275,7 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
         // this should be either MLDimension or &[u32]
     ) -> crate::error::Result<MLOperandDataType> {
         let graph = self
-            .graph
+            .recorder
             .as_mut()
             .ok_or(GraphBuilderError::GraphAlreadyBuilt)?;
         operand.data_type(graph)
@@ -2297,22 +2290,12 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
         descriptor: &MLOperandDescriptor,
     ) -> crate::error::Result<MLOperand> {
         debug!("Adding input {name:?} {descriptor:?}");
-        let operand = Operand {
-            descriptor: descriptor.into(),
-            kind: OperandKind::Input,
-            name: Some(name.to_string()),
-        };
-
-        let graph = self
-            .graph
+        let id = self
+            .recorder
             .as_mut()
-            .ok_or(GraphBuilderError::GraphAlreadyBuilt)?;
-
-        let id = graph.operands.len();
-        graph.operands.push(operand);
-        graph.input_operands.push(id as u32);
-
-        Ok(MLOperand { id })
+            .ok_or(GraphBuilderError::GraphAlreadyBuilt)?
+            .add_input(name.to_string(), descriptor.into());
+        Ok(MLOperand { id: id as usize })
     }
 
     // MLGraphBuilder.constant
@@ -2344,31 +2327,21 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
             .into());
         }
 
-        let operand = Operand {
-            descriptor: descriptor.into(),
-            kind: OperandKind::Constant,
-            name: None,
-        };
-
-        let graph = self
-            .graph
+        let recorder = self
+            .recorder
             .as_mut()
             .ok_or(GraphBuilderError::GraphAlreadyBuilt)?;
-
-        let id = graph.operands.len();
-        graph.operands.push(operand);
-        graph
-            .id_to_constant_tensor_operand_map
-            .insert(id as u32, format!("{id}"));
-        graph.constant_operand_ids_to_handles.insert(
-            id as u32,
+        let id = recorder.graph().operands.len() as u32;
+        recorder.add_constant(
+            None,
+            descriptor.into(),
             crate::ConstantData {
                 data: bytemuck::cast_slice(values.as_slice()).to_vec(),
                 label: None,
             },
+            Some(id.to_string()),
         );
-
-        Ok(MLOperand { id })
+        Ok(MLOperand { id: id as usize })
     }
 
     /// Constant copied from a slice of plain-old-data values; the byte size must match
@@ -2403,27 +2376,18 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
             }
             .into());
         }
-        let operand = Operand {
-            descriptor: descriptor.into(),
-            kind: OperandKind::Constant,
-            name: None,
-        };
-
-        let graph = self
-            .graph
+        let recorder = self
+            .recorder
             .as_mut()
             .ok_or(GraphBuilderError::GraphAlreadyBuilt)?;
-
-        let id = graph.operands.len();
-        graph.operands.push(operand);
-        graph
-            .id_to_constant_tensor_operand_map
-            .insert(id as u32, format!("{id}"));
-        graph
-            .constant_operand_ids_to_handles
-            .insert(id as u32, crate::ConstantData { data, label: None });
-
-        Ok(MLOperand { id })
+        let id = recorder.graph().operands.len() as u32;
+        recorder.add_constant(
+            None,
+            descriptor.into(),
+            crate::ConstantData { data, label: None },
+            Some(id.to_string()),
+        );
+        Ok(MLOperand { id: id as usize })
     }
 
     /// Scalar constant from a single value. Not implemented yet; use
@@ -2444,7 +2408,7 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
         build: impl FnOnce(u32, u32, Option<Options>) -> Operation,
     ) -> Result<MLOperand> {
         let output_id = self
-            .graph
+            .recorder
             .as_mut()
             .ok_or(GraphBuilderError::GraphAlreadyBuilt)?
             .operands
@@ -2460,7 +2424,7 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
         build: impl FnOnce(u32, u32, u32, Option<Options>) -> Operation,
     ) -> Result<MLOperand> {
         let output_id = self
-            .graph
+            .recorder
             .as_mut()
             .ok_or(GraphBuilderError::GraphAlreadyBuilt)?
             .operands
@@ -2477,7 +2441,7 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
         build: impl FnOnce(u32, u32, u32, u32, Option<Options>) -> Operation,
     ) -> Result<MLOperand> {
         let output_id = self
-            .graph
+            .recorder
             .as_mut()
             .ok_or(GraphBuilderError::GraphAlreadyBuilt)?
             .operands
@@ -2500,7 +2464,7 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
         build: impl FnOnce(u32, u32, Option<u32>, u32, Option<Options>) -> Operation,
     ) -> Result<MLOperand> {
         let output_id = self
-            .graph
+            .recorder
             .as_mut()
             .ok_or(GraphBuilderError::GraphAlreadyBuilt)?
             .operands
@@ -2636,7 +2600,7 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
         options: MLSplitOptions,
     ) -> Result<Vec<MLOperand>> {
         let graph = self
-            .graph
+            .recorder
             .as_mut()
             .ok_or(GraphBuilderError::GraphAlreadyBuilt)?;
         let output_ids: Vec<u32> = (0u32..splits.len() as u32)
@@ -2662,7 +2626,7 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
         options: MLSplitOptions,
     ) -> Result<Vec<MLOperand>> {
         let graph = self
-            .graph
+            .recorder
             .as_mut()
             .ok_or(GraphBuilderError::GraphAlreadyBuilt)?;
         let output_ids: Vec<u32> = (0u32..num_splits)
@@ -2770,7 +2734,7 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
         options: MLSliceOptions,
     ) -> Result<MLOperand> {
         let graph = self
-            .graph
+            .recorder
             .as_mut()
             .ok_or(GraphBuilderError::GraphAlreadyBuilt)?;
         let output_id = graph.operands.len();
@@ -3166,7 +3130,7 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
         options: MLGatherOptions,
     ) -> Result<MLOperand> {
         let output_id = self
-            .graph
+            .recorder
             .as_mut()
             .ok_or(GraphBuilderError::GraphAlreadyBuilt)?
             .operands
@@ -3194,7 +3158,7 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
         options: MLGatherOptions,
     ) -> Result<MLOperand> {
         let output_id = self
-            .graph
+            .recorder
             .as_mut()
             .ok_or(GraphBuilderError::GraphAlreadyBuilt)?
             .operands
@@ -3243,7 +3207,7 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
         options: MLOperatorOptions,
     ) -> Result<MLOperand> {
         let graph = self
-            .graph
+            .recorder
             .as_mut()
             .ok_or(GraphBuilderError::GraphAlreadyBuilt)?;
         let output_id = graph.operands.len();
@@ -3258,52 +3222,25 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
 
     fn add_single_output_operation(&mut self, operation: Operation) -> Result<MLOperand> {
         trace!("Adding operation {operation:?}");
-        let graph = self
-            .graph
+        let recorder = self
+            .recorder
             .as_mut()
             .ok_or(GraphBuilderError::GraphAlreadyBuilt)?;
-        let output_id = graph.operands.len();
-
-        let output_operand = Operand {
-            kind: OperandKind::Intermediate,
-            descriptor: shape_inference_single_output(&operation, graph)?,
-            name: (!operation.label().is_empty()).then(|| operation.label().to_string()),
-        };
-        trace!("  Adding operand {output_operand:?}");
-        graph.operands.push(output_operand);
-        graph.operations.push(operation);
-
-        Ok(MLOperand { id: output_id })
+        let mut outputs = recorder.record_operation(operation, None)?;
+        if outputs.len() != 1 {
+            return Err(GraphBuilderError::InconsistentGraphInfo {
+                message: format!("single-output insertion returned {} outputs", outputs.len()),
+            });
+        }
+        Ok(outputs.remove(0))
     }
 
     fn add_multi_output_operation(&mut self, operation: Operation) -> Result<Vec<MLOperand>> {
         trace!("Adding operation {operation:?}");
-        let graph = self
-            .graph
+        self.recorder
             .as_mut()
-            .ok_or(GraphBuilderError::GraphAlreadyBuilt)?;
-        let mut splits = shape_inference_multi_output(&operation, graph)?;
-
-        let mut output = vec![];
-        let name_prefix = operation
-            .label()
-            .is_empty()
-            .then(|| operation.label().to_string());
-
-        for (i, s) in splits.drain(..).enumerate() {
-            let output_id = graph.operands.len();
-            let output_operand = Operand {
-                kind: OperandKind::Intermediate,
-                descriptor: s,
-                name: name_prefix.as_ref().map(|prefix| format!("{prefix}_{i}")),
-            };
-            trace!(" Adding operand {output_operand:?}");
-            graph.operands.push(output_operand);
-            output.push(MLOperand { id: output_id })
-        }
-        graph.operations.push(operation);
-
-        Ok(output)
+            .ok_or(GraphBuilderError::GraphAlreadyBuilt)?
+            .record_operation(operation, None)
     }
 
     /// Gated recurrent unit over `steps` time steps. Returns the final hidden state
@@ -3320,7 +3257,7 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
     ) -> Result<Vec<MLOperand>> {
         let output_count = if options.return_sequence { 2 } else { 1 };
         let graph = self
-            .graph
+            .recorder
             .as_mut()
             .ok_or(GraphBuilderError::GraphAlreadyBuilt)?;
         let base = graph.operands.len() as u32;
@@ -3349,7 +3286,7 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
         options: MLGruCellOptions,
     ) -> Result<MLOperand> {
         let graph = self
-            .graph
+            .recorder
             .as_mut()
             .ok_or(GraphBuilderError::GraphAlreadyBuilt)?;
         let output_id = graph.operands.len() as u32;
@@ -3378,7 +3315,7 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
     ) -> Result<Vec<MLOperand>> {
         let output_count = if options.return_sequence { 3 } else { 2 };
         let graph = self
-            .graph
+            .recorder
             .as_mut()
             .ok_or(GraphBuilderError::GraphAlreadyBuilt)?;
         let base = graph.operands.len() as u32;
@@ -3409,7 +3346,7 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
         options: MLLstmCellOptions,
     ) -> Result<Vec<MLOperand>> {
         let graph = self
-            .graph
+            .recorder
             .as_mut()
             .ok_or(GraphBuilderError::GraphAlreadyBuilt)?;
         let base = graph.operands.len() as u32;
@@ -3438,6 +3375,10 @@ mod test {
             MLOperandDescriptor, MLPowerPreference, MLTensorDescriptor,
         },
         mlgraphbuilder::MLGraphBuilder,
+        operator_options::{
+            MLDimension, MLGemmOptions, MLSplitOptions, MLSqueezeOptions, MLUnsqueezeOptions,
+        },
+        operators::Operation,
     };
 
     #[test]
@@ -3481,6 +3422,42 @@ mod test {
     }
 
     #[test]
+    fn builder_and_graph_json_loader_record_equivalent_static_graphs() {
+        let descriptor = MLOperandDescriptor::new(
+            crate::operator_enums::MLOperandDataType::Float32,
+            vec![2, 3],
+        );
+        let mut builder = MLGraphBuilder::new_uncompiled();
+        let input = builder.input("input", &descriptor).unwrap();
+        let result = builder.relu(input).unwrap();
+        let mut outputs = MLNamedOperands::new();
+        outputs.insert("result", result);
+        let built = builder.finish_graph_info(&outputs).unwrap();
+
+        let json = crate::webnn_json::to_graph_json(&built, false).unwrap();
+        let loaded = crate::webnn_json::from_graph_json(&json).unwrap();
+
+        assert_eq!(loaded.input_operands, built.input_operands);
+        assert_eq!(loaded.output_operands, built.output_operands);
+        assert_eq!(loaded.operations.len(), built.operations.len());
+        assert_eq!(
+            loaded.operations[0].op_type(),
+            built.operations[0].op_type()
+        );
+        assert_eq!(loaded.operands.len(), built.operands.len());
+        for (actual, expected) in loaded.operands.iter().zip(&built.operands) {
+            assert_eq!(actual.kind, expected.kind);
+            assert_eq!(actual.name, expected.name);
+            assert_eq!(actual.descriptor.data_type, expected.descriptor.data_type);
+            assert_eq!(actual.descriptor.shape, expected.descriptor.shape);
+            assert_eq!(
+                actual.descriptor.pending_permutation,
+                expected.descriptor.pending_permutation
+            );
+        }
+    }
+
+    #[test]
     fn add_inputs() {
         let _ = pretty_env_logger::try_init();
         let context = MLContext::create(&MLContextOptions::new(MLPowerPreference::Default, true));
@@ -3499,7 +3476,7 @@ mod test {
 
         let a = builder.input("a", &desc).unwrap();
         let b = builder.input("b", &desc).unwrap();
-        assert_eq!(builder.graph.as_ref().unwrap().operands.len(), 2);
+        assert_eq!(builder.recorder.as_ref().unwrap().operands.len(), 2);
 
         let mut outputs = MLNamedOperands::new();
         outputs.insert("out1", a);
@@ -3516,7 +3493,7 @@ mod test {
         let mut builder = MLGraphBuilder::new(&mut context).unwrap();
         let a = builder.input("a", &desc).unwrap();
         let b = builder.input("b", &desc).unwrap();
-        assert_eq!(builder.graph.as_ref().unwrap().operands.len(), 2);
+        assert_eq!(builder.recorder.as_ref().unwrap().operands.len(), 2);
         let out1 = builder.identity(a).unwrap();
         let out2 = builder.add(a, b).unwrap();
         let mut outputs = MLNamedOperands::new();
@@ -3812,6 +3789,97 @@ mod test {
     }
 
     #[test]
+    fn rustnn_save_webnn_round_trips_packed_4bit_constants_and_executes() {
+        let _ = pretty_env_logger::try_init();
+        let context = MLContext::create(&MLContextOptions::new(MLPowerPreference::Default, false));
+        if matches!(context, Err(crate::error::Error::NoBackendAvailable { .. })) {
+            return;
+        }
+        let mut context = context.unwrap();
+
+        let uint4_desc =
+            MLOperandDescriptor::new(crate::operator_enums::MLOperandDataType::Uint4, vec![3]);
+        let int4_desc =
+            MLOperandDescriptor::new(crate::operator_enums::MLOperandDataType::Int4, vec![4]);
+        let scale_desc =
+            MLOperandDescriptor::new(crate::operator_enums::MLOperandDataType::Float32, vec![1]);
+        let output_desc =
+            MLOperandDescriptor::new(crate::operator_enums::MLOperandDataType::Float32, vec![7]);
+        let uint4_bytes = crate::graph::pack_uint4(&[0, 7, 15]);
+        let int4_bytes = crate::graph::pack_int4(&[-8, -1, 0, 7]);
+
+        let mut builder = MLGraphBuilder::new(&mut context).unwrap();
+        let uint4 = builder
+            .constant_from_bytes(&uint4_desc, uint4_bytes.clone())
+            .unwrap();
+        let int4 = builder
+            .constant_from_bytes(&int4_desc, int4_bytes.clone())
+            .unwrap();
+        let scale = builder.constant_from_slice(&scale_desc, &[1.0f32]).unwrap();
+        let uint4_float = builder.dequantize_linear(uint4, scale).unwrap();
+        let int4_float = builder.dequantize_linear(int4, scale).unwrap();
+        let output = builder.concat(&[uint4_float, int4_float], 0).unwrap();
+        let mut named_outputs = MLNamedOperands::new();
+        named_outputs.insert("output", output);
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let webnn_path = temp_dir.path().join("packed-4bit.webnn");
+        builder
+            .rustnn_save_webnn(&named_outputs, &webnn_path)
+            .unwrap();
+        drop(builder);
+
+        let archive_bytes = std::fs::read(webnn_path.with_extension("safetensors")).unwrap();
+        let (_, metadata) = safetensors::SafeTensors::read_metadata(&archive_bytes).unwrap();
+        assert_eq!(
+            metadata
+                .metadata()
+                .as_ref()
+                .and_then(|metadata| metadata.get(webnn_graph::PACKED_4BIT_METADATA_KEY))
+                .map(String::as_str),
+            Some(webnn_graph::PACKED_4BIT_METADATA_VERSION)
+        );
+        let archive = safetensors::SafeTensors::deserialize(&archive_bytes).unwrap();
+        let saved_uint4 = archive.tensor("operand_0").unwrap();
+        assert_eq!(saved_uint4.dtype(), safetensors::Dtype::U8);
+        assert_eq!(saved_uint4.shape(), [2]);
+        assert_eq!(saved_uint4.data(), uint4_bytes);
+        let saved_int4 = archive.tensor("operand_1").unwrap();
+        assert_eq!(saved_int4.dtype(), safetensors::Dtype::U8);
+        assert_eq!(saved_int4.shape(), [2]);
+        assert_eq!(saved_int4.data(), int4_bytes);
+        assert_eq!(
+            archive.tensor("operand_2").unwrap().dtype(),
+            safetensors::Dtype::F32
+        );
+
+        let loaded = crate::load_graph_from_path(&webnn_path).unwrap();
+        assert_eq!(
+            loaded.operands[0].descriptor.data_type,
+            crate::graph::DataType::Uint4
+        );
+        assert_eq!(loaded.operands[0].descriptor.static_or_max_shape(), vec![3]);
+        assert_eq!(loaded.constant_operand_ids_to_handles[&0].data, uint4_bytes);
+        assert_eq!(
+            loaded.operands[1].descriptor.data_type,
+            crate::graph::DataType::Int4
+        );
+        assert_eq!(loaded.operands[1].descriptor.static_or_max_shape(), vec![4]);
+        assert_eq!(loaded.constant_operand_ids_to_handles[&1].data, int4_bytes);
+
+        let mut graph = context.rustnn_build_graph(loaded).unwrap();
+        let mut output_tensor_desc = MLTensorDescriptor::from_operand_descriptor(&output_desc);
+        output_tensor_desc.set_readable(true);
+        let output_tensor = context.create_tensor(&output_tensor_desc).unwrap();
+        let inputs = MLNamedTensors::new();
+        let outputs = MLNamedTensors::from([("output", &output_tensor)]);
+        context.dispatch(&mut graph, &inputs, &outputs).unwrap();
+        let mut actual = vec![0.0f32; 7];
+        context.read_tensor(&output_tensor, &mut actual).unwrap();
+        assert_eq!(actual, vec![0.0, 7.0, 15.0, -8.0, -1.0, 0.0, 7.0]);
+    }
+
+    #[test]
     fn rustnn_save_webnn_emits_named_constant_weight_ref() {
         let _ = pretty_env_logger::try_init();
         let context = MLContext::create(&MLContextOptions::new(MLPowerPreference::Default, true));
@@ -3926,5 +3994,262 @@ mod test {
             }
         );
         assert!(!webnn_path.exists());
+    }
+
+    #[test]
+    fn rustnn_saved_shape_operations_reload_and_execute() {
+        let _ = pretty_env_logger::try_init();
+        let context = MLContext::create(&MLContextOptions::new(MLPowerPreference::Default, false));
+        if matches!(context, Err(crate::error::Error::NoBackendAvailable { .. })) {
+            return;
+        }
+        let mut context = context.unwrap();
+        let input_desc = MLOperandDescriptor::new(
+            crate::operator_enums::MLOperandDataType::Float32,
+            vec![1, 4],
+        );
+
+        let mut builder = MLGraphBuilder::new(&mut context).unwrap();
+        let input = builder.input("input", &input_desc).unwrap();
+        let sliced = builder
+            .slice(
+                input,
+                &[0, 0],
+                &[MLDimension::Static(1), MLDimension::Static(2)],
+            )
+            .unwrap();
+        let concatenated = builder.concat(&[sliced, sliced], 1).unwrap();
+        let reshaped = builder
+            .reshape(
+                concatenated,
+                vec![MLDimension::Static(2), MLDimension::Static(2)],
+            )
+            .unwrap();
+        let expanded = builder
+            .unsqueeze_with_options(
+                reshaped,
+                MLUnsqueezeOptions {
+                    axes: vec![0],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let squeezed = builder
+            .squeeze_with_options(
+                expanded,
+                MLSqueezeOptions {
+                    axes: vec![0],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut named_outputs = MLNamedOperands::new();
+        named_outputs.insert("output", squeezed);
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let webnn_path = temp_dir.path().join("shape-ops.webnn");
+        builder
+            .rustnn_save_webnn(&named_outputs, &webnn_path)
+            .unwrap();
+        drop(builder);
+
+        let text = std::fs::read_to_string(&webnn_path).unwrap();
+        assert!(text.contains("starts=[0, 0]"));
+        assert!(text.contains("sizes=[1, 2]"));
+        assert!(text.contains("axis=1"));
+        assert!(text.contains("newShape=[2, 2]"));
+        assert!(text.contains("unsqueeze("));
+        assert!(text.contains("squeeze("));
+        assert!(text.contains("axes=[0]"));
+
+        let loaded = crate::load_graph_from_path(&webnn_path).unwrap();
+        let output_id = loaded.output_operands[0];
+        assert_eq!(
+            loaded.operands[output_id as usize]
+                .descriptor
+                .static_or_max_shape(),
+            vec![2, 2]
+        );
+        let mut graph = context.rustnn_build_graph(loaded).unwrap();
+
+        let mut input_tensor_desc = MLTensorDescriptor::from_operand_descriptor(&input_desc);
+        input_tensor_desc.set_writable(true);
+        let output_operand_desc = MLOperandDescriptor::new(
+            crate::operator_enums::MLOperandDataType::Float32,
+            vec![2, 2],
+        );
+        let mut output_tensor_desc =
+            MLTensorDescriptor::from_operand_descriptor(&output_operand_desc);
+        output_tensor_desc.set_readable(true);
+        let input_tensor = context.create_tensor(&input_tensor_desc).unwrap();
+        let output_tensor = context.create_tensor(&output_tensor_desc).unwrap();
+        context
+            .write_tensor(&input_tensor, &[1.0f32, 2.0, 3.0, 4.0])
+            .unwrap();
+        let inputs = MLNamedTensors::from([("input", &input_tensor)]);
+        let outputs = MLNamedTensors::from([("output", &output_tensor)]);
+        context.dispatch(&mut graph, &inputs, &outputs).unwrap();
+        let mut actual = vec![0.0f32; 4];
+        context.read_tensor(&output_tensor, &mut actual).unwrap();
+        assert_eq!(actual, vec![1.0, 2.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn rustnn_saved_gemm_bias_reloads_by_operand_name_and_executes() {
+        let _ = pretty_env_logger::try_init();
+        let context = MLContext::create(&MLContextOptions::new(MLPowerPreference::Default, false));
+        if matches!(context, Err(crate::error::Error::NoBackendAvailable { .. })) {
+            return;
+        }
+        let mut context = context.unwrap();
+        let matrix_desc = MLOperandDescriptor::new(
+            crate::operator_enums::MLOperandDataType::Float32,
+            vec![2, 2],
+        );
+        let bias_desc =
+            MLOperandDescriptor::new(crate::operator_enums::MLOperandDataType::Float32, vec![2]);
+
+        let mut builder = MLGraphBuilder::new(&mut context).unwrap();
+        let input = builder.input("input", &matrix_desc).unwrap();
+        let weights = builder
+            .constant_from_slice(&matrix_desc, &[1.0f32, 0.0, 0.0, 1.0])
+            .unwrap();
+        let bias = builder
+            .constant_from_slice(&bias_desc, &[10.0f32, 20.0])
+            .unwrap();
+        let output = builder
+            .gemm_with_options(
+                input,
+                weights,
+                MLGemmOptions {
+                    c: Some(bias.id as u32),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut named_outputs = MLNamedOperands::new();
+        named_outputs.insert("output", output);
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let webnn_path = temp_dir.path().join("gemm.webnn");
+        builder
+            .rustnn_save_webnn(&named_outputs, &webnn_path)
+            .unwrap();
+        drop(builder);
+
+        let text = std::fs::read_to_string(&webnn_path).unwrap();
+        let gemm_line = text.lines().find(|line| line.contains("gemm(")).unwrap();
+        assert!(gemm_line.contains("c=\"operand_2\""));
+
+        let loaded = crate::load_graph_from_path(&webnn_path).unwrap();
+        let c = loaded
+            .operations
+            .iter()
+            .find_map(|operation| match operation {
+                Operation::Gemm { options, .. } => options.as_ref().and_then(|options| options.c),
+                _ => None,
+            })
+            .expect("reloaded Gemm bias operand");
+        assert_eq!(
+            loaded.operands[c as usize].descriptor.static_or_max_shape(),
+            vec![2]
+        );
+        let mut graph = context.rustnn_build_graph(loaded).unwrap();
+
+        let mut input_tensor_desc = MLTensorDescriptor::from_operand_descriptor(&matrix_desc);
+        input_tensor_desc.set_writable(true);
+        let mut output_tensor_desc = MLTensorDescriptor::from_operand_descriptor(&matrix_desc);
+        output_tensor_desc.set_readable(true);
+        let input_tensor = context.create_tensor(&input_tensor_desc).unwrap();
+        let output_tensor = context.create_tensor(&output_tensor_desc).unwrap();
+        context
+            .write_tensor(&input_tensor, &[1.0f32, 2.0, 3.0, 4.0])
+            .unwrap();
+        let inputs = MLNamedTensors::from([("input", &input_tensor)]);
+        let outputs = MLNamedTensors::from([("output", &output_tensor)]);
+        context.dispatch(&mut graph, &inputs, &outputs).unwrap();
+        let mut actual = vec![0.0f32; 4];
+        context.read_tensor(&output_tensor, &mut actual).unwrap();
+        assert_eq!(actual, vec![11.0, 22.0, 13.0, 24.0]);
+    }
+
+    #[test]
+    fn rustnn_saved_split_outputs_reload_and_execute() {
+        let _ = pretty_env_logger::try_init();
+        let context = MLContext::create(&MLContextOptions::new(MLPowerPreference::Default, false));
+        if matches!(context, Err(crate::error::Error::NoBackendAvailable { .. })) {
+            return;
+        }
+        let mut context = context.unwrap();
+        let input_desc = MLOperandDescriptor::new(
+            crate::operator_enums::MLOperandDataType::Float32,
+            vec![1, 4],
+        );
+
+        let mut builder = MLGraphBuilder::new(&mut context).unwrap();
+        let input = builder.input("input", &input_desc).unwrap();
+        let split = builder
+            .split_with_options(
+                input,
+                &[1, 3],
+                MLSplitOptions {
+                    axis: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut named_outputs = MLNamedOperands::new();
+        named_outputs.insert("left", split[0]);
+        named_outputs.insert("right", split[1]);
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let webnn_path = temp_dir.path().join("split.webnn");
+        builder
+            .rustnn_save_webnn(&named_outputs, &webnn_path)
+            .unwrap();
+        drop(builder);
+
+        let loaded = crate::load_graph_from_path(&webnn_path).unwrap();
+        let output_shapes = loaded
+            .output_operands
+            .iter()
+            .map(|&id| {
+                loaded.operands[id as usize]
+                    .descriptor
+                    .static_or_max_shape()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(output_shapes, vec![vec![1, 1], vec![1, 3]]);
+        let mut graph = context.rustnn_build_graph(loaded).unwrap();
+
+        let mut input_tensor_desc = MLTensorDescriptor::from_operand_descriptor(&input_desc);
+        input_tensor_desc.set_writable(true);
+        let mut left_desc = MLTensorDescriptor::from_operand_descriptor(&MLOperandDescriptor::new(
+            crate::operator_enums::MLOperandDataType::Float32,
+            vec![1, 1],
+        ));
+        left_desc.set_readable(true);
+        let mut right_desc =
+            MLTensorDescriptor::from_operand_descriptor(&MLOperandDescriptor::new(
+                crate::operator_enums::MLOperandDataType::Float32,
+                vec![1, 3],
+            ));
+        right_desc.set_readable(true);
+        let input_tensor = context.create_tensor(&input_tensor_desc).unwrap();
+        let left_tensor = context.create_tensor(&left_desc).unwrap();
+        let right_tensor = context.create_tensor(&right_desc).unwrap();
+        context
+            .write_tensor(&input_tensor, &[1.0f32, 2.0, 3.0, 4.0])
+            .unwrap();
+        let inputs = MLNamedTensors::from([("input", &input_tensor)]);
+        let outputs = MLNamedTensors::from([("left", &left_tensor), ("right", &right_tensor)]);
+        context.dispatch(&mut graph, &inputs, &outputs).unwrap();
+
+        let mut left = vec![0.0f32; 1];
+        let mut right = vec![0.0f32; 3];
+        context.read_tensor(&left_tensor, &mut left).unwrap();
+        context.read_tensor(&right_tensor, &mut right).unwrap();
+        assert_eq!(left, vec![1.0]);
+        assert_eq!(right, vec![2.0, 3.0, 4.0]);
     }
 }
