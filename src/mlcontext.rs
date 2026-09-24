@@ -34,8 +34,8 @@ use std::collections::BTreeMap;
 use std::{collections::HashMap, fmt::Display, marker::PhantomData};
 
 pub use crate::mlcontextoptions::{
-    CoremlOptions, LiteRtOptions, MLContextOptions, MLPowerPreference, OrtOptions, RustNNOptions,
-    TrtxOptions,
+    CoremlOptions, CoremlTensorStatistics, LiteRtOptions, MLContextOptions, MLPowerPreference,
+    OrtOptions, RustNNOptions, TrtxOptions,
 };
 
 /// <https://www.w3.org/TR/webnn/#typedefdef-mlnamedtensors>
@@ -75,6 +75,9 @@ pub(crate) trait ListDevices {
 
 // could make public later if interface stabilized
 pub(crate) trait MLBackendContext<'context>: std::fmt::Debug + Send + Sync {
+    fn coreml_tensor_statistics(&self) -> Option<CoremlTensorStatistics> {
+        None
+    }
     fn accelerated(&self) -> bool;
     fn create_builder<'builder>(
         &mut self,
@@ -738,6 +741,12 @@ impl<'context> MLContext<'context> {
         max_shape: &[u64],
     ) -> Result<()> {
         self.backend.rustnn_set_tensor_capacity(tensor, max_shape)
+    }
+
+    /// Cumulative tensor I/O counters for a CoreML context, or `None` for another backend.
+    /// Counts only rustnn-side work, not internal CoreML/driver copies or hardware placement.
+    pub fn rustnn_coreml_tensor_statistics(&self) -> Option<CoremlTensorStatistics> {
+        self.backend.coreml_tensor_statistics()
     }
 }
 

@@ -159,3 +159,57 @@ The hint fixes the backend; the device is still whatever that backend reports fo
 so `accelerated = true` on an ONNX Runtime build without a GPU execution provider prints `Cpu`.
 
 The selection order and the per-backend requirements are described in [Backends](backends.md).
+
+### CoreML KV-cache benchmark
+
+`examples/coreml_kv_benchmark.rs` compares the byte-buffer reference path (`baseline`),
+persistent native arrays (`persistent`), and optional output backings (`backings`). It uses
+real `MLContext` dispatch and distinct ping-pong cache tensors. It is a fixture-specific
+TinyStories probe, not a general text-generation example or held-out language-quality test.
+The frozen dynamic TinyStories graphs also require the separate runtime reshape/expand
+lowerings under development in the fork. They are not supplied by tensor reuse; without
+those identical prerequisites on both sides, prefill fails before timing starts.
+
+Supply the frozen fixture externally: `graphs/fp32_prefill.json`, `graphs/fp32_decode.json`,
+`Resources/streams.json`, `Resources/boundary.json`, per-step little-endian float32 logits in
+`Resources/references/fp32_cache/<stream>/<step:03>.f32`, and cache checkpoints in
+`Resources/cache-references/<stream>/<step:03>/<past_tensor_name>.f32`. Stream manifests carry
+`vocab`, `atol`, `rtol` and `streams` (`name` and `steps`, each with a full `tokens` prefix).
+The example expects eight layers, 16 attention heads and head size four. Weights and oracle
+files are not downloaded automatically or bundled in the repository.
+
+```json
+{
+  "fixture_root": "/path/to/frozen-fixture",
+  "output": "/path/to/results/baseline.json",
+  "policy": "cpuOnly",
+  "mode": "baseline",
+  "streams": ["greedy_0", "boundary_grow"],
+  "steps": 128,
+  "warmups": 2,
+  "repeats": 5,
+  "min_measured_seconds": 30
+}
+```
+
+```bash
+make benchmark-coreml-kv COREML_KV_CONFIG=/path/to/config.json
+```
+
+Repeat with each mode and reverse the order in a second round. Use identical model and
+reference hashes, compiler options, compute policy and lowering prerequisites in all modes.
+The target disables release LTO; mobile host applications must also disable cross-language
+LTO when their Rust/Xcode LLVM versions are incompatible. Keep other workloads idle.
+
+Each configuration first checks all logits, available cache checkpoints, output independence
+and tensor I/O counters. Timed replays must reproduce the verification fingerprint. Decode
+timing includes input updates, shape changes, dispatch, logits readback and greedy selection;
+it excludes compilation, prefill, oracle comparison and disk I/O. Reports include sustained
+goodput, 32-token windows, latency percentiles and actual loaded compute policy. Compute
+policy is not proof of placement, and logical copy counters are not total driver traffic.
+
+Flexible outputs cannot use CoreML backings; zero accepted backings means any improvement is
+from persistent input storage and reduced host copying. A `smollm_model` configuration probes
+import/build/nonempty-cache dispatch readiness only. Its output explicitly records that no
+numerical reference was validated, so it must not be reported as a SmolLM quality or throughput
+benchmark.

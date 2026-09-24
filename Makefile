@@ -7,6 +7,7 @@ ONNX_PATH ?= target/graph.onnx
 COREML_PATH ?= target/graph.mlmodel
 COREMLC_PATH ?= target/graph.mlmodelc
 COREML_FEATURES ?= coreml-runtime,dynamic-inputs
+COREML_KV_CONFIG ?=
 TEST_FILTER ?=
 LITERT_PATH ?= target/graph.tflite
 CANN_PATH ?= target/graph.cann
@@ -90,7 +91,7 @@ CANN_CROSS_ENV = CC_aarch64_unknown_linux_ohos=$(OHOS_SDK_NATIVE)/llvm/bin/clang
 	coverage coverage-html coverage-lcov coverage-open coverage-clean \
 	docs-serve docs-build docs-clean ci-docs docs-api docs-backend-ops docs-backend-ops-check \
 	fetch-wpt require-wpt-cache test-wpt test-wpt-trtx test-wpt-litert test-wpt-coreml \
-	test-wpt-coreml-report build-coreml test-coreml test-wpt-op test-wpt-report test-wpt-cann \
+	test-wpt-coreml-report build-coreml test-coreml benchmark-coreml-kv test-wpt-op test-wpt-report test-wpt-cann \
 	wpt-sync-onnx wpt-sync-litert wpt-sync-coreml wpt-sync-trtx wpt-sync-cann \
 	webnn-chromedriver test-webnn-wpt-chrome test-webnn-wpt-chrome-headless \
 	onnxruntime-download onnx onnx-validate coreml coreml-validate litert cann \
@@ -188,6 +189,11 @@ build-coreml:
 # have their own targets and corpus/device setup; do not run them here.
 test-coreml:
 	$(CARGO) test --lib --bins --test 'test_*' --no-default-features --features $(COREML_FEATURES) -- $(TEST_FILTER) --test-threads=1
+
+# Requires a frozen model/reference fixture; correctness gates run before timing.
+benchmark-coreml-kv:
+	@test -n "$(COREML_KV_CONFIG)" || (echo "Set COREML_KV_CONFIG to the benchmark JSON configuration"; exit 1)
+	CARGO_PROFILE_RELEASE_LTO=false $(CARGO) run --release --features coreml-runtime,dynamic-inputs --example coreml_kv_benchmark -- "$(COREML_KV_CONFIG)"
 
 test-wpt-coreml-report:
 	@mkdir -p reports
@@ -461,6 +467,7 @@ help:
 	@echo "CoreML Conversion:"
 	@echo "  coreml             - Convert graph to CoreML format"
 	@echo "  coreml-validate    - Convert and validate CoreML graph"
+	@echo "  benchmark-coreml-kv - Measure KV-cache reuse with COREML_KV_CONFIG=..."
 	@echo "  build-coreml       - Build all targets with CoreML and dynamic inputs (macOS)"
 	@echo "  test-coreml        - Run CoreML unit/integration tests (optional TEST_FILTER=triangular)"
 	@echo "                       Set COREML_FEATURES=coreml-runtime to disable dynamic inputs"
