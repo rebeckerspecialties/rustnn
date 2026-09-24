@@ -105,12 +105,16 @@
 
 pub mod backend_selection;
 pub mod backends;
+#[cfg(feature = "capi")]
+pub mod capi;
 pub mod converters;
 pub mod debug;
 pub mod error;
 pub mod executors;
 pub mod graph;
+mod graph_recorder;
 pub mod graphviz;
+pub mod limits;
 pub mod loader;
 pub mod mlcontext;
 pub mod mlcontextoptions;
@@ -141,12 +145,8 @@ pub use error::GraphError;
 pub use executors::cann::{CannInput, CannOutput};
 #[cfg(feature = "onnx-runtime")]
 pub use executors::onnx::{
-    OnnxInput, OnnxOutput, OnnxOutputWithData, TensorData, run_onnx_with_inputs,
-    run_onnx_with_inputs_checked, run_onnx_zeroed,
-};
-#[cfg(any(feature = "trtx-runtime-mock", feature = "trtx-runtime"))]
-pub use executors::trtx::{
-    TrtxInput, TrtxOutput, TrtxOutputWithData, run_trtx_with_inputs, run_trtx_zeroed,
+    OnnxInput, OnnxOutput, OnnxOutputWithData, TensorData, run_onnx_path_with_inputs,
+    run_onnx_with_inputs, run_onnx_with_inputs_checked, run_onnx_zeroed,
 };
 pub use graph::{ConstantData, DataType, GraphInfo, Operand, OperandDescriptor, OperandKind};
 pub use graphviz::graph_to_dot;

@@ -34,6 +34,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-cli
 
 [features]
 default = []
+capi = ["dep:pretty_env_logger"]
 dynamic-inputs = []
 coreml-runtime = ["objc", "block"]
 onnx-runtime = ["ort", "ndarray"]
@@ -147,19 +148,18 @@ ort = { version = "=2.0.0-rc.13", optional = true, features = [
     "api-27",
 ] }
 half = "2.4"
-safetensors = "0.7"
 trtx = { version = "0.8.0", optional = true }
 litert = { version = "0.2.1", optional = true }
 litert-sys = { version = "0.2.1", optional = true }
 flatbuffers = { version = "25.12", optional = true }
 regex = "1.11"
-hiai-rs = { git = "https://github.com/rustnn/hiai-rs", rev = "a7b8ae5", optional = true }
+hiai-rs = { version = "0.1.0", optional = true }
 webnn-graph = { git = "https://github.com/rustnn/webnn-graph", branch = "main" }
 webnn-onnx-utils = { git = "https://github.com/rustnn/webnn-onnx-utils", branch = "main" }
 
 cudarc = { version = "0.19", features = ["cuda-13020"], optional = true }
 log = "0.4.29"
-pretty_env_logger = "0.5.0"
+pretty_env_logger = { version = "0.5.0", optional = true }
 seahash = "4.1.0"
 dirs = "6.0.0"
 zstd = { version = "0.13", optional = true }
@@ -192,6 +192,7 @@ cc = "1.0"
 seahash = "4.1.0"
 
 [dev-dependencies]
+safetensors = "0.7"
 half = "2.4"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 dirs = "6.0.0"
@@ -228,3 +229,62 @@ required-features = ["native-examples"]
 name = "rustnn"
 crate-type = ["rlib"]
 doctest = false
+
+[package.metadata.capi.header]
+# Used as header file name. By default this is equal to the crate name.
+# The name can be with or without the header filename extension `.h`
+name = "rustnn"
+# Install the header into a subdirectory with the name of the crate. This
+# is enabled by default, pass `false` or "" to disable it.
+subdirectory = "rustnn"
+# Generate the header file with `cbindgen`, or copy a pre-generated header
+# from the `assets` subdirectory. By default a header is generated.
+generation = true
+# Can be use to disable header generation completely.
+# This can be used when generating dynamic modules instead of an actual library.
+enabled = true
+
+[package.metadata.capi.pkg_config]
+# Used as the package name in the pkg-config file and defaults to the crate name.
+name = "rustnn"
+# Used as the pkg-config file name and defaults to the crate name.
+filename = "rustnn"
+# Used as the package description in the pkg-config file and defaults to the crate description.
+description = "C API for the rustnn WebNN implementation"
+# Used as the package version in the pkg-config file and defaults to the crate version.
+version = "0.5.11"
+# Used as the Requires field in the pkg-config file, if defined
+#requires = "gstreamer-1.0, gstreamer-base-1.0"
+# Used as the Requires.private field in the pkg-config file, if defined
+#requires_private = "gobject-2.0, glib-2.0 >= 2.56.0, gmodule-2.0"
+# Strip the include search path from the last n components, useful to support installing in a
+# subdirectory but then include with the path. By default it is 0.
+#strip_include_path_components = 0
+
+[package.metadata.capi.library]
+# Used as the library name and defaults to the crate name. This might get
+# prefixed with `lib` depending on the target platform.
+name = "rustnn"
+# Used as library version and defaults to the crate version. How this is used
+# depends on the target platform.
+version = "0.5.11"
+# Used to disable versioning links when installing the dynamic library
+versioning = true
+# Instead of using semver, select a fixed number of version components for your SONAME version suffix:
+# Setting this to 1 with a version of 0.0.0 allows a suffix of `.so.0`
+# Setting this to 3 always includes the full version in the SONAME (indicate any update is ABI breaking)
+#version_suffix_components = 2
+# Add `-Cpanic=abort` to the RUSTFLAGS automatically, it may be useful in case
+# something might panic in the crates used by the library.
+rustflags = "-Cpanic=abort"
+# Used to disable the generation of additional import library file in platforms
+# that have the concept such as Windows
+import_library = true
+
+[package.metadata.capi.install.data]
+subdirectory = "rustnn"
+asset = [
+    { from = "cmake/rustnnConfig.cmake.in", to = "rustnn/cmake" },
+    { from = "cmake/rustnnConfig.cmake", to = "rustnn/cmake" },
+    { from = "cmake/rustnnConfigVersion.cmake", to = "rustnn/cmake" },
+]
