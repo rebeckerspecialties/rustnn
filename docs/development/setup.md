@@ -23,7 +23,7 @@ The default build needs no native runtime beyond the prerequisites above.
 | Cargo feature | Additional requirements |
 |---|---|
 | `onnx-runtime` | The pinned ONNX Runtime; `make onnxruntime-download` installs it and the related Make targets configure `ORT_DYLIB_PATH` |
-| `coreml-runtime` | macOS and Xcode Command Line Tools; CoreML is supplied by macOS. Some in-memory execution paths require macOS 15+ |
+| `coreml-runtime` | Xcode and system CoreML on macOS/iOS; see the [CoreML guide](../integration/coreml.md) for deployment requirements and the tvOS dependency caveat |
 | `trtx-runtime`, `trtx-enterprise` | A compatible NVIDIA GPU and driver, CUDA 13.0, and a loadable TensorRT-RTX runtime |
 | `litert-runtime` | `flatc` on `PATH` plus the native LiteRT library provisioned by `litert-sys`; WPT runs also configure its library search path |
 | `cann-runtime` | An OHOS/Ascend HiAI environment and `libcann_shim.so` (or `CANN_SHIM_PATH`) |
@@ -48,6 +48,7 @@ Use the Makefile targets; they set feature flags and environment variables consi
 | `viz` | Export the sample graph as Graphviz DOT |
 | `onnx`, `onnx-validate` | Convert the sample graph to ONNX (`GRAPH_FILE=...` selects another graph); also execute it with ONNX Runtime |
 | `coreml`, `coreml-validate` | CoreML conversion and execution (macOS) |
+| `benchmark-coreml-kv COREML_KV_CONFIG=...` | Sustained CoreML tensor-reuse comparison with an external frozen model/reference fixture; see [Examples](../user-guide/examples.md#coreml-kv-cache-benchmark) |
 | `litert`, `cann` | LiteRT and CANN conversion of the sample graph |
 | `validate-cann-env`, `cann-build`, `cann-device-test` | OpenHarmony toolchain check, cross build, device test through `hdc`; see [CANN](../integration/cann.md) |
 | `validate-all-env` | Build, unit tests, ONNX and CoreML validation in one run |

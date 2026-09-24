@@ -1,4 +1,4 @@
-//! Minimal CoreML execution bridge for macOS.
+//! Minimal CoreML execution bridge for macOS, iOS and tvOS.
 //! Loads a `.mlmodel`, compiles it if needed, and runs a zeroed inference
 //! using CoreML's Objective-C API.
 
@@ -22,17 +22,27 @@ use crate::error::GraphError;
 use crate::graph::{DataType, Dimension, OperandDescriptor, get_static_or_max_size};
 use crate::runtime_checks::{RuntimeShapeState, TensorKind, validate_shape_data_length};
 
+#[path = "coreml_tensor.rs"]
+mod tensor_storage;
+pub(crate) use tensor_storage::{CoremlTensorBinding, CoremlTensorStorage, run_coreml_tensors};
+
+impl CompiledCoremlModel {
+    pub(crate) fn compute_unit(&self) -> &'static str {
+        self.compute_unit
+    }
+}
+
 // Link against the system frameworks we use.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 #[link(name = "Foundation", kind = "framework")]
 unsafe extern "C" {}
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 #[link(name = "CoreML", kind = "framework")]
 unsafe extern "C" {}
 
 // Objective-C++ exception firewall (src/executors/coreml_shim.mm).
 // Return codes: 0 = success, 1 = NSError, 2 = NSException, 3 = C++ exception.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 unsafe extern "C" {
     fn rustnn_coreml_compile(
         model_url: *mut Object,
@@ -57,8 +67,12 @@ unsafe extern "C" {
 }
 
 // Shims to check compilation on Linux
-/// Always-failing stand-in for the CoreML shim; only exists off macOS so the feature compiles.
-#[cfg(not(target_os = "macos"))]
+/// Always-failing stand-in for targets without the native CoreML shim.
+///
+/// # Safety
+/// This stand-in does not dereference its pointer arguments. Its unsafe signature
+/// mirrors the native shim; no output pointers are initialized on failure.
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 pub unsafe extern "C" fn rustnn_coreml_compile(
     _model_url: *mut Object,
     _out_url: *mut *mut Object,
@@ -67,8 +81,12 @@ pub unsafe extern "C" fn rustnn_coreml_compile(
 ) -> i32 {
     1
 }
-/// Always-failing stand-in for the CoreML shim; only exists off macOS so the feature compiles.
-#[cfg(not(target_os = "macos"))]
+/// Always-failing stand-in for targets without the native CoreML shim.
+///
+/// # Safety
+/// This stand-in does not dereference its pointer arguments. Its unsafe signature
+/// mirrors the native shim; no output pointers are initialized on failure.
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 pub unsafe extern "C" fn rustnn_coreml_load(
     _compiled_url: *mut Object,
     _configuration: *mut Object,
@@ -78,8 +96,12 @@ pub unsafe extern "C" fn rustnn_coreml_load(
 ) -> i32 {
     1
 }
-/// Always-failing stand-in for the CoreML shim; only exists off macOS so the feature compiles.
-#[cfg(not(target_os = "macos"))]
+/// Always-failing stand-in for targets without the native CoreML shim.
+///
+/// # Safety
+/// This stand-in does not dereference its pointer arguments. Its unsafe signature
+/// mirrors the native shim; no output pointers are initialized on failure.
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 pub unsafe extern "C" fn rustnn_coreml_predict(
     _model: *mut Object,
     _features: *mut Object,
@@ -880,12 +902,16 @@ unsafe fn extract_multiarray_bytes(
         // Int32, not Float32 — do not route it through normalize_dtype_code here.
         let is_float = matches!(actual_dtype_code as i32, 32 | 65568 | 16 | 65552);
         let ints: Vec<i32> = if is_float {
-            raw.chunks_exact(4)
-                .map(|c| f32::from_le_bytes(c.try_into().unwrap()) as i32)
+            raw.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c) as i32)
                 .collect()
         } else {
-            raw.chunks_exact(4)
-                .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+            raw.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| i32::from_le_bytes(*c))
                 .collect()
         };
         let packed = if matches!(descriptor.data_type, DataType::Int4) {

@@ -21,6 +21,8 @@
 - The documentation site combines three generated parts: MkDocs pages from `docs/`, rustdoc from
   `make docs-api`, and the WPT dashboard cached by the nightly workflow. Test a docs change
   locally with `make ci-docs` and `make docs-api`.
+- `benchmark-coreml-kv` is a manual device benchmark, not a CI timing gate. It needs a frozen
+  model/reference fixture; the tensor-storage integration tests run under `make test-coreml`.
 
 ## Pages deployment
 
