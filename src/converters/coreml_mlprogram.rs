@@ -13302,6 +13302,31 @@ mod tests {
     }
 
     #[test]
+    fn inferred_reshape_checks_static_axes_even_when_products_match() {
+        for size in [i32::MAX as u32, i32::MAX as u32 + 1, u32::MAX] {
+            let input = [
+                GraphDimension::Dynamic(crate::graph::DynamicDimension {
+                    name: "sequence".into(),
+                    max_size: 8,
+                }),
+                GraphDimension::Static(size),
+            ];
+            let target = [
+                MLDimension::Static(size),
+                MLDimension::Dynamic(crate::operator_options::MLDynamicDimension {
+                    name: "sequence".into(),
+                    max_size: 8,
+                }),
+            ];
+            assert_eq!(
+                CoremlMlProgramConverter::inferred_reshape_target(&input, &target),
+                i32::try_from(size).ok().map(|size| vec![size, -1]),
+                "equal products must not bypass MIL int32 bounds: {size}"
+            );
+        }
+    }
+
+    #[test]
     fn inferred_reshape_requires_matching_nonzero_products_and_one_equal_label() {
         use crate::graph::DynamicDimension;
         let input_dynamic = |name: &str, max_size| {
