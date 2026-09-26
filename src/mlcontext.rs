@@ -251,6 +251,19 @@ pub struct MLGraph<'context> {
 }
 
 impl<'context> MLGraph<'context> {
+    /// Inspect CoreML's successful load policy, route and preceding failures.
+    ///
+    /// Returns `None` for other backends. This RustNN extension reports loading,
+    /// not measured operator placement or prediction-time scheduling decisions.
+    #[cfg(feature = "coreml-runtime")]
+    pub fn rustnn_coreml_load_diagnostics(
+        &self,
+    ) -> Option<&crate::executors::coreml::CoremlLoadDiagnostics> {
+        self.backend
+            .as_coreml_model()
+            .map(|graph| graph.load_diagnostics())
+    }
+
     pub(crate) fn new(backend: MLBackendGraph<'context>, graph_info: &GraphInfo) -> Result<Self> {
         let (input_descriptors, output_descriptors) = graph_info
             .io_binding_maps()

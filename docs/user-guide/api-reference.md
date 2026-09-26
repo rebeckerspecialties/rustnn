@@ -19,6 +19,11 @@ locally into `target/doc/rustnn/`).
   quantization zero points) hold operand indices: pass `operand.rustnn_index()` or
   `operand.into()`.
 - Methods that are not part of the WebNN specification carry the `rustnn_` prefix.
+
+With `coreml-runtime`, `MLGraph::rustnn_coreml_load_diagnostics()` exposes the requested and
+loaded policies, loading route and earlier failures. It returns `None` for other backends.
+These are load diagnostics, not accelerator-placement measurements; see the
+[CoreML backend](../integration/coreml.md#selection-and-devices).
 - The API is synchronous. `dispatch`, `read_tensor` and `write_tensor` return when the work is
   done.
 - Results are `rustnn::error::Result<T>`, an alias for `Result<T, rustnn::error::Error>`.
