@@ -21,8 +21,8 @@ pub mod wpt_tensor;
 pub mod wpt_types;
 
 use tolerance::{
-    FloatErrorMetrics, IntegerErrorMetrics, check_integer_tolerance, float_error_metrics,
-    get_operation_tolerance, integer_error_metrics, validate_result,
+    FloatErrorMetrics, IntegerErrorMetrics, cann_fp16_tolerance, check_integer_tolerance,
+    float_error_metrics, get_operation_tolerance, integer_error_metrics, validate_result,
 };
 use wpt_audit::WptAuditCollector;
 use wpt_backend::WptBackend;
@@ -38,23 +38,7 @@ const SUPPORTED_DTYPES: &[&str] = &[
     "float32", "float16", "int8", "uint8", "int32", "uint32", "int64", "uint64", "int4", "uint4",
 ];
 
-/// Skip WPT cases whose operation is not supported by the selected backend.
-pub fn should_skip_test_by_ops(
-    backend_prefix: &str,
-    operation: &str,
-    _graph: &WptGraph,
-) -> Option<String> {
-    if backend_prefix == "litert"
-        && rustnn::backends::litert::unsupported_ops().contains(&operation)
-    {
-        return Some(format!(
-            "operation '{operation}' not supported by litert backend"
-        ));
-    }
-    None
-}
-
-/// Skip WPT cases whose inputs or expected outputs use unsupported tensor dtypes.
+/// Skip WPT cases whose inputs or expected outputs use dtypes no backend accepts.
 pub fn should_skip_test_by_dtype(
     backend_prefix: &str,
     operation: &str,
@@ -69,17 +53,9 @@ pub fn should_skip_test_by_dtype(
             return Some(format!("unsupported dataType: {dt}"));
         }
         if backend_prefix == "litert" {
-            if dt.eq_ignore_ascii_case("float16") || spec.shape().len() >= 5 {
-                return Some(
-                    "float16/5D tensor not implemented for litert backend yet".to_string(),
-                );
-            }
             // TODO: Needs Investigation
             if operation == "transpose" && spec.shape().is_empty() {
                 return Some("transpose 0D not supported by litert backend".to_string());
-            }
-            if rustnn::backends::litert::dtype_unsupported_for_op(dt, operation) {
-                return Some(format!("dtype '{dt}' not supported by litert backend"));
             }
         }
     }
@@ -395,6 +371,14 @@ pub fn run_one_test_case_with_audit(
     let graph_op_refs: Vec<&str> = graph_op_names.iter().map(String::as_str).collect();
     let (tolerance_kind, tolerance_value) =
         get_operation_tolerance(operation, test_case.tolerance.as_ref(), &graph_op_refs);
+    // The CANN/HiAI NPU executes in fp16 even for float32 I/O; compare at fp16
+    // significance so conformant fp16 arithmetic is not judged as a float32
+    // failure.
+    let (tolerance_kind, tolerance_value) = if backend.trial_prefix() == "cann" {
+        cann_fp16_tolerance(tolerance_kind, tolerance_value)
+    } else {
+        (tolerance_kind, tolerance_value)
+    };
     let wpt_ulp_only = test_case
         .tolerance
         .as_ref()

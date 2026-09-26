@@ -31,8 +31,10 @@ distinction between numeric and named sizes.
 
 This does not repair an export that already replaced a shape dependency with a
 literal maximum. In particular, SmolLM's existing literal `4096` slice still needs
-the original ONNX shape dependency preserved by its exporter. See the
-[SmolLM tracker](https://github.com/rustnn/rustnn/issues/222).
+the original ONNX shape dependency preserved by its exporter. Producer-based
+Slice/Range provenance is tracked in
+[webnn-graph #20](https://github.com/rustnn/webnn-graph/issues/20), separately from
+this lowering. See also the [SmolLM tracker](https://github.com/rustnn/rustnn/issues/222).
 
 The lowering uses the existing MIL `slice_by_size` operation, without an opset
 increase. Zero-extent prediction support is a separate limitation. Tests cover
