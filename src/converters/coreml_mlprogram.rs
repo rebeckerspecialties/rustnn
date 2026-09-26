@@ -37,7 +37,7 @@ use crate::protos::coreml::mil_spec::{
 };
 use crate::protos::coreml::specification::Model;
 use prost::Message;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Convert zero_point byte data from a source dtype to a target dtype.
 /// Only Int32 → Uint8 and Int32 → Int8 are supported; all other pairs are returned as-is.
@@ -360,7 +360,7 @@ impl CoremlMlProgramConverter {
                     rank: dimensions.len() as i64,
                     data_type,
                     dimensions,
-                    attributes: HashMap::new(),
+                    attributes: BTreeMap::new(),
                 }),
             ),
         };
@@ -624,11 +624,11 @@ impl CoremlMlProgramConverter {
                     offset,
                 })),
             };
-            let mut attributes = HashMap::new();
+            let mut attributes = BTreeMap::new();
             attributes.insert("val".to_string(), blob_file_value);
             return Ok(MilOperation {
                 r#type: "const".to_string(),
-                inputs: HashMap::new(),
+                inputs: BTreeMap::new(),
                 outputs: vec![output_type],
                 attributes,
                 ..Default::default()
@@ -772,12 +772,12 @@ impl CoremlMlProgramConverter {
 
         // Create const operation
         // Note: const operations in CoreML MIL use attributes, not inputs, for the value
-        let mut attributes = HashMap::new();
+        let mut attributes = BTreeMap::new();
         attributes.insert("val".to_string(), immediate_value);
 
         Ok(MilOperation {
             r#type: "const".to_string(),
-            inputs: HashMap::new(),
+            inputs: BTreeMap::new(),
             outputs: vec![output_type],
             attributes,
             ..Default::default()
@@ -787,7 +787,7 @@ impl CoremlMlProgramConverter {
     /// Create a MIL operation
     fn create_mil_operation(
         op_type: &str,
-        inputs: HashMap<String, Argument>,
+        inputs: BTreeMap<String, Argument>,
         outputs: Vec<NamedValueType>,
     ) -> MilOperation {
         MilOperation {
@@ -848,7 +848,7 @@ impl CoremlMlProgramConverter {
                             },
                         )),
                     }],
-                    attributes: HashMap::new(),
+                    attributes: BTreeMap::new(),
                 })),
             }),
             value: Some(value::Value::ImmediateValue(value::ImmediateValue {
@@ -883,7 +883,7 @@ impl CoremlMlProgramConverter {
                     data_type: MilDataType::Int32 as i32,
                     rank: 0, // Scalar
                     dimensions: vec![],
-                    attributes: HashMap::new(),
+                    attributes: BTreeMap::new(),
                 })),
             }),
             value: Some(value::Value::ImmediateValue(value::ImmediateValue {
@@ -924,7 +924,7 @@ impl CoremlMlProgramConverter {
                             dimension::ConstantDimension { size: 1 },
                         )),
                     }],
-                    attributes: HashMap::new(),
+                    attributes: BTreeMap::new(),
                 })),
             }),
             value: Some(value::Value::ImmediateValue(value::ImmediateValue {
@@ -958,7 +958,7 @@ impl CoremlMlProgramConverter {
                     data_type: MilDataType::Float32 as i32,
                     rank: 0, // Scalar
                     dimensions: vec![],
-                    attributes: HashMap::new(),
+                    attributes: BTreeMap::new(),
                 })),
             }),
             value: Some(value::Value::ImmediateValue(value::ImmediateValue {
@@ -997,7 +997,7 @@ impl CoremlMlProgramConverter {
                     data_type: MilDataType::Float16 as i32,
                     rank: 0, // Scalar
                     dimensions: vec![],
-                    attributes: HashMap::new(),
+                    attributes: BTreeMap::new(),
                 })),
             }),
             value: Some(value::Value::ImmediateValue(value::ImmediateValue {
@@ -1034,7 +1034,7 @@ impl CoremlMlProgramConverter {
                     data_type: MilDataType::String as i32,
                     rank: 0, // Scalar string
                     dimensions: vec![],
-                    attributes: HashMap::new(),
+                    attributes: BTreeMap::new(),
                 })),
             }),
             value: Some(value::Value::ImmediateValue(value::ImmediateValue {
@@ -1069,7 +1069,7 @@ impl CoremlMlProgramConverter {
                     data_type: MilDataType::Bool as i32,
                     rank: 0, // Scalar
                     dimensions: vec![],
-                    attributes: HashMap::new(),
+                    attributes: BTreeMap::new(),
                 })),
             }),
             value: Some(value::Value::ImmediateValue(value::ImmediateValue {
@@ -1115,7 +1115,7 @@ impl CoremlMlProgramConverter {
                     data_type: MilDataType::Int32 as i32,
                     rank: 0, // Scalar
                     dimensions: vec![],
-                    attributes: HashMap::new(),
+                    attributes: BTreeMap::new(),
                 })),
             }),
             value: Some(value::Value::ImmediateValue(value::ImmediateValue {
@@ -1158,7 +1158,7 @@ impl CoremlMlProgramConverter {
                             },
                         )),
                     }],
-                    attributes: HashMap::new(),
+                    attributes: BTreeMap::new(),
                 })),
             }),
             value: Some(value::Value::ImmediateValue(value::ImmediateValue {
@@ -1287,7 +1287,7 @@ impl CoremlMlProgramConverter {
         output_type: NamedValueType,
         dtype: &str,
     ) -> MilOperation {
-        let mut inputs = HashMap::new();
+        let mut inputs = BTreeMap::new();
         inputs.insert("x".to_string(), Self::create_name_argument(input_name));
         inputs.insert("dtype".to_string(), Self::create_immediate_string(dtype));
         Self::create_mil_operation(mil_ops::CAST, inputs, vec![output_type])
@@ -1337,7 +1337,7 @@ impl CoremlMlProgramConverter {
             .collect::<Result<Vec<_>, GraphError>>()?;
 
         // Create inputs
-        let mut inputs: HashMap<String, Argument> = HashMap::new();
+        let mut inputs: BTreeMap<String, Argument> = BTreeMap::new();
 
         // Add main input (x)
         inputs.insert("x".to_string(), Self::create_name_argument(input_name));
@@ -1687,7 +1687,7 @@ impl CoremlMlProgramConverter {
         dtype: i32,
         out_shape: &[u32],
     ) -> String {
-        let mut inputs = HashMap::new();
+        let mut inputs = BTreeMap::new();
         inputs.insert("x".to_string(), Self::create_name_argument(x.to_string()));
         inputs.insert("y".to_string(), Self::create_name_argument(y.to_string()));
         inputs.insert(
@@ -1714,7 +1714,7 @@ impl CoremlMlProgramConverter {
         dtype: i32,
         shape: &[u32],
     ) -> String {
-        let mut inputs = HashMap::new();
+        let mut inputs = BTreeMap::new();
         inputs.insert("x".to_string(), Self::create_name_argument(x.to_string()));
         inputs.insert("y".to_string(), Self::create_name_argument(y.to_string()));
         let ty = Self::value_type_for_static_shape(out_name.clone(), dtype, shape);
@@ -1735,7 +1735,7 @@ impl CoremlMlProgramConverter {
         dtype: i32,
         shape: &[GraphDimension],
     ) -> String {
-        let mut inputs = HashMap::new();
+        let mut inputs = BTreeMap::new();
         inputs.insert("x".to_string(), Self::create_name_argument(x.to_string()));
         inputs.insert("y".to_string(), Self::create_name_argument(y.to_string()));
         let ty = Self::create_named_value_type(out_name.clone(), dtype, shape, false);
@@ -1769,7 +1769,7 @@ impl CoremlMlProgramConverter {
         dtype: i32,
         shape: &[u32],
     ) -> String {
-        let mut inputs = HashMap::new();
+        let mut inputs = BTreeMap::new();
         inputs.insert("x".to_string(), Self::create_name_argument(x.to_string()));
         let ty = Self::value_type_for_static_shape(out_name.clone(), dtype, shape);
         block
@@ -1787,7 +1787,7 @@ impl CoremlMlProgramConverter {
         out_name: String,
         dtype: i32,
     ) -> String {
-        let mut inputs = HashMap::new();
+        let mut inputs = BTreeMap::new();
         inputs.insert("x".to_string(), Self::create_name_argument(x.to_string()));
         inputs.insert("begin".to_string(), Self::create_immediate_int_array(begin));
         inputs.insert("size".to_string(), Self::create_immediate_int_array(size));
@@ -1821,11 +1821,11 @@ impl CoremlMlProgramConverter {
                 value: Some(value::immediate_value::Value::Tensor(tv)),
             })),
         };
-        let mut attrs = HashMap::new();
+        let mut attrs = BTreeMap::new();
         attrs.insert("val".to_string(), imm);
         block.operations.push(MilOperation {
             r#type: "const".to_string(),
-            inputs: HashMap::new(),
+            inputs: BTreeMap::new(),
             outputs: vec![ct],
             attributes: attrs,
             ..Default::default()
@@ -1897,7 +1897,7 @@ impl CoremlMlProgramConverter {
             );
             block.operations.push(Self::create_mil_operation(
                 "shape",
-                HashMap::from([("x".to_string(), Self::create_name_argument(shape_input))]),
+                BTreeMap::from([("x".to_string(), Self::create_name_argument(shape_input))]),
                 vec![shape_type],
             ));
             let bound_shape = [dimensions.len() as u32];
@@ -1995,7 +1995,7 @@ impl CoremlMlProgramConverter {
         out_name: String,
         dtype: i32,
     ) -> String {
-        let mut inputs = HashMap::new();
+        let mut inputs = BTreeMap::new();
         inputs.insert("x".to_string(), Self::create_name_argument(x.to_string()));
         inputs.insert("shape".to_string(), Self::create_immediate_int_array(shape));
         let ty = Self::value_type_for_static_shape(out_name.clone(), dtype, shape);
@@ -2014,7 +2014,7 @@ impl CoremlMlProgramConverter {
         dtype: i32,
         out_shape: &[u32],
     ) -> String {
-        let mut inputs = HashMap::new();
+        let mut inputs = BTreeMap::new();
         inputs.insert("values".to_string(), Self::create_argument_tuple(names));
         inputs.insert("axis".to_string(), Self::create_immediate_int(axis));
         inputs.insert("interleave".to_string(), Self::create_immediate_bool(false));
@@ -2050,11 +2050,11 @@ impl CoremlMlProgramConverter {
                 value: Some(value::immediate_value::Value::Tensor(tensor_value)),
             })),
         };
-        let mut attributes = HashMap::new();
+        let mut attributes = BTreeMap::new();
         attributes.insert("val".to_string(), immediate);
         block.operations.push(MilOperation {
             r#type: "const".to_string(),
-            inputs: HashMap::new(),
+            inputs: BTreeMap::new(),
             outputs: vec![const_type],
             attributes,
             ..Default::default()
@@ -2419,7 +2419,7 @@ impl CoremlMlProgramConverter {
                 rank: dimensions.len() as i64,
                 data_type: mil_type,
                 dimensions,
-                attributes: HashMap::new(),
+                attributes: BTreeMap::new(),
             })),
         };
 
@@ -2494,7 +2494,7 @@ impl CoremlMlProgramConverter {
                     data_type: mil_type,
                     rank: 0,
                     dimensions: vec![],
-                    attributes: HashMap::new(),
+                    attributes: BTreeMap::new(),
                 })),
             }),
             value: Some(value::Value::ImmediateValue(value::ImmediateValue {
@@ -2568,7 +2568,7 @@ impl CoremlMlProgramConverter {
             &[]
         };
 
-        let mut attributes = HashMap::new();
+        let mut attributes = BTreeMap::new();
         attributes.insert(
             "quantized_data".to_string(),
             Self::constexpr_param_value(graph, weight_builder, *input, &input_shape)?,
@@ -2586,7 +2586,7 @@ impl CoremlMlProgramConverter {
 
         main_block.operations.push(MilOperation {
             r#type: "constexpr_affine_dequantize".to_string(),
-            inputs: HashMap::new(),
+            inputs: BTreeMap::new(),
             outputs: vec![output_type],
             attributes,
             ..Default::default()
@@ -2607,7 +2607,7 @@ impl CoremlMlProgramConverter {
                     data_type: MilDataType::Int32 as i32,
                     rank: 0,
                     dimensions: vec![],
-                    attributes: HashMap::new(),
+                    attributes: BTreeMap::new(),
                 })),
             }),
             value: Some(value::Value::ImmediateValue(value::ImmediateValue {
@@ -2678,7 +2678,7 @@ impl CoremlMlProgramConverter {
 
         // An explicitly empty axes sequence is an identity for reduceLogSumExp.
         if axes.is_empty() {
-            let mut identity_inputs = HashMap::new();
+            let mut identity_inputs = BTreeMap::new();
             identity_inputs.insert("x".to_string(), Self::create_name_argument(input_name));
             main_block.operations.push(Self::create_mil_operation(
                 mil_ops::IDENTITY,
@@ -2708,7 +2708,7 @@ impl CoremlMlProgramConverter {
             let reshaped_name = format!("{}_lse_input1d", output_name);
             let reshaped_type =
                 Self::create_named_value_type(reshaped_name.clone(), dtype, &working_shape, false);
-            let mut reshape_inputs = HashMap::new();
+            let mut reshape_inputs = BTreeMap::new();
             reshape_inputs.insert("x".to_string(), Self::create_name_argument(input_name));
             reshape_inputs.insert("shape".to_string(), Self::create_immediate_int_array(&[1]));
             main_block.operations.push(Self::create_mil_operation(
@@ -2728,7 +2728,7 @@ impl CoremlMlProgramConverter {
         let max_name = format!("{}_lse_max", output_name);
         let max_type =
             Self::create_named_value_type(max_name.clone(), dtype, &keep_dims_shape, false);
-        let mut max_inputs = HashMap::new();
+        let mut max_inputs = BTreeMap::new();
         max_inputs.insert(
             "x".to_string(),
             Self::create_name_argument(working_input_name.clone()),
@@ -2744,7 +2744,7 @@ impl CoremlMlProgramConverter {
         let shifted_name = format!("{}_lse_shifted", output_name);
         let shifted_type =
             Self::create_named_value_type(shifted_name.clone(), dtype, &working_shape, false);
-        let mut sub_inputs = HashMap::new();
+        let mut sub_inputs = BTreeMap::new();
         sub_inputs.insert(
             "x".to_string(),
             Self::create_name_argument(working_input_name),
@@ -2762,7 +2762,7 @@ impl CoremlMlProgramConverter {
         let exp_name = format!("{}_lse_exp", output_name);
         let exp_type =
             Self::create_named_value_type(exp_name.clone(), dtype, &working_shape, false);
-        let mut exp_inputs = HashMap::new();
+        let mut exp_inputs = BTreeMap::new();
         exp_inputs.insert("x".to_string(), Self::create_name_argument(shifted_name));
         main_block.operations.push(Self::create_mil_operation(
             mil_ops::EXP,
@@ -2773,7 +2773,7 @@ impl CoremlMlProgramConverter {
         let sum_name = format!("{}_lse_sum", output_name);
         let sum_type =
             Self::create_named_value_type(sum_name.clone(), dtype, &keep_dims_shape, false);
-        let mut sum_inputs = HashMap::new();
+        let mut sum_inputs = BTreeMap::new();
         sum_inputs.insert("x".to_string(), Self::create_name_argument(exp_name));
         sum_inputs.insert("axes".to_string(), Self::create_immediate_int_array(&axes));
         sum_inputs.insert("keep_dims".to_string(), Self::create_immediate_bool(true));
@@ -2786,7 +2786,7 @@ impl CoremlMlProgramConverter {
         let log_name = format!("{}_lse_log", output_name);
         let log_type =
             Self::create_named_value_type(log_name.clone(), dtype, &keep_dims_shape, false);
-        let mut log_inputs = HashMap::new();
+        let mut log_inputs = BTreeMap::new();
         log_inputs.insert("x".to_string(), Self::create_name_argument(sum_name));
         log_inputs.insert(
             "epsilon".to_string(),
@@ -2800,7 +2800,7 @@ impl CoremlMlProgramConverter {
 
         let keep_dimensions = options.map(|opts| opts.keep_dimensions).unwrap_or(false);
         if keep_dimensions || input_rank == 0 {
-            let mut add_inputs = HashMap::new();
+            let mut add_inputs = BTreeMap::new();
             add_inputs.insert("x".to_string(), Self::create_name_argument(max_name));
             add_inputs.insert("y".to_string(), Self::create_name_argument(log_name));
             main_block.operations.push(Self::create_mil_operation(
@@ -2814,7 +2814,7 @@ impl CoremlMlProgramConverter {
         let keep_dims_name = format!("{}_lse_keepdims", output_name);
         let keep_dims_type =
             Self::create_named_value_type(keep_dims_name.clone(), dtype, &keep_dims_shape, false);
-        let mut add_inputs = HashMap::new();
+        let mut add_inputs = BTreeMap::new();
         add_inputs.insert("x".to_string(), Self::create_name_argument(max_name));
         add_inputs.insert("y".to_string(), Self::create_name_argument(log_name));
         main_block.operations.push(Self::create_mil_operation(
@@ -2825,7 +2825,7 @@ impl CoremlMlProgramConverter {
 
         if output_operand.descriptor.shape.is_empty() {
             // WebNN scalar outputs use CoreML's one-element boundary representation.
-            let mut reshape_inputs = HashMap::new();
+            let mut reshape_inputs = BTreeMap::new();
             reshape_inputs.insert("x".to_string(), Self::create_name_argument(keep_dims_name));
             reshape_inputs.insert("shape".to_string(), Self::create_immediate_int_array(&[1]));
             main_block.operations.push(Self::create_mil_operation(
@@ -2834,7 +2834,7 @@ impl CoremlMlProgramConverter {
                 vec![output_type],
             ));
         } else {
-            let mut squeeze_inputs = HashMap::new();
+            let mut squeeze_inputs = BTreeMap::new();
             squeeze_inputs.insert("x".to_string(), Self::create_name_argument(keep_dims_name));
             squeeze_inputs.insert("axes".to_string(), Self::create_immediate_int_array(&axes));
             main_block.operations.push(Self::create_mil_operation(
@@ -2927,7 +2927,7 @@ impl CoremlMlProgramConverter {
         let in_r_name = format!("{}_dq_in_r", output_name);
         let in_r_type =
             Self::value_type_for_static_shape(in_r_name.clone(), out_dtype, &interleaved_input);
-        let mut in_reshape = HashMap::new();
+        let mut in_reshape = BTreeMap::new();
         in_reshape.insert("x".to_string(), Self::create_name_argument(in_f_name));
         in_reshape.insert(
             "shape".to_string(),
@@ -2944,7 +2944,7 @@ impl CoremlMlProgramConverter {
         let scale_r_name = format!("{}_dq_scale_r", output_name);
         let scale_r_type =
             Self::value_type_for_static_shape(scale_r_name.clone(), out_dtype, &interleaved_scale);
-        let mut scale_reshape = HashMap::new();
+        let mut scale_reshape = BTreeMap::new();
         scale_reshape.insert("x".to_string(), Self::create_name_argument(scale_name));
         scale_reshape.insert(
             "shape".to_string(),
@@ -2968,7 +2968,7 @@ impl CoremlMlProgramConverter {
             let zp_r_name = format!("{}_dq_zp_r", output_name);
             let zp_r_type =
                 Self::value_type_for_static_shape(zp_r_name.clone(), out_dtype, &interleaved_scale);
-            let mut zp_reshape = HashMap::new();
+            let mut zp_reshape = BTreeMap::new();
             zp_reshape.insert("x".to_string(), Self::create_name_argument(zp_f_name));
             zp_reshape.insert(
                 "shape".to_string(),
@@ -2982,7 +2982,7 @@ impl CoremlMlProgramConverter {
             let sub_name = format!("{}_dq_sub", output_name);
             let sub_type =
                 Self::value_type_for_static_shape(sub_name.clone(), out_dtype, &interleaved_input);
-            let mut sub_inputs = HashMap::new();
+            let mut sub_inputs = BTreeMap::new();
             sub_inputs.insert("x".to_string(), Self::create_name_argument(in_r_name));
             sub_inputs.insert("y".to_string(), Self::create_name_argument(zp_r_name));
             main_block.operations.push(Self::create_mil_operation(
@@ -2999,7 +2999,7 @@ impl CoremlMlProgramConverter {
         let mul_name = format!("{}_dq_mul", output_name);
         let mul_type =
             Self::value_type_for_static_shape(mul_name.clone(), out_dtype, &interleaved_input);
-        let mut mul_inputs = HashMap::new();
+        let mut mul_inputs = BTreeMap::new();
         mul_inputs.insert("x".to_string(), Self::create_name_argument(minus_zp_name));
         mul_inputs.insert("y".to_string(), Self::create_name_argument(scale_r_name));
         main_block.operations.push(Self::create_mil_operation(
@@ -3008,7 +3008,7 @@ impl CoremlMlProgramConverter {
             vec![mul_type],
         ));
 
-        let mut out_reshape = HashMap::new();
+        let mut out_reshape = BTreeMap::new();
         out_reshape.insert("x".to_string(), Self::create_name_argument(mul_name));
         out_reshape.insert(
             "shape".to_string(),
@@ -3102,7 +3102,7 @@ impl CoremlMlProgramConverter {
         let in_r_name = format!("{}_q_in_r", output_name);
         let in_r_type =
             Self::value_type_for_static_shape(in_r_name.clone(), float_dtype, &interleaved_input);
-        let mut in_reshape = HashMap::new();
+        let mut in_reshape = BTreeMap::new();
         in_reshape.insert("x".to_string(), Self::create_name_argument(in_f_name));
         in_reshape.insert(
             "shape".to_string(),
@@ -3130,7 +3130,7 @@ impl CoremlMlProgramConverter {
             float_dtype,
             &interleaved_scale,
         );
-        let mut scale_reshape = HashMap::new();
+        let mut scale_reshape = BTreeMap::new();
         scale_reshape.insert("x".to_string(), Self::create_name_argument(scale_f_name));
         scale_reshape.insert(
             "shape".to_string(),
@@ -3146,7 +3146,7 @@ impl CoremlMlProgramConverter {
         let div_name = format!("{}_q_div", output_name);
         let div_type =
             Self::value_type_for_static_shape(div_name.clone(), float_dtype, &interleaved_input);
-        let mut div_inputs = HashMap::new();
+        let mut div_inputs = BTreeMap::new();
         div_inputs.insert("x".to_string(), Self::create_name_argument(in_r_name));
         div_inputs.insert("y".to_string(), Self::create_name_argument(scale_r_name));
         main_block.operations.push(Self::create_mil_operation(
@@ -3157,7 +3157,7 @@ impl CoremlMlProgramConverter {
         let round_name = format!("{}_q_round", output_name);
         let round_type =
             Self::value_type_for_static_shape(round_name.clone(), float_dtype, &interleaved_input);
-        let mut round_inputs = HashMap::new();
+        let mut round_inputs = BTreeMap::new();
         round_inputs.insert("x".to_string(), Self::create_name_argument(div_name));
         main_block.operations.push(Self::create_mil_operation(
             mil_ops::ROUND_EVEN,
@@ -3182,7 +3182,7 @@ impl CoremlMlProgramConverter {
                 float_dtype,
                 &interleaved_scale,
             );
-            let mut zp_reshape = HashMap::new();
+            let mut zp_reshape = BTreeMap::new();
             zp_reshape.insert("x".to_string(), Self::create_name_argument(zp_f_name));
             zp_reshape.insert(
                 "shape".to_string(),
@@ -3199,7 +3199,7 @@ impl CoremlMlProgramConverter {
                 float_dtype,
                 &interleaved_input,
             );
-            let mut add_inputs = HashMap::new();
+            let mut add_inputs = BTreeMap::new();
             add_inputs.insert("x".to_string(), Self::create_name_argument(round_name));
             add_inputs.insert("y".to_string(), Self::create_name_argument(zp_r_name));
             main_block.operations.push(Self::create_mil_operation(
@@ -3227,7 +3227,7 @@ impl CoremlMlProgramConverter {
                     float_dtype,
                     &interleaved_input,
                 );
-                let mut clip_inputs = HashMap::new();
+                let mut clip_inputs = BTreeMap::new();
                 clip_inputs.insert("x".to_string(), Self::create_name_argument(biased_name));
                 clip_inputs.insert("alpha".to_string(), Self::create_immediate_float(qmin));
                 clip_inputs.insert("beta".to_string(), Self::create_immediate_float(qmax));
@@ -3245,7 +3245,7 @@ impl CoremlMlProgramConverter {
         let out_f_name = format!("{}_q_out_f", output_name);
         let out_f_type =
             Self::value_type_for_static_shape(out_f_name.clone(), float_dtype, &input_shape);
-        let mut out_reshape = HashMap::new();
+        let mut out_reshape = BTreeMap::new();
         out_reshape.insert("x".to_string(), Self::create_name_argument(clamped_name));
         out_reshape.insert(
             "shape".to_string(),
@@ -3421,7 +3421,7 @@ impl CoremlMlProgramConverter {
         // Hnew = n + z ⊙ (H - n)
         let hsubn = Self::rnn_binary(block, "sub", &hid_name, &n, p("hsubn"), dtype, &bh);
         let zmul = Self::rnn_binary(block, "mul", &z, &hsubn, p("zmul"), dtype, &bh);
-        let mut add_inputs = HashMap::new();
+        let mut add_inputs = BTreeMap::new();
         add_inputs.insert("x".to_string(), Self::create_name_argument(n));
         add_inputs.insert("y".to_string(), Self::create_name_argument(zmul));
         block.operations.push(Self::create_mil_operation(
@@ -3599,7 +3599,7 @@ impl CoremlMlProgramConverter {
         // Cnew = f ⊙ C + i ⊙ g  (emitted as the cell output).
         let fc = Self::rnn_binary(block, "mul", &gate_f, &cell_name, p("fc"), dtype, &bh);
         let ig = Self::rnn_binary(block, "mul", &gate_i, &gate_g, p("ig"), dtype, &bh);
-        let mut cnew_inputs = HashMap::new();
+        let mut cnew_inputs = BTreeMap::new();
         cnew_inputs.insert("x".to_string(), Self::create_name_argument(fc));
         cnew_inputs.insert("y".to_string(), Self::create_name_argument(ig));
         block
@@ -3609,7 +3609,7 @@ impl CoremlMlProgramConverter {
         // o depends on Cnew; Hnew = o ⊙ f2(Cnew).
         let gate_o = gate(block, o_off, f0, "o", Some((po_off, &c_name)));
         let tanh_c = Self::rnn_unary(block, f2, &c_name, p("tanhc"), dtype, &bh);
-        let mut h_inputs = HashMap::new();
+        let mut h_inputs = BTreeMap::new();
         h_inputs.insert("x".to_string(), Self::create_name_argument(gate_o));
         h_inputs.insert("y".to_string(), Self::create_name_argument(tanh_c));
         block
@@ -4103,8 +4103,8 @@ impl CoremlMlProgramConverter {
         graph: &GraphInfo,
         op: &Operation,
         input_names: &[String],
-    ) -> Result<HashMap<String, Argument>, GraphError> {
-        let mut inputs = HashMap::new();
+    ) -> Result<BTreeMap<String, Argument>, GraphError> {
+        let mut inputs = BTreeMap::new();
 
         match &op {
             // Binary operations: x, y
@@ -5773,8 +5773,11 @@ impl super::GraphConverter for CoremlMlProgramConverter {
             }
         }
 
-        // Add constant operands as const operations
-        for (operand_id, constant_data) in &graph_info.constant_operand_ids_to_handles {
+        // Stable operand order determines both const operations and weight-blob
+        // offsets. HashMap iteration would change both artifacts between runs.
+        let mut constants: Vec<_> = graph_info.constant_operand_ids_to_handles.iter().collect();
+        constants.sort_unstable_by_key(|(operand_id, _)| **operand_id);
+        for (operand_id, constant_data) in constants {
             let operand =
                 graph_info
                     .operand(*operand_id)
@@ -5926,7 +5929,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                             let filter_name = operand_name(graph_info, filter_operand_id);
                             let transposed_filter_name = format!("{}_transposed", filter_name);
 
-                            let mut transpose_inputs: HashMap<String, Argument> = HashMap::new();
+                            let mut transpose_inputs: BTreeMap<String, Argument> = BTreeMap::new();
                             transpose_inputs
                                 .insert("x".to_string(), Self::create_name_argument(filter_name));
                             transpose_inputs.insert(
@@ -5948,7 +5951,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                                             rank: dimensions.len() as i64,
                                             data_type: dtype,
                                             dimensions,
-                                            attributes: HashMap::new(),
+                                            attributes: BTreeMap::new(),
                                         },
                                     ),
                                 ),
@@ -6019,7 +6022,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         let input_name = operand_name(graph_info, input_operand_id);
                         let transposed_input_name = format!("{}_nchw", input_name);
 
-                        let mut transpose_inputs: HashMap<String, Argument> = HashMap::new();
+                        let mut transpose_inputs: BTreeMap<String, Argument> = BTreeMap::new();
                         transpose_inputs
                             .insert("x".to_string(), Self::create_name_argument(input_name));
                         transpose_inputs.insert(
@@ -6041,7 +6044,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                                         rank: dimensions.len() as i64,
                                         data_type: dtype,
                                         dimensions,
-                                        attributes: HashMap::new(),
+                                        attributes: BTreeMap::new(),
                                     },
                                 ),
                             ),
@@ -6122,7 +6125,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                     unfused_name.clone(),
                     Self::mil_data_type(&pool_in_operand.descriptor.data_type)?,
                 )?;
-                let mut mul_inputs = HashMap::new();
+                let mut mul_inputs = BTreeMap::new();
                 mul_inputs.insert("x".to_string(), Self::create_name_argument(in_name));
                 mul_inputs.insert(
                     "y".to_string(),
@@ -6174,7 +6177,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         Self::create_output_value(graph_info, out_id, &operand_name_overrides)?;
                     // Reshape to [1] (create_output_value promotes 0D scalars to [1],
                     // matching the model's rank-1 boundary), which is a no-op copy.
-                    let mut ri = HashMap::new();
+                    let mut ri = BTreeMap::new();
                     ri.insert("x".to_string(), Self::create_name_argument(in_name));
                     ri.insert(
                         "shape".to_string(),
@@ -6330,7 +6333,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         MilDataType::Bool as i32,
                     )?;
 
-                    let mut equal_inputs = HashMap::new();
+                    let mut equal_inputs = BTreeMap::new();
                     equal_inputs.insert(
                         "x".to_string(),
                         Self::create_name_argument(input_names[0].clone()),
@@ -6345,7 +6348,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         vec![equal_output_type],
                     ));
 
-                    let mut not_inputs = HashMap::new();
+                    let mut not_inputs = BTreeMap::new();
                     not_inputs.insert(
                         "x".to_string(),
                         Self::create_name_argument(equal_output_name),
@@ -6365,7 +6368,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         eq_name.clone(),
                         MilDataType::Bool as i32,
                     )?;
-                    let mut eq_inputs = HashMap::new();
+                    let mut eq_inputs = BTreeMap::new();
                     eq_inputs.insert(
                         "x".to_string(),
                         Self::create_name_argument(input_name.clone()),
@@ -6376,7 +6379,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         eq_inputs,
                         vec![eq_type],
                     ));
-                    let mut not_inputs = HashMap::new();
+                    let mut not_inputs = BTreeMap::new();
                     not_inputs.insert("x".to_string(), Self::create_name_argument(eq_name));
                     main_block.operations.push(Self::create_mil_operation(
                         mil_ops::LOGICAL_NOT,
@@ -6402,7 +6405,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         abs_name.clone(),
                         abs_mil_dtype,
                     )?;
-                    let mut abs_inputs = HashMap::new();
+                    let mut abs_inputs = BTreeMap::new();
                     abs_inputs.insert("x".to_string(), Self::create_name_argument(input_name));
                     main_block.operations.push(Self::create_mil_operation(
                         mil_ops::ABS,
@@ -6420,7 +6423,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                     } else {
                         Self::create_immediate_float(max_val)
                     };
-                    let mut gt_inputs = HashMap::new();
+                    let mut gt_inputs = BTreeMap::new();
                     gt_inputs.insert("x".to_string(), Self::create_name_argument(abs_name));
                     gt_inputs.insert("y".to_string(), max_val_arg);
                     main_block.operations.push(Self::create_mil_operation(
@@ -6493,7 +6496,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                     Self::create_immediate_int(0)
                 };
                 let _ = is_float16;
-                let mut cond_inputs = HashMap::new();
+                let mut cond_inputs = BTreeMap::new();
                 cond_inputs.insert("x".to_string(), Self::create_name_argument(x_name.clone()));
                 cond_inputs.insert("y".to_string(), zero_arg);
                 main_block.operations.push(Self::create_mil_operation(
@@ -6510,7 +6513,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                     neg_name.clone(),
                     mil_dtype,
                 )?;
-                let mut mul_inputs = HashMap::new();
+                let mut mul_inputs = BTreeMap::new();
                 mul_inputs.insert("x".to_string(), Self::create_name_argument(x_name.clone()));
                 mul_inputs.insert("y".to_string(), Self::create_name_argument(alpha_name));
                 main_block.operations.push(Self::create_mil_operation(
@@ -6520,7 +6523,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                 ));
 
                 // output = select(cond, x, neg_branch)
-                let mut sel_inputs = HashMap::new();
+                let mut sel_inputs = BTreeMap::new();
                 sel_inputs.insert("cond".to_string(), Self::create_name_argument(cond_name));
                 sel_inputs.insert("a".to_string(), Self::create_name_argument(x_name));
                 sel_inputs.insert("b".to_string(), Self::create_name_argument(neg_name));
@@ -6596,7 +6599,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                                 clipped_name.clone(),
                                 crate::protos::coreml::mil_spec::DataType::Float32 as i32,
                             )?;
-                            let mut clip_inputs = HashMap::new();
+                            let mut clip_inputs = BTreeMap::new();
                             clip_inputs
                                 .insert("x".to_string(), Self::create_name_argument(float_name));
                             clip_inputs.insert(
@@ -6631,7 +6634,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                                 sat_name.clone(),
                                 crate::protos::coreml::mil_spec::DataType::Float32 as i32,
                             )?;
-                            let mut sat_inputs = HashMap::new();
+                            let mut sat_inputs = BTreeMap::new();
                             sat_inputs
                                 .insert("x".to_string(), Self::create_name_argument(clipped_name));
                             sat_inputs
@@ -6690,7 +6693,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                                         rank: dimensions.len() as i64,
                                         data_type: dtype,
                                         dimensions: dimensions.clone(),
-                                        attributes: HashMap::new(),
+                                        attributes: BTreeMap::new(),
                                     },
                                 ),
                             ),
@@ -6707,7 +6710,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                     // and `input*0 + bound` yields NaN for non-finite inputs. Use
                     // minimum(maximum(input, min), max), which is exact for infinities.
                     let mx_name = format!("{}_clamp_max", output_name);
-                    let mut mx_inputs: HashMap<String, Argument> = HashMap::new();
+                    let mut mx_inputs: BTreeMap<String, Argument> = BTreeMap::new();
                     mx_inputs.insert("x".to_string(), Self::create_name_argument(input_name));
                     mx_inputs.insert("y".to_string(), bound_arg(min_value));
                     main_block.operations.push(Self::create_mil_operation(
@@ -6715,7 +6718,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         mx_inputs,
                         vec![make_type(mx_name.clone())],
                     ));
-                    let mut mn_inputs: HashMap<String, Argument> = HashMap::new();
+                    let mut mn_inputs: BTreeMap<String, Argument> = BTreeMap::new();
                     mn_inputs.insert("x".to_string(), Self::create_name_argument(mx_name));
                     mn_inputs.insert("y".to_string(), bound_arg(max_value));
                     main_block.operations.push(Self::create_mil_operation(
@@ -6769,7 +6772,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         )
                     );
 
-                    let mut reshape_inputs: HashMap<String, Argument> = HashMap::new();
+                    let mut reshape_inputs: BTreeMap<String, Argument> = BTreeMap::new();
                     reshape_inputs.insert("x".to_string(), Self::create_name_argument(input_name));
                     reshape_inputs.insert(
                         "shape".to_string(),
@@ -6796,7 +6799,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                                     rank: dimensions.len() as i64,
                                     data_type: dtype,
                                     dimensions,
-                                    attributes: HashMap::new(),
+                                    attributes: BTreeMap::new(),
                                 },
                             ),
                         ),
@@ -6925,7 +6928,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         neg_name.clone(),
                         crate::protos::coreml::mil_spec::DataType::Float32 as i32,
                     )?;
-                    let mut neg_inputs = HashMap::new();
+                    let mut neg_inputs = BTreeMap::new();
                     neg_inputs.insert("x".to_string(), Self::create_name_argument(float_name));
                     neg_inputs.insert("y".to_string(), Self::create_immediate_float(-1.0));
                     main_block.operations.push(Self::create_mil_operation(
@@ -6975,7 +6978,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         relu_name.clone(),
                         crate::protos::coreml::mil_spec::DataType::Float32 as i32,
                     )?;
-                    let mut relu_inputs = HashMap::new();
+                    let mut relu_inputs = BTreeMap::new();
                     relu_inputs.insert("x".to_string(), Self::create_name_argument(float_name));
                     main_block.operations.push(Self::create_mil_operation(
                         mil_ops::RELU,
@@ -7053,7 +7056,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         padded_name.clone(),
                         crate::protos::coreml::mil_spec::DataType::Float32 as i32,
                     )?;
-                    let mut pad_inputs = HashMap::new();
+                    let mut pad_inputs = BTreeMap::new();
                     pad_inputs.insert("x".to_string(), Self::create_name_argument(float_name));
                     pad_inputs.insert(
                         "pad".to_string(),
@@ -7120,7 +7123,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                     );
 
                     // Create hardsigmoid operation with alpha=1/6, beta=0.5
-                    let mut hardsigmoid_inputs: HashMap<String, Argument> = HashMap::new();
+                    let mut hardsigmoid_inputs: BTreeMap<String, Argument> = BTreeMap::new();
                     hardsigmoid_inputs.insert(
                         "x".to_string(),
                         Self::create_name_argument(input_name.clone()),
@@ -7153,7 +7156,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                                     rank: dimensions.len() as i64,
                                     data_type: dtype,
                                     dimensions,
-                                    attributes: HashMap::new(),
+                                    attributes: BTreeMap::new(),
                                 },
                             ),
                         ),
@@ -7173,7 +7176,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                     main_block.operations.push(hardsigmoid_op);
 
                     // Create mul operation: x * hardsigmoid_output
-                    let mut mul_inputs: HashMap<String, Argument> = HashMap::new();
+                    let mut mul_inputs: BTreeMap<String, Argument> = BTreeMap::new();
                     mul_inputs.insert("x".to_string(), Self::create_name_argument(input_name));
                     mul_inputs.insert(
                         "y".to_string(),
@@ -7209,7 +7212,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                                     rank: output_dimensions.len() as i64,
                                     data_type: output_dtype,
                                     dimensions: output_dimensions,
-                                    attributes: HashMap::new(),
+                                    attributes: BTreeMap::new(),
                                 },
                             ),
                         ),
@@ -7293,7 +7296,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                     output_name.clone()
                 };
 
-                let mut matmul_inputs: HashMap<String, Argument> = HashMap::new();
+                let mut matmul_inputs: BTreeMap<String, Argument> = BTreeMap::new();
                 matmul_inputs.insert(
                     "x".to_string(),
                     Self::create_name_argument(operand_name(graph_info, op.input_operands()[0])),
@@ -7335,7 +7338,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         output_name.clone()
                     };
 
-                    let mut alpha_mul_inputs: HashMap<String, Argument> = HashMap::new();
+                    let mut alpha_mul_inputs: BTreeMap<String, Argument> = BTreeMap::new();
                     alpha_mul_inputs
                         .insert("x".to_string(), Self::create_name_argument(current_name));
                     alpha_mul_inputs.insert("y".to_string(), alpha_arg);
@@ -7362,7 +7365,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                     };
 
                     if needs_beta_mul {
-                        let mut beta_mul_inputs: HashMap<String, Argument> = HashMap::new();
+                        let mut beta_mul_inputs: BTreeMap<String, Argument> = BTreeMap::new();
                         beta_mul_inputs.insert("x".to_string(), Self::create_name_argument(c_name));
                         beta_mul_inputs.insert("y".to_string(), beta_arg);
 
@@ -7376,7 +7379,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         ));
                     }
 
-                    let mut add_inputs: HashMap<String, Argument> = HashMap::new();
+                    let mut add_inputs: BTreeMap<String, Argument> = BTreeMap::new();
                     add_inputs.insert("x".to_string(), Self::create_name_argument(current_name));
                     add_inputs.insert("y".to_string(), Self::create_name_argument(scaled_c_name));
 
@@ -7471,12 +7474,12 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                             rank: output_dimensions.len() as i64,
                             data_type: output_dtype,
                             dimensions: output_dimensions.clone(),
-                            attributes: HashMap::new(),
+                            attributes: BTreeMap::new(),
                         }),
                     ),
                 };
 
-                let mut mul_inputs: HashMap<String, Argument> = HashMap::new();
+                let mut mul_inputs: BTreeMap<String, Argument> = BTreeMap::new();
                 mul_inputs.insert("x".to_string(), Self::create_name_argument(input_name));
                 mul_inputs.insert("y".to_string(), alpha_arg);
                 main_block.operations.push(Self::create_mil_operation(
@@ -7488,7 +7491,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                     }],
                 ));
 
-                let mut add_inputs: HashMap<String, Argument> = HashMap::new();
+                let mut add_inputs: BTreeMap<String, Argument> = BTreeMap::new();
                 add_inputs.insert("x".to_string(), Self::create_name_argument(mul_output_name));
                 add_inputs.insert("y".to_string(), beta_arg);
                 main_block.operations.push(Self::create_mil_operation(
@@ -7562,7 +7565,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                                     data_type: MilDataType::Int32 as i32,
                                     rank: 0, // Scalar
                                     dimensions: vec![],
-                                    attributes: HashMap::new(),
+                                    attributes: BTreeMap::new(),
                                 })),
                             }),
                             value: Some(value::Value::ImmediateValue(value::ImmediateValue {
@@ -7588,7 +7591,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                 };
 
                 // Create mul operation: x * (-1)
-                let mut mul_inputs: HashMap<String, Argument> = HashMap::new();
+                let mut mul_inputs: BTreeMap<String, Argument> = BTreeMap::new();
                 mul_inputs.insert("x".to_string(), Self::create_name_argument(input_name));
                 mul_inputs.insert("y".to_string(), neg_one_immediate);
 
@@ -7617,7 +7620,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                             rank: output_dimensions.len() as i64,
                             data_type: output_dtype,
                             dimensions: output_dimensions,
-                            attributes: HashMap::new(),
+                            attributes: BTreeMap::new(),
                         }),
                     ),
                 };
@@ -7690,7 +7693,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                                     rank: dimensions.len() as i64,
                                     data_type: dtype,
                                     dimensions,
-                                    attributes: HashMap::new(),
+                                    attributes: BTreeMap::new(),
                                 },
                             ),
                         ),
@@ -7710,7 +7713,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                     };
 
                     // zeros = x - x
-                    let mut sub_inputs: HashMap<String, Argument> = HashMap::new();
+                    let mut sub_inputs: BTreeMap<String, Argument> = BTreeMap::new();
                     sub_inputs.insert(
                         "x".to_string(),
                         Self::create_name_argument(input_name.clone()),
@@ -7727,7 +7730,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
 
                     if let Some(bias_id) = bias_id_opt {
                         let bias_name = operand_name(graph_info, bias_id);
-                        let mut add_inputs: HashMap<String, Argument> = HashMap::new();
+                        let mut add_inputs: BTreeMap<String, Argument> = BTreeMap::new();
                         add_inputs.insert("x".to_string(), Self::create_name_argument(zeros_name));
                         add_inputs.insert("y".to_string(), Self::create_name_argument(bias_name));
                         main_block.operations.push(Self::create_mil_operation(
@@ -7794,7 +7797,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                     // fill_like follows the actual input shape, including both
                     // dynamically sized matrix axes and any batch dimensions.
                     if !integer_input {
-                        let mut fill_inputs = HashMap::new();
+                        let mut fill_inputs = BTreeMap::new();
                         fill_inputs.insert(
                             "ref_tensor".to_string(),
                             Self::create_name_argument(input_name.clone()),
@@ -7815,7 +7818,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                     let (band_lower, band_upper) =
                         Self::triangular_band_bounds(shape, is_upper, diagonal)?;
 
-                    let mut band_inputs: HashMap<String, Argument> = HashMap::new();
+                    let mut band_inputs: BTreeMap<String, Argument> = BTreeMap::new();
                     band_inputs.insert(
                         "x".to_string(),
                         Self::create_name_argument(if integer_input {
@@ -7847,7 +7850,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         // Keep typed integer arithmetic: CoreML select can lose
                         // int32 precision beyond 2^24 even with URL compilation.
                         // x-x and x-0 are exact for integers and cannot overflow.
-                        let mut sub_inputs = HashMap::new();
+                        let mut sub_inputs = BTreeMap::new();
                         sub_inputs.insert("x".to_string(), Self::create_name_argument(input_name));
                         sub_inputs.insert("y".to_string(), Self::create_name_argument(band_name));
                         main_block.operations.push(Self::create_mil_operation(
@@ -7858,7 +7861,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         continue;
                     }
 
-                    let mut equal_inputs = HashMap::new();
+                    let mut equal_inputs = BTreeMap::new();
                     equal_inputs.insert("x".to_string(), Self::create_name_argument(band_name));
                     equal_inputs.insert("y".to_string(), Self::create_immediate_float(0.0));
                     main_block.operations.push(Self::create_mil_operation(
@@ -7877,7 +7880,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         DataType::Float32 => Self::create_immediate_float(0.0),
                         _ => Self::create_immediate_int(0),
                     };
-                    let mut select_inputs = HashMap::new();
+                    let mut select_inputs = BTreeMap::new();
                     select_inputs.insert("cond".to_string(), Self::create_name_argument(keep_name));
                     select_inputs.insert("a".to_string(), Self::create_name_argument(input_name));
                     select_inputs.insert("b".to_string(), zero);
@@ -8037,7 +8040,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                             )?;
                             (name, ty)
                         };
-                        let mut io = HashMap::new();
+                        let mut io = BTreeMap::new();
                         io.insert("x".to_string(), Self::create_name_argument(cur.clone()));
                         io.insert("y".to_string(), Self::create_name_argument(bcast));
                         main_block.operations.push(Self::create_mil_operation(
@@ -8072,7 +8075,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                     Self::create_output_value(graph_info, out_id, &operand_name_overrides)?;
                 let names =
                     Self::input_names_for_operation(graph_info, op, &operand_name_overrides);
-                let mut div_in_args = HashMap::new();
+                let mut div_in_args = BTreeMap::new();
                 div_in_args.insert(
                     "x".to_string(),
                     Self::create_name_argument(names[0].clone()),
@@ -8115,7 +8118,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                     DataType::Int32 => Self::create_immediate_int(1),
                     _ => Self::create_immediate_float(1.0),
                 };
-                let mut mul_in = HashMap::new();
+                let mut mul_in = BTreeMap::new();
                 mul_in.insert(
                     "x".to_string(),
                     Self::create_name_argument(Self::output_name_for_operand(
@@ -8181,7 +8184,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                             int32,
                             &reshaped_dims,
                         );
-                        let mut rs_in: HashMap<String, Argument> = HashMap::new();
+                        let mut rs_in: BTreeMap<String, Argument> = BTreeMap::new();
                         rs_in.insert(
                             "x".to_string(),
                             Self::create_name_argument(cast_in_name.clone()),
@@ -8326,7 +8329,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         format!("{out_name}_bias_bcast_{out_id}"),
                         mil_dtype,
                     );
-                    let mut add_in = HashMap::new();
+                    let mut add_in = BTreeMap::new();
                     add_in.insert("x".to_string(), Self::create_name_argument(nobias_name));
                     add_in.insert("y".to_string(), Self::create_name_argument(bias_bcast));
                     main_block.operations.push(Self::create_mil_operation(
@@ -8485,13 +8488,13 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                                             rank: spatial_input_dims.len() as i64,
                                             data_type: dtype,
                                             dimensions: spatial_input_dims,
-                                            attributes: HashMap::new(),
+                                            attributes: BTreeMap::new(),
                                         },
                                     ),
                                 ),
                             }),
                         };
-                        let mut pre_tp: HashMap<String, Argument> = HashMap::new();
+                        let mut pre_tp: BTreeMap<String, Argument> = BTreeMap::new();
                         pre_tp.insert("x".to_string(), Self::create_name_argument(input_name_raw));
                         pre_tp.insert(
                             "perm".to_string(),
@@ -8519,7 +8522,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                                             rank: spatial_output_dims.len() as i64,
                                             data_type: dtype,
                                             dimensions: spatial_output_dims,
-                                            attributes: HashMap::new(),
+                                            attributes: BTreeMap::new(),
                                         },
                                     ),
                                 ),
@@ -8566,7 +8569,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                     mil_ops::UPSAMPLE_NEAREST_NEIGHBOR
                 };
 
-                let mut resample_inputs: HashMap<String, Argument> = HashMap::new();
+                let mut resample_inputs: BTreeMap<String, Argument> = BTreeMap::new();
                 resample_inputs.insert(
                     "x".to_string(),
                     Self::create_name_argument(upsample_input_name),
@@ -8599,7 +8602,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                 ));
 
                 if needs_spatial_transpose {
-                    let mut post_tp: HashMap<String, Argument> = HashMap::new();
+                    let mut post_tp: BTreeMap<String, Argument> = BTreeMap::new();
                     post_tp.insert(
                         "x".to_string(),
                         Self::create_name_argument(upsample_output_name),
@@ -8765,13 +8768,13 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                                             dimension::ConstantDimension { size: 1 },
                                         )),
                                     }],
-                                    attributes: HashMap::new(),
+                                    attributes: BTreeMap::new(),
                                 },
                             ),
                         ),
                     }),
                 };
-                let mut reshape_inputs = HashMap::new();
+                let mut reshape_inputs = BTreeMap::new();
                 reshape_inputs.insert("x".to_string(), Self::create_name_argument(input_name));
                 reshape_inputs.insert(
                     "shape".to_string(),
@@ -8885,13 +8888,13 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                                                 )),
                                             })
                                             .collect(),
-                                        attributes: HashMap::new(),
+                                        attributes: BTreeMap::new(),
                                     },
                                 ),
                             ),
                         }),
                     };
-                    let mut reshape_in_inputs = HashMap::new();
+                    let mut reshape_in_inputs = BTreeMap::new();
                     reshape_in_inputs
                         .insert("x".to_string(), Self::create_name_argument(input_name));
                     reshape_in_inputs.insert(
@@ -8922,7 +8925,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                                                 )),
                                             })
                                             .collect(),
-                                        attributes: HashMap::new(),
+                                        attributes: BTreeMap::new(),
                                     },
                                 ),
                             ),
@@ -8953,7 +8956,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    let mut reshape_out_inputs = HashMap::new();
+                    let mut reshape_out_inputs = BTreeMap::new();
                     reshape_out_inputs
                         .insert("x".to_string(), Self::create_name_argument(bn_result_name));
                     reshape_out_inputs.insert(
@@ -9001,7 +9004,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         output_name,
                         MilDataType::Int32 as i32,
                     )?;
-                    let mut inputs: HashMap<String, Argument> = HashMap::new();
+                    let mut inputs: BTreeMap<String, Argument> = BTreeMap::new();
                     if let Some(first) = input_names.first() {
                         inputs.insert("x".to_string(), Self::create_argument(first));
                     }
@@ -9264,7 +9267,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                     } else {
                         mil_ops::GATHER_ALONG_AXIS
                     };
-                    let mut gather_inputs: HashMap<String, Argument> = HashMap::new();
+                    let mut gather_inputs: BTreeMap<String, Argument> = BTreeMap::new();
                     gather_inputs.insert("x".to_string(), Self::create_name_argument(data_name));
                     gather_inputs
                         .insert("indices".to_string(), Self::create_name_argument(norm_idx));
@@ -9279,7 +9282,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         vec![gather_output_type.clone()],
                     ));
                     if squeeze_gather_axis {
-                        let mut squeeze_inputs = HashMap::new();
+                        let mut squeeze_inputs = BTreeMap::new();
                         squeeze_inputs.insert(
                             "x".to_string(),
                             Self::create_name_argument(gather_output_type.name),
@@ -9376,7 +9379,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                             &bounds,
                             &output_name,
                         );
-                        let mut gnd_inputs: HashMap<String, Argument> = HashMap::new();
+                        let mut gnd_inputs: BTreeMap<String, Argument> = BTreeMap::new();
                         gnd_inputs.insert("x".to_string(), Self::create_name_argument(data_name));
                         gnd_inputs
                             .insert("indices".to_string(), Self::create_name_argument(norm_idx));
@@ -9517,13 +9520,13 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                                             rank: input_rank as i64,
                                             data_type: dtype,
                                             dimensions: bcast_dims.clone(),
-                                            attributes: HashMap::new(),
+                                            attributes: BTreeMap::new(),
                                         },
                                     ),
                                 ),
                             }),
                         };
-                            let mut rs_in: HashMap<String, Argument> = HashMap::new();
+                            let mut rs_in: BTreeMap<String, Argument> = BTreeMap::new();
                             rs_in.insert(
                                 "x".to_string(),
                                 Self::create_name_argument(mean_name.clone()),
@@ -9548,13 +9551,13 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                                             rank: input_rank as i64,
                                             data_type: dtype,
                                             dimensions: bcast_dims,
-                                            attributes: HashMap::new(),
+                                            attributes: BTreeMap::new(),
                                         },
                                     ),
                                 ),
                             }),
                         };
-                            let mut rs_var: HashMap<String, Argument> = HashMap::new();
+                            let mut rs_var: BTreeMap<String, Argument> = BTreeMap::new();
                             rs_var.insert(
                                 "x".to_string(),
                                 Self::create_name_argument(var_name.clone()),
@@ -9589,7 +9592,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                                         rank: out_dims.len() as i64,
                                         data_type: dtype,
                                         dimensions: out_dims.clone(),
-                                        attributes: HashMap::new(),
+                                        attributes: BTreeMap::new(),
                                     },
                                 ),
                             ),
@@ -9598,7 +9601,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
 
                     // x_minus_mean = x - mean
                     let x_minus_mean = format!("{}_bn_xmm", output_name);
-                    let mut sub_in: HashMap<String, Argument> = HashMap::new();
+                    let mut sub_in: BTreeMap<String, Argument> = BTreeMap::new();
                     sub_in.insert("x".to_string(), Self::create_name_argument(input_name));
                     sub_in.insert("y".to_string(), Self::create_name_argument(mean_for_sub));
                     main_block.operations.push(Self::create_mil_operation(
@@ -9620,7 +9623,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                                         rank: var_dims.len() as i64,
                                         data_type: dtype,
                                         dimensions: var_dims.clone(),
-                                        attributes: HashMap::new(),
+                                        attributes: BTreeMap::new(),
                                     },
                                 ),
                             ),
@@ -9632,7 +9635,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                     } else {
                         Self::create_immediate_float(epsilon)
                     };
-                    let mut veps_in: HashMap<String, Argument> = HashMap::new();
+                    let mut veps_in: BTreeMap<String, Argument> = BTreeMap::new();
                     veps_in.insert(
                         "x".to_string(),
                         Self::create_name_argument(var_for_div.clone()),
@@ -9646,7 +9649,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
 
                     // std = sqrt(var_plus_eps)
                     let std_name = format!("{}_bn_std", output_name);
-                    let mut sqrt_in: HashMap<String, Argument> = HashMap::new();
+                    let mut sqrt_in: BTreeMap<String, Argument> = BTreeMap::new();
                     sqrt_in.insert("x".to_string(), Self::create_name_argument(var_eps_name));
                     main_block.operations.push(Self::create_mil_operation(
                         "sqrt",
@@ -9656,7 +9659,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
 
                     // normalized = x_minus_mean / std
                     let normed_name = format!("{}_bn_normed", output_name);
-                    let mut div_in: HashMap<String, Argument> = HashMap::new();
+                    let mut div_in: BTreeMap<String, Argument> = BTreeMap::new();
                     div_in.insert("x".to_string(), Self::create_name_argument(x_minus_mean));
                     div_in.insert("y".to_string(), Self::create_name_argument(std_name));
                     main_block.operations.push(Self::create_mil_operation(
@@ -9681,13 +9684,13 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                                             rank: input_rank as i64,
                                             data_type: dtype,
                                             dimensions: bcast_dims.clone(),
-                                            attributes: HashMap::new(),
+                                            attributes: BTreeMap::new(),
                                         },
                                     ),
                                 ),
                             }),
                         };
-                            let mut rs_in: HashMap<String, Argument> = HashMap::new();
+                            let mut rs_in: BTreeMap<String, Argument> = BTreeMap::new();
                             rs_in.insert("x".to_string(), Self::create_name_argument(src_name));
                             rs_in.insert(
                                 "shape".to_string(),
@@ -9706,7 +9709,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         );
                         let sc_name = bcast_param(sc_name, "gamma", &mut main_block.operations);
                         let scaled_name = format!("{}_bn_scaled", output_name);
-                        let mut mul_in: HashMap<String, Argument> = HashMap::new();
+                        let mut mul_in: BTreeMap<String, Argument> = BTreeMap::new();
                         mul_in.insert("x".to_string(), Self::create_name_argument(normed_name));
                         mul_in.insert("y".to_string(), Self::create_name_argument(sc_name));
                         main_block.operations.push(Self::create_mil_operation(
@@ -9727,7 +9730,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         );
                         let bi_name = bcast_param(bi_name, "beta", &mut main_block.operations);
                         let biased_name = output_name.clone();
-                        let mut add_in: HashMap<String, Argument> = HashMap::new();
+                        let mut add_in: BTreeMap<String, Argument> = BTreeMap::new();
                         add_in.insert("x".to_string(), Self::create_name_argument(after_scale));
                         add_in.insert("y".to_string(), Self::create_name_argument(bi_name));
                         main_block.operations.push(Self::create_mil_operation(
@@ -9738,7 +9741,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         biased_name
                     } else {
                         // No bias: rename final intermediate to output name via identity
-                        let mut id_in: HashMap<String, Argument> = HashMap::new();
+                        let mut id_in: BTreeMap<String, Argument> = BTreeMap::new();
                         id_in.insert("x".to_string(), Self::create_name_argument(after_scale));
                         main_block.operations.push(Self::create_mil_operation(
                             "identity",
@@ -9812,13 +9815,13 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                                         rank: nchw_in_dims.len() as i64,
                                         data_type: dtype,
                                         dimensions: nchw_in_dims,
-                                        attributes: HashMap::new(),
+                                        attributes: BTreeMap::new(),
                                     },
                                 ),
                             ),
                         }),
                     };
-                    let mut pre_tp: HashMap<String, Argument> = HashMap::new();
+                    let mut pre_tp: BTreeMap<String, Argument> = BTreeMap::new();
                     pre_tp.insert("x".to_string(), Self::create_name_argument(input_name));
                     pre_tp.insert(
                         "perm".to_string(),
@@ -9846,7 +9849,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                                         rank: nchw_out_dims.len() as i64,
                                         data_type: dtype,
                                         dimensions: nchw_out_dims,
-                                        attributes: HashMap::new(),
+                                        attributes: BTreeMap::new(),
                                     },
                                 ),
                             ),
@@ -9866,7 +9869,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
 
                     // Post-transpose: NCHW [N,C,H,W] -> NHWC [N,H,W,C], perm=[0,2,3,1]
                     let post_perm = [0u32, 2, 3, 1];
-                    let mut post_tp: HashMap<String, Argument> = HashMap::new();
+                    let mut post_tp: BTreeMap<String, Argument> = BTreeMap::new();
                     post_tp.insert("x".to_string(), Self::create_name_argument(nchw_out_name));
                     post_tp.insert(
                         "perm".to_string(),
@@ -9938,7 +9941,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                                         rank: nchw_out_dims.len() as i64,
                                         data_type: dtype,
                                         dimensions: nchw_out_dims,
-                                        attributes: HashMap::new(),
+                                        attributes: BTreeMap::new(),
                                     },
                                 ),
                             ),
@@ -9960,7 +9963,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
 
                     // Post-transpose: NCHW [N,C',H',W'] → NHWC [N,H',W',C'], perm=[0,2,3,1]
                     let post_perm = [0u32, 2, 3, 1];
-                    let mut post_tp_inputs: HashMap<String, Argument> = HashMap::new();
+                    let mut post_tp_inputs: BTreeMap<String, Argument> = BTreeMap::new();
                     post_tp_inputs
                         .insert("x".to_string(), Self::create_name_argument(nchw_out_name));
                     post_tp_inputs.insert(
@@ -10054,13 +10057,13 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                                         rank: nchw_input_dims.len() as i64,
                                         data_type: dtype,
                                         dimensions: nchw_input_dims,
-                                        attributes: HashMap::new(),
+                                        attributes: BTreeMap::new(),
                                     },
                                 ),
                             ),
                         }),
                     };
-                    let mut pre_tp_inputs: HashMap<String, Argument> = HashMap::new();
+                    let mut pre_tp_inputs: BTreeMap<String, Argument> = BTreeMap::new();
                     pre_tp_inputs.insert("x".to_string(), Self::create_name_argument(input_name));
                     pre_tp_inputs.insert(
                         "perm".to_string(),
@@ -10089,7 +10092,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                                         rank: nchw_pool_dims.len() as i64,
                                         data_type: dtype,
                                         dimensions: nchw_pool_dims,
-                                        attributes: HashMap::new(),
+                                        attributes: BTreeMap::new(),
                                     },
                                 ),
                             ),
@@ -10112,7 +10115,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
 
                     // Post-transpose: NCHW [N,C,H',W'] -> NHWC [N,H',W',C], perm=[0,2,3,1]
                     let post_tp_perm = [0u32, 2, 3, 1];
-                    let mut post_tp_inputs: HashMap<String, Argument> = HashMap::new();
+                    let mut post_tp_inputs: BTreeMap<String, Argument> = BTreeMap::new();
                     post_tp_inputs.insert(
                         "x".to_string(),
                         Self::create_name_argument(nchw_pool_output_name),
@@ -10226,7 +10229,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         &reshaped_dims,
                         false,
                     );
-                    let mut reshape_inputs: HashMap<String, Argument> = HashMap::new();
+                    let mut reshape_inputs: BTreeMap<String, Argument> = BTreeMap::new();
                     reshape_inputs.insert("x".to_string(), Self::create_name_argument(input_name));
                     reshape_inputs.insert(
                         "shape".to_string(),
@@ -10239,7 +10242,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                     ));
 
                     let mil_op_type = self.get_mil_op_type(op.op_type())?;
-                    let mut reduce_inputs: HashMap<String, Argument> = HashMap::new();
+                    let mut reduce_inputs: BTreeMap<String, Argument> = BTreeMap::new();
                     reduce_inputs
                         .insert("x".to_string(), Self::create_name_argument(reshaped_name));
                     reduce_inputs.insert(
@@ -10300,7 +10303,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                                         rank: 1,
                                         data_type: mil_dtype,
                                         dimensions: vec![one_dim],
-                                        attributes: HashMap::new(),
+                                        attributes: BTreeMap::new(),
                                     },
                                 ),
                             ),
@@ -10308,7 +10311,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                     };
 
                     // Emit: reshape(x=input, shape=[1]) -> reshaped_input_name
-                    let mut reshape_inputs: HashMap<String, Argument> = HashMap::new();
+                    let mut reshape_inputs: BTreeMap<String, Argument> = BTreeMap::new();
                     reshape_inputs.insert("x".to_string(), Self::create_name_argument(input_name));
                     reshape_inputs.insert(
                         "shape".to_string(),
@@ -10368,7 +10371,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                                                     dimension::ConstantDimension { size: 1 },
                                                 )),
                                             }],
-                                            attributes: HashMap::new(),
+                                            attributes: BTreeMap::new(),
                                         },
                                     ),
                                 ),
@@ -10377,7 +10380,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
 
                         // Build reduce inputs manually: x=reshaped, axes=[0], keep_dims=True
                         // so the output stays [1] (which we can reshape to [])
-                        let mut reduce_inputs: HashMap<String, Argument> = HashMap::new();
+                        let mut reduce_inputs: BTreeMap<String, Argument> = BTreeMap::new();
                         if let Some(first) = input_names.first() {
                             reduce_inputs.insert("x".to_string(), Self::create_argument(first));
                         }
@@ -10394,7 +10397,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         ));
 
                         // Reshape [1] -> []
-                        let mut reshape_back: HashMap<String, Argument> = HashMap::new();
+                        let mut reshape_back: BTreeMap<String, Argument> = BTreeMap::new();
                         reshape_back.insert(
                             "x".to_string(),
                             Self::create_name_argument(reduce_intermediate_name),
