@@ -51,6 +51,9 @@ length as capacity, and are resized every token.
 
 ## Legacy executors
 
+For the CoreML subset of named slice sizes, its bounds checks and exporter limitations,
+see [Runtime-sized CoreML slices](coreml-dynamic-slices.md).
+
 `run_onnx_with_inputs_checked` and `run_coreml_with_inputs_checked` take the input and output
 descriptor maps from `ValidationArtifacts` and apply the same checks to a one-shot run;
 `run_onnx_with_inputs` skips them.

@@ -3652,15 +3652,19 @@ mod adapter {
     }
 }
 
-#[cfg(feature = "cann-runtime")]
-pub(crate) use adapter::encode_via_adapter;
-
-#[cfg(not(feature = "cann-runtime"))]
-pub(crate) fn encode_via_adapter(_graph: &GraphInfo) -> Result<Vec<u8>, GraphError> {
-    Err(GraphError::ConversionFailed {
-        format: "cann".into(),
-        reason: "CANN shim not available (mock mode)".into(),
-    })
+pub(crate) fn encode_via_adapter(graph: &GraphInfo) -> Result<Vec<u8>, GraphError> {
+    super::require_static_slice_sizes(graph, "cann")?;
+    #[cfg(feature = "cann-runtime")]
+    {
+        adapter::encode_via_adapter(graph)
+    }
+    #[cfg(not(feature = "cann-runtime"))]
+    {
+        Err(GraphError::ConversionFailed {
+            format: "cann".into(),
+            reason: "CANN shim not available (mock mode)".into(),
+        })
+    }
 }
 
 /// Rewrites the ViT multi-head-attention qkv split into a ≤4-D form (the NPU
@@ -3976,6 +3980,7 @@ impl GraphConverter for CannConverter {
     }
 
     fn convert(&self, graph: &GraphInfo) -> Result<ConvertedGraph, GraphError> {
+        super::require_static_slice_sizes(graph, self.format())?;
         let data = match encode_via_adapter(graph) {
             Ok(bytes) => bytes,
             // Fall back to placeholder bytes, but say why: a consumer cannot otherwise tell a real
@@ -3985,7 +3990,6 @@ impl GraphConverter for CannConverter {
                 build_hiai_ir_model_mock(graph)?
             }
         };
-
         Ok(ConvertedGraph {
             format: "cann",
             content_type: "application/octet-stream",

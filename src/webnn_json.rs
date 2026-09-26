@@ -1906,6 +1906,237 @@ mod tests {
     }
 
     #[test]
+    fn test_from_graph_json_slice_preserves_dynamic_size() {
+        use webnn_graph::ast::{DataType as WDataType, Dimension as WDimension, OperandDesc};
+
+        let mut inputs = BTreeMap::new();
+        inputs.insert(
+            "x".to_string(),
+            OperandDesc {
+                data_type: WDataType::Float32,
+                shape: vec![
+                    WDimension::Static(1),
+                    WDimension::Static(1),
+                    WDimension::Static(4096),
+                    WDimension::Static(4096),
+                ],
+            },
+        );
+        let mut options = serde_json::Map::new();
+        options.insert("starts".to_string(), serde_json::json!([0, 0, 0, 0]));
+        options.insert(
+            "sizes".to_string(),
+            serde_json::json!([
+                1,
+                1,
+                4096,
+                { "name": "past_sequence_length + 1", "maxSize": 4096 }
+            ]),
+        );
+        let nodes = vec![Node {
+            id: "n0".to_string(),
+            op: "slice".to_string(),
+            inputs: vec!["x".to_string()],
+            options,
+            outputs: Some(vec!["y".to_string()]),
+        }];
+        let mut outputs = BTreeMap::new();
+        outputs.insert("y".to_string(), "y".to_string());
+
+        let graph = from_graph_json(&GraphJson {
+            name: Some("dynamic_slice_subset".to_string()),
+            format: "webnn-graph-json".to_string(),
+            version: 2,
+            quantized: false,
+            inputs,
+            consts: BTreeMap::new(),
+            nodes,
+            outputs,
+        })
+        .expect("from_graph_json");
+
+        let output = &graph.operands[graph.output_operands[0] as usize].descriptor;
+        assert_eq!(
+            output.shape[..3],
+            [
+                Dimension::Static(1),
+                Dimension::Static(1),
+                Dimension::Static(4096),
+            ]
+        );
+        assert_eq!(
+            output.shape[3],
+            Dimension::Dynamic(DynamicDimension {
+                name: "past_sequence_length + 1".to_string(),
+                max_size: 4096,
+            })
+        );
+        let exported = to_graph_json(&graph, false).unwrap();
+        assert_eq!(
+            exported.nodes[0].options["starts"],
+            serde_json::json!([0, 0, 0, 0])
+        );
+        assert_eq!(
+            exported.nodes[0].options["sizes"],
+            serde_json::json!([
+                1, 1, 4096, { "name": "past_sequence_length + 1", "maxSize": 4096 }
+            ])
+        );
+        let round_trip = from_graph_json(&exported).unwrap();
+        assert_eq!(round_trip.operations, graph.operations);
+        assert_eq!(
+            round_trip.operands[round_trip.output_operands[0] as usize]
+                .descriptor
+                .shape,
+            output.shape,
+        );
+        assert_eq!(
+            round_trip.operands[round_trip.output_operands[0] as usize]
+                .descriptor
+                .data_type,
+            output.data_type,
+        );
+    }
+
+    #[test]
+    fn test_from_graph_json_slice_keeps_fixed_size_equal_to_dynamic_input_maximum() {
+        use webnn_graph::ast::{
+            DataType as WDataType, Dimension as WDimension, DynamicDimension as WDynamicDimension,
+            OperandDesc,
+        };
+
+        let mut inputs = BTreeMap::new();
+        inputs.insert(
+            "x".to_string(),
+            OperandDesc {
+                data_type: WDataType::Float32,
+                shape: vec![WDimension::Dynamic(WDynamicDimension {
+                    name: "sequence_length".to_string(),
+                    max_size: 8,
+                })],
+            },
+        );
+        let mut options = serde_json::Map::new();
+        options.insert("starts".to_string(), serde_json::json!([0]));
+        options.insert("sizes".to_string(), serde_json::json!([8]));
+        options.insert("strides".to_string(), serde_json::json!([1]));
+        let nodes = vec![Node {
+            id: "n0".to_string(),
+            op: "slice".to_string(),
+            inputs: vec!["x".to_string()],
+            options,
+            outputs: Some(vec!["y".to_string()]),
+        }];
+        let mut outputs = BTreeMap::new();
+        outputs.insert("y".to_string(), "y".to_string());
+
+        let graph = from_graph_json(&GraphJson {
+            name: Some("fixed_slice_dynamic_input_subset".to_string()),
+            format: "webnn-graph-json".to_string(),
+            version: 2,
+            quantized: false,
+            inputs,
+            consts: BTreeMap::new(),
+            nodes,
+            outputs,
+        })
+        .expect("from_graph_json");
+
+        let input = &graph.operands[graph.input_operands[0] as usize].descriptor;
+        assert_eq!(
+            input.shape,
+            vec![Dimension::Dynamic(DynamicDimension {
+                name: "sequence_length".to_string(),
+                max_size: 8,
+            })]
+        );
+        // At an active input length of four this still requests eight elements;
+        // importing it must not turn it into a full-axis, length-four slice.
+        let output = &graph.operands[graph.output_operands[0] as usize].descriptor;
+        assert_eq!(output.shape, vec![Dimension::Static(8)]);
+        let Operation::Slice { starts, sizes, .. } = &graph.operations[0] else {
+            panic!("expected slice operation");
+        };
+        assert_eq!(starts, &[0]);
+        assert_eq!(sizes, &[crate::operator_options::MLDimension::Static(8)]);
+        let exported = to_graph_json(&graph, false).unwrap();
+        assert_eq!(exported.nodes[0].options["starts"], serde_json::json!([0]));
+        assert_eq!(exported.nodes[0].options["sizes"], serde_json::json!([8]));
+        assert_eq!(exported.nodes[0].options["strides"], serde_json::json!([1]));
+        let round_trip = from_graph_json(&exported).unwrap();
+        assert_eq!(round_trip.operations, graph.operations);
+        assert_eq!(
+            round_trip.operands[round_trip.output_operands[0] as usize]
+                .descriptor
+                .shape,
+            vec![Dimension::Static(8)],
+        );
+    }
+
+    #[test]
+    fn test_from_graph_json_slice_defers_dynamic_bounds_and_rejects_bad_strides() {
+        use webnn_graph::ast::{DataType as WDataType, OperandDesc};
+
+        let mut inputs = BTreeMap::new();
+        inputs.insert(
+            "x".to_string(),
+            OperandDesc {
+                data_type: WDataType::Float32,
+                shape: wshape(&[8]),
+            },
+        );
+        let mut options = serde_json::Map::new();
+        options.insert("starts".to_string(), serde_json::json!([2]));
+        options.insert(
+            "sizes".to_string(),
+            serde_json::json!([
+                { "name": "sequence", "maxSize": 16 }
+            ]),
+        );
+        let mut graph_json = GraphJson {
+            name: Some("runtime_slice_bounds".to_string()),
+            format: "webnn-graph-json".to_string(),
+            version: 2,
+            quantized: false,
+            inputs,
+            consts: BTreeMap::new(),
+            nodes: vec![Node {
+                id: "n0".to_string(),
+                op: "slice".to_string(),
+                inputs: vec!["x".to_string()],
+                options,
+                outputs: Some(vec!["y".to_string()]),
+            }],
+            outputs: BTreeMap::from([("y".to_string(), "y".to_string())]),
+        };
+        let graph = from_graph_json(&graph_json).unwrap();
+        assert_eq!(
+            graph.operands[graph.output_operands[0] as usize]
+                .descriptor
+                .shape,
+            vec![Dimension::Dynamic(DynamicDimension {
+                name: "sequence".to_string(),
+                max_size: 16,
+            })],
+        );
+        for strides in [
+            serde_json::json!([0]),
+            serde_json::json!([2]),
+            serde_json::json!([1, 1]),
+        ] {
+            graph_json.nodes[0]
+                .options
+                .insert("strides".to_string(), strides);
+            assert!(from_graph_json(&graph_json).is_err());
+        }
+        graph_json.nodes[0].options.remove("strides");
+        graph_json.nodes[0]
+            .options
+            .insert("sizes".to_string(), serde_json::json!([8]));
+        assert!(from_graph_json(&graph_json).is_err());
+    }
+
+    #[test]
     fn test_from_graph_json_dynamic_expand_shape_inference_subset() {
         use webnn_graph::ast::{
             DataType as WDataType, Dimension as WDimension, DynamicDimension as WDynamicDimension,

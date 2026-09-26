@@ -40,8 +40,8 @@ use crate::shape_inference::{
     infer_gather_shape_dimensions, infer_gemm_shape_dimensions, infer_global_pool_shape,
     infer_matmul_shape_dimensions, infer_pad_shape, infer_pool2d_shape_dimensions,
     infer_prelu_shape, infer_reduce_shape_dimensions, infer_resample2d_shape,
-    infer_scatter_elements_shape, infer_scatter_nd_shape, infer_slice_shape, infer_split_shapes,
-    infer_squeeze_shape, infer_tile_shape, infer_transpose_shape_dimensions,
+    infer_scatter_elements_shape, infer_scatter_nd_shape, infer_slice_shape_dimensions,
+    infer_split_shapes, infer_squeeze_shape, infer_tile_shape, infer_transpose_shape_dimensions,
     infer_triangular_shape, infer_unsqueeze_shape_dimensions,
 };
 use crate::webnn_json::to_graph_json;
@@ -140,25 +140,29 @@ fn slice_shape(
         .into());
     }
 
-    let sizes_u32: Vec<u32> = sizes.iter().map(|d| d.static_or_max()).collect();
     let strides = options.as_ref().map(|o| o.strides.as_slice());
     let shape = infer_shape_err(
         "slice",
         operation,
-        infer_slice_shape(
-            &shape_dims_u32(&operand.descriptor.shape),
-            starts,
-            &sizes_u32,
-            strides,
-        )
-        .map(|v| to_dimension_vector(&v)),
+        infer_slice_shape_dimensions(&operand.descriptor.shape, starts, sizes, strides),
     )?;
 
-    Ok(OperandDescriptor {
+    let descriptor = OperandDescriptor {
         data_type: operand.descriptor.data_type,
         shape,
         pending_permutation: vec![],
-    })
+    };
+    if descriptor.byte_length().is_none() {
+        return Err(Box::new(ShapeInferenceError::InferError {
+            op_name: "slice",
+            operation: operation.clone(),
+            source: GraphError::ShapeInferenceFailed {
+                reason: "Slice maximum output byte length overflows usize".to_string(),
+            },
+        })
+        .into());
+    }
+    Ok(descriptor)
 }
 
 fn concat_shape(
@@ -3380,6 +3384,92 @@ mod test {
         },
         operators::Operation,
     };
+
+    #[test]
+    fn slice_builder_preserves_explicit_dynamic_and_fixed_sizes() {
+        use crate::graph::{Dimension, DynamicDimension};
+        use crate::operator_options::{MLDimension, MLDynamicDimension, MLSliceOptions};
+
+        let mut builder = MLGraphBuilder::new_uncompiled();
+        let dimension = DynamicDimension {
+            name: "sequence".to_string(),
+            max_size: 8,
+        };
+        let input_id = builder.recorder.as_mut().unwrap().add_input(
+            "input".into(),
+            crate::graph::OperandDescriptor {
+                data_type: crate::graph::DataType::Float32,
+                shape: vec![Dimension::Dynamic(dimension.clone())],
+                pending_permutation: vec![],
+            },
+        );
+        let input = crate::mlcontext::MLOperand {
+            id: input_id as usize,
+        };
+
+        let dynamic_size = MLDimension::Dynamic(MLDynamicDimension {
+            name: dimension.name.clone(),
+            max_size: dimension.max_size,
+        });
+        let dynamic = builder
+            .slice(input, &[0], std::slice::from_ref(&dynamic_size))
+            .unwrap();
+        let fixed = builder
+            .slice(input, &[0], &[MLDimension::Static(8)])
+            .unwrap();
+        let graph = builder.recorder.as_ref().unwrap().graph();
+        assert_eq!(
+            graph.operands[dynamic.id].descriptor.shape,
+            vec![Dimension::Dynamic(dimension)]
+        );
+        assert_eq!(
+            graph.operands[fixed.id].descriptor.shape,
+            vec![Dimension::Static(8)]
+        );
+        assert!(
+            builder
+                .slice_with_options(
+                    input,
+                    &[0],
+                    &[dynamic_size],
+                    MLSliceOptions {
+                        strides: vec![2],
+                        ..Default::default()
+                    },
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn slice_builder_rejects_maximum_output_byte_length_overflow() {
+        use crate::operator_options::MLDimension;
+
+        let mut builder = MLGraphBuilder::new_uncompiled();
+        let input = builder
+            .input(
+                "input",
+                &MLOperandDescriptor::new(
+                    crate::operator_enums::MLOperandDataType::Float32,
+                    vec![u64::from(u32::MAX); 2],
+                ),
+            )
+            .unwrap();
+        assert!(
+            builder
+                .slice(input, &[0, 0], &[u32::MAX; 2].map(MLDimension::Static))
+                .is_err()
+        );
+        assert!(
+            builder
+                .recorder
+                .as_ref()
+                .unwrap()
+                .graph()
+                .operations
+                .is_empty()
+        );
+    }
 
     #[test]
     fn conv2d_bias_through_options_uses_operand_index() {

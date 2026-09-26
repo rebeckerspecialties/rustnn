@@ -127,6 +127,9 @@ Rules that hold for every converter:
 - Dynamic expand derives repetitions from proven broadcast relationships: matching axes
   repeat once, singleton axes repeat by the target extent. It does not divide target by
   input sizes, which would admit invalid broadcasts and introduce division by zero.
+- [Runtime-sized slices](https://rustnn.github.io/rustnn/development/coreml-dynamic-slices/) support explicit named sizes bound to
+  graph inputs, constant starts and unit strides. Unknown or derived relationships fail
+  explicitly; runtime bounds checks do not replace fixed sizes with active extents.
 
 ### LiteRT
 
