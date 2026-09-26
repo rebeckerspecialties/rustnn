@@ -7,6 +7,10 @@ use std::process::Command;
 
 use super::wpt_types::{WptCorpus, WptLoadedCase};
 
+/// WPT corpus embedded at build time (see `build.rs`).
+#[cfg(feature = "wpt-embed-corpus")]
+const EMBEDDED_WPT_CORPUS: &str = include_str!(concat!(env!("OUT_DIR"), "/webnn-wpt-corpus.json"));
+
 pub fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -89,8 +93,64 @@ pub fn ensure_wpt_cache(wpt_dir: &Path) -> Result<(), String> {
     fetch_wpt_cache(wpt_dir)
 }
 
-/// Load the full WPT conformance corpus in one Node.js invocation.
+/// Verify the WPT checkout at `wpt_dir` matches the pinned `WPT_REVISION` file.
+///
+/// Returns `None` when the checkout matches the pin, or `Some(warning)` on a
+/// mismatch or when the revision cannot be determined (e.g. `WPT_DIR` is not a
+/// git checkout, or the pin file is missing/invalid).
+pub fn check_wpt_revision(wpt_dir: &Path) -> Option<String> {
+    let pinned = std::fs::read_to_string(repo_root().join("WPT_REVISION"))
+        .ok()
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| (7..=40).contains(&s.len()) && s.chars().all(|c| c.is_ascii_hexdigit()));
+    let Some(pinned) = pinned else {
+        return Some(
+            "WPT_REVISION file is missing or invalid; cannot verify the WPT checkout".to_string(),
+        );
+    };
+
+    let actual = Command::new("git")
+        .arg("-C")
+        .arg(wpt_dir)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_lowercase());
+    let Some(actual) = actual else {
+        return Some(format!(
+            "cannot determine the WPT checkout revision at {} (is it a git checkout?)",
+            wpt_dir.display()
+        ));
+    };
+
+    if actual.starts_with(&pinned) {
+        None
+    } else {
+        Some(format!(
+            "WPT checkout ({actual}) does not match pinned WPT_REVISION ({pinned}); run `make fetch-wpt`"
+        ))
+    }
+}
+
+/// The WPT corpus embedded at build time, when enabled.
+#[cfg(feature = "wpt-embed-corpus")]
+fn embedded_wpt_corpus() -> Option<WptCorpus> {
+    serde_json::from_str(EMBEDDED_WPT_CORPUS).ok()
+}
+
+/// Load the WPT conformance corpus.
+///
+/// With `--features wpt-embed-corpus` the corpus is baked into the binary at
+/// build time (no Node.js needed);
+/// Otherwise it is dumped from the WPT checkout via the host Node.js bridge.
 pub fn load_wpt_corpus(wpt_dir: &Path) -> Result<WptCorpus, String> {
+    #[cfg(feature = "wpt-embed-corpus")]
+    if let Some(corpus) = embedded_wpt_corpus() {
+        return Ok(corpus);
+    }
+
     ensure_wpt_cache(wpt_dir)?;
 
     let script = dump_corpus_script();

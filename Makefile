@@ -6,20 +6,37 @@ PNG_PATH ?= target/graph.png
 ONNX_PATH ?= target/graph.onnx
 COREML_PATH ?= target/graph.mlmodel
 COREMLC_PATH ?= target/graph.mlmodelc
+COREML_FEATURES ?= coreml-runtime,dynamic-inputs
+TEST_FILTER ?=
 LITERT_PATH ?= target/graph.tflite
 CANN_PATH ?= target/graph.cann
 OHOS_SDK_NATIVE ?=
+CAPI_PREFIX ?= $(CURDIR)/target/rustnn-capi-install
+CAPI_EXAMPLE_BUILD_DIR ?= $(CURDIR)/target/examples/capi
+CAPI_RUST_LOG ?= info
 
 ORT_VERSION ?= 1.29.0
 ORT_BASE ?= https://github.com/microsoft/onnxruntime/releases/download/v$(ORT_VERSION)
 ORT_DIR ?= target/onnxruntime
-MATURIN_ARGS ?=
+TRT_VERSION ?= 1.6.1.120
+TRT_CUDA_VERSION ?= 13.4
+TRT_BASE ?= https://developer.nvidia.com/downloads/trt/rtx_sdk/secure/1.6
+TRT_DIR ?= target/tensorrt-rtx
+TRT_SDK_DIR ?= $(TRT_DIR)/TensorRT-RTX-$(TRT_VERSION)
 CHROMEDRIVER_CACHE ?= $(CURDIR)/.cache/chromedriver
 CHROMEDRIVER ?= $(CHROMEDRIVER_CACHE)/chromedriver
 
 # Platform detection
 UNAME_S := $(shell uname)
 UNAME_M := $(shell uname -m)
+
+ifeq ($(OS),Windows_NT)
+	TRT_ARCHIVE ?= TensorRT-RTX-$(TRT_VERSION)-Windows-amd64-cuda-$(TRT_CUDA_VERSION)-Release-external.zip
+	TRT_ENV_VARS = TENSORRT_SDK_DIR="$(abspath $(TRT_SDK_DIR))" PATH="$(abspath $(TRT_SDK_DIR))/bin:$(abspath $(TRT_SDK_DIR))/lib:$$PATH"
+else ifeq ($(UNAME_S),Linux)
+	TRT_ARCHIVE ?= TensorRT-RTX-$(TRT_VERSION)-Linux-$(UNAME_M)-cuda-$(TRT_CUDA_VERSION)-Release-external.tar.zst
+	TRT_ENV_VARS = TENSORRT_SDK_DIR="$(abspath $(TRT_SDK_DIR))" LD_LIBRARY_PATH="$(abspath $(TRT_SDK_DIR))/lib:$(ORT_LIB_DIR_ABS):$$LD_LIBRARY_PATH"
+endif
 
 # Set platform-specific ONNX Runtime tarball name
 ifeq ($(UNAME_S),Darwin)
@@ -82,12 +99,15 @@ CANN_CROSS_ENV = CC_aarch64_unknown_linux_ohos=$(OHOS_SDK_NATIVE)/llvm/bin/clang
 	CANN_DDK=$(CANN_DDK) \
 	RUSTFLAGS="-Clink-arg=--target=aarch64-linux-ohos -Clink-arg=--sysroot=$(OHOS_SDK_NATIVE)/sysroot"
 
-.PHONY: build test fmt run viz onnx coreml coreml-validate onnx-validate litert cann cann-build cann-device-test validate-cann-env validate-all-env \
-	docs-serve docs-build docs-clean ci-docs docs-backend-ops docs-backend-ops-check \
-	fmt-check lint \
+.PHONY: build test fmt fmt-check lint run viz clean clean-all help \
 	coverage coverage-html coverage-lcov coverage-open coverage-clean \
-	help clean-all
-	webnn-chromedriver require-wpt-cache test-webnn-wpt-chrome test-webnn-wpt-chrome-headless
+	docs-serve docs-build docs-clean ci-docs docs-api docs-backend-ops docs-backend-ops-check \
+	fetch-wpt require-wpt-cache test-wpt test-wpt-trtx test-wpt-litert test-wpt-coreml \
+	test-wpt-coreml-report build-coreml test-coreml test-wpt-op test-wpt-report test-wpt-cann \
+	wpt-sync-onnx wpt-sync-litert wpt-sync-coreml wpt-sync-trtx wpt-sync-cann \
+	webnn-chromedriver test-webnn-wpt-chrome test-webnn-wpt-chrome-headless \
+	onnxruntime-download trtxruntime-download onnx onnx-validate coreml coreml-validate litert cann \
+	cann-build cann-device-test validate-cann-env validate-all-env capi-examples
 
 clean:
 	$(CARGO) clean
@@ -159,8 +179,8 @@ test-webnn-wpt-chrome-headless: require-wpt-cache webnn-chromedriver
 test-wpt: onnxruntime-download
 	$(ORT_ENV_VARS) $(CARGO) test --test run_wpt_conformance --features onnx-runtime -- --test-threads 1
 
-test-wpt-trtx:
-	$(CARGO) test --test run_wpt_conformance --features "onnx-runtime,trtx-runtime" -- trtx --test-threads 1
+test-wpt-trtx: onnxruntime-download trtxruntime-download
+	$(ORT_ENV_VARS) $(TRT_ENV_VARS) $(CARGO) test --test run_wpt_conformance --features "onnx-runtime,trtx-runtime" -- trtx --test-threads 1
 
 test-wpt-litert:
 	@HOST_TRIPLE=$$(rustc -vV 2>/dev/null | grep host: | cut -d' ' -f2); \
@@ -173,9 +193,29 @@ test-wpt-litert:
 test-wpt-coreml:
 	$(CARGO) test --test run_wpt_conformance --features coreml-runtime -- coreml --test-threads 1
 
+.PHONY: test-coreml-gather
+test-coreml-gather:
+	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_dynamic_gather --test test_coreml_gather_bounds -- $(TEST_FILTER) --test-threads=1
+
+# Build every target, including examples and the separately run WPT harness.
+build-coreml:
+	$(CARGO) build --all-targets --no-default-features --features $(COREML_FEATURES)
+
+# Ordinary integration suites use test_*. The live WPT and browser harnesses
+# have their own targets and corpus/device setup; do not run them here.
+test-coreml:
+	$(CARGO) test --lib --bins --test 'test_*' --no-default-features --features $(COREML_FEATURES) -- $(TEST_FILTER) --test-threads=1
+
 test-wpt-coreml-report:
 	@mkdir -p reports
 	WPT_REPORT_JSON=reports/wpt-conformance.json $(CARGO) test --test run_wpt_conformance --features coreml-runtime -- coreml --test-threads 1
+
+test-wpt-cann: require-wpt-cache validate-cann-env
+	@mkdir -p reports
+	$(CANN_CROSS_ENV) $(CARGO) test --test run_wpt_conformance --no-run \
+		--target aarch64-unknown-linux-ohos --features cann-runtime,wpt-embed-corpus --release
+	CANN_DDK=$(CANN_DDK) \
+	./scripts/ohos-test-helper.sh wpt $(filter-out $@,$(MAKECMDGOALS))
 
 test-wpt-op: onnxruntime-download
 	@test -n "$(OP)" || (echo "Usage: make test-wpt-op OP=add" && exit 1)
@@ -190,6 +230,31 @@ test-wpt-report: fetch-wpt onnxruntime-download
 	LD_LIBRARY_PATH="$$LITERT_LIB_DIR:$$LD_LIBRARY_PATH" \
 	LIBRARY_PATH="$$LITERT_LIB_DIR:$$LIBRARY_PATH" \
 	RUST_BACKTRACE=1 WPT_REPORT_JSON=reports/wpt-conformance.json $(ORT_ENV_VARS) $(CARGO) test --test run_wpt_conformance --features $(WPT_BACKEND)-runtime -- --test-threads 1
+
+# ONNX: onnx_expected_failures.txt.
+wpt-sync-onnx: fetch-wpt
+	./scripts/update_expected_failures.sh onnx 2>&1 | tee /tmp/wpt-onnx.log || true
+	@grep -q -F '[WPT] result:' /tmp/wpt-onnx.log
+
+# LiteRT: litert_expected_failures.txt.
+wpt-sync-litert: fetch-wpt
+	./scripts/update_expected_failures.sh litert 2>&1 | tee /tmp/wpt-litert.log || true
+	@grep -q -F '[WPT] result:' /tmp/wpt-litert.log
+
+# CoreML: coreml_expected_failures.txt (macOS).
+wpt-sync-coreml: fetch-wpt
+	./scripts/update_expected_failures.sh coreml 2>&1 | tee /tmp/wpt-coreml.log || true
+	@grep -q -F '[WPT] result:' /tmp/wpt-coreml.log
+
+# TensorRT: trtx_expected_failures.txt (requires an NVIDIA GPU; not run in CI).
+wpt-sync-trtx: fetch-wpt
+	./scripts/update_expected_failures.sh trtx 2>&1 | tee /tmp/wpt-trtx.log || true
+	@grep -q -F '[WPT] result:' /tmp/wpt-trtx.log
+
+# CANN: cann_expected_failures.txt (requires an OHOS device).
+wpt-sync-cann: fetch-wpt
+	./scripts/update_expected_failures.sh cann 2>&1 | tee /tmp/wpt-cann.log || true
+	@grep -q -F '[WPT] result:' /tmp/wpt-cann.log
 
 fmt:
 	$(CARGO) fmt
@@ -252,12 +317,42 @@ onnxruntime-download:
 		echo "[OK] ONNX Runtime downloaded and extracted"; \
 	fi
 
+trtxruntime-download:
+	@test -n "$(TRT_ARCHIVE)" || (echo "No TensorRT-RTX SDK archive configured for this platform" >&2; exit 1)
+	@if [ -f "$(TRT_SDK_DIR)/include/NvInfer.h" ]; then \
+		echo "TensorRT-RTX already downloaded at $(TRT_SDK_DIR)"; \
+	else \
+		set -eu; \
+		mkdir -p "$(TRT_DIR)" "$(dir $(TRT_SDK_DIR))"; \
+		tmp="$$(mktemp -d "$(TRT_DIR)/download.XXXXXX")"; \
+		trap 'rm -rf "$$tmp"' EXIT; \
+		curl -fL --retry 3 "$(TRT_BASE)/$(TRT_ARCHIVE)" -o "$$tmp/$(TRT_ARCHIVE)"; \
+		case "$(TRT_ARCHIVE)" in \
+			*.zip) unzip -q "$$tmp/$(TRT_ARCHIVE)" -d "$$tmp" ;; \
+			*.tar.zst) tar --zstd -xf "$$tmp/$(TRT_ARCHIVE)" -C "$$tmp" ;; \
+		esac; \
+		test -f "$$tmp/TensorRT-RTX-$(TRT_VERSION)/include/NvInfer.h"; \
+		mv "$$tmp/TensorRT-RTX-$(TRT_VERSION)" "$(TRT_SDK_DIR)"; \
+		echo "TensorRT-RTX $(TRT_VERSION) downloaded to $(TRT_SDK_DIR)"; \
+	fi
+
 onnx: onnxruntime-download
 	$(ORT_ENV_VARS) $(CARGO) run --features onnx-runtime -- $(GRAPH_FILE) --convert onnx --convert-output $(ONNX_PATH)
 	@echo "ONNX graph written to $(ONNX_PATH)"
 
 onnx-validate: onnx
 	$(ORT_ENV_VARS) $(CARGO) run --features onnx-runtime -- $(GRAPH_FILE) --convert onnx --convert-output $(ONNX_PATH) --run-onnx
+
+# Build, install, and execute the C and C++ API examples with ONNX Runtime.
+capi-examples: onnxruntime-download
+	$(ORT_ENV_VARS) $(CARGO) cinstall --features capi,onnx-runtime --prefix="$(CAPI_PREFIX)"
+	cmake -S examples/capi -B "$(CAPI_EXAMPLE_BUILD_DIR)" \
+		-DCMAKE_BUILD_TYPE=RelWithDebInfo \
+		-DCMAKE_EXPORT_COMPILE_COMMANDS=YES \
+		-DCMAKE_PREFIX_PATH="$(CAPI_PREFIX)"
+	cmake --build "$(CAPI_EXAMPLE_BUILD_DIR)" --parallel
+	RUST_LOG="$(CAPI_RUST_LOG)" $(ORT_ENV_VARS) "$(CAPI_EXAMPLE_BUILD_DIR)/rustnn_c_example"
+	RUST_LOG="$(CAPI_RUST_LOG)" $(ORT_ENV_VARS) "$(CAPI_EXAMPLE_BUILD_DIR)/rustnn_cpp_example"
 
 coreml:
 	$(CARGO) run --features coreml-runtime -- $(GRAPH_FILE) --convert coreml --convert-output $(COREML_PATH)
@@ -326,6 +421,14 @@ docs-clean:
 	@echo "Cleaning documentation build artifacts..."
 	rm -rf site/
 
+# Rust API documentation (rustdoc). Warnings are errors so broken doc links fail CI.
+# The feature list matches what CI type-checks on Linux; coreml-runtime is macOS-only.
+DOCS_API_FEATURES ?= onnx-runtime,trtx-runtime,litert-runtime,cann-runtime,coreml-runtime,dynamic-inputs
+docs-api:
+	@echo "Building Rust API documentation..."
+	RUSTDOCFLAGS="-D warnings" $(CARGO) doc --no-deps --lib --features $(DOCS_API_FEATURES)
+	@echo "[OK] Rust API documentation generated in target/doc/rustnn/"
+
 docs-backend-ops:
 	@echo "Generating backend operator support report..."
 	python3 scripts/generate_backend_operator_report.py
@@ -368,8 +471,12 @@ help:
 	@echo ""
 	@echo "ONNX Conversion:"
 	@echo "  onnxruntime-download - Download ONNX Runtime"
+	@echo "  trtxruntime-download - Download TensorRT-RTX SDK"
 	@echo "  onnx               - Convert graph to ONNX format"
 	@echo "  onnx-validate      - Convert and validate ONNX graph"
+	@echo ""
+	@echo "C and C++ API:"
+	@echo "  capi-examples      - Install the C API and build/run both dispatch examples"
 	@echo ""
 	@echo "WPT Conformance:"
 	@echo "  fetch-wpt          - Download/update WPT corpus (.cache/wpt)"
@@ -377,6 +484,13 @@ help:
 	@echo "  test-wpt-op OP=... - Run filtered WPT trials"
 	@echo "  test-wpt-report    - Run full WPT suite and write JSON/HTML reports (ignores trial failures)"
 	@echo "  test-wpt-trtx      - Run WPT suite via TensorRT (skips when GPU unavailable)"
+	@echo "  test-wpt-cann      - Run WPT conformance suite via CANN on device"
+	@echo "  test-wpt-litert    - Run WPT suite via LiteRT"
+	@echo "  wpt-sync-onnx      - Regenerate ONNX expected-failures"
+	@echo "  wpt-sync-litert    - Regenerate LiteRT expected-failures"
+	@echo "  wpt-sync-coreml    - Regenerate CoreML expected-failures (macOS)"
+	@echo "  wpt-sync-trtx      - Regenerate TensorRT expected-failures (requires GPU)"
+	@echo "  wpt-sync-cann      - Regenerate CANN expected-failures (requires device)"
 	@echo "  webnn-chromedriver - Download a ChromeDriver compatible with installed Chrome"
 	@echo "  test-webnn-wpt-chrome - Run browser WebNN WPT graph-build tests in Chrome"
 	@echo "  test-webnn-wpt-chrome-headless - Run the browser WebNN WPT tests headlessly"
@@ -384,6 +498,9 @@ help:
 	@echo "CoreML Conversion:"
 	@echo "  coreml             - Convert graph to CoreML format"
 	@echo "  coreml-validate    - Convert and validate CoreML graph"
+	@echo "  build-coreml       - Build all targets with CoreML and dynamic inputs (macOS)"
+	@echo "  test-coreml        - Run CoreML unit/integration tests (optional TEST_FILTER=triangular)"
+	@echo "                       Set COREML_FEATURES=coreml-runtime to disable dynamic inputs"
 	@echo ""
 	@echo "LiteRT Conversion:"
 	@echo "  litert             - Convert graph to LiteRT/TFLite format"
@@ -397,6 +514,7 @@ help:
 	@echo "  docs-serve         - Serve documentation with live reload"
 	@echo "  docs-build         - Build static documentation site"
 	@echo "  ci-docs            - Build documentation in strict mode (CI)"
+	@echo "  docs-api           - Build Rust API docs (rustdoc, warnings are errors)"
 	@echo "  docs-clean         - Clean documentation artifacts"
 	@echo "  docs-backend-ops   - Generate backend operator support report"
 	@echo "  docs-backend-ops-check - Verify backend operator report is up to date"
