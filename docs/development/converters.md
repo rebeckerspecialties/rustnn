@@ -112,6 +112,9 @@ Rules that hold for every converter:
   A scalar result keeps the `[1]` CoreML boundary representation without changing the WebNN rank.
 - Float16 weights go to the weight blob written by `weight_file_builder.rs` and returned as
   `weights_data`.
+- The internal `shape` extension lowers to MIL `shape`, retaining its native int32 result
+  inside CoreML and widening the public int64 result at readback. Imported shape tensors
+  retain their type and rank through the shared `unsqueeze` inference path.
 
 ### LiteRT
 
