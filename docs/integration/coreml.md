@@ -56,8 +56,10 @@ for KV caches, alternate two distinct tensor sets. A dispatch cannot bind one te
 input and output.
 
 When supported, `outputBackings` proposes the destination array to CoreML. Only a returned
-array with the same object identity counts as accepted. Flexible output features cannot use
-backings: those outputs, declined backings, strided results and dtype conversions are copied
+array with the same object identity counts as accepted. Backings require a fully static
+graph (including intermediate operands) and a fixed output feature. A fixed-size output
+alone is not sufficient when the graph has dynamic dimensions. Ineligible outputs,
+declined backings, strided results and dtype conversions are copied
 into the destination's owned storage. Returned arrays are never adopted as tensor storage,
 because CoreML may alias them to an input or another output. This is not a guarantee of zero
 copies inside CoreML, GPU or Neural Engine drivers.

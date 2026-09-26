@@ -66,6 +66,7 @@ pub(crate) struct CoremlTensor {
 /// A compiled CoreML model held by [`MLGraph`] (mirrors `OrtGraph`).
 pub(crate) struct CoremlGraph {
     model: CompiledCoremlModel,
+    output_backings_eligible: bool,
 }
 
 impl fmt::Debug for CoremlGraph {
@@ -90,6 +91,7 @@ impl fmt::Debug for CoremlBuilder {
 
 impl<'context, 'builder> MLBackendBuilder<'context, 'builder> for CoremlBuilder {
     fn build(&mut self, graph_info: GraphInfo) -> crate::error::Result<MLGraph<'context>> {
+        let output_backings_eligible = supports_output_backings(&graph_info);
         let converted = CoremlMlProgramConverter
             .convert(&graph_info)
             .map_err(|e| Error::GraphBuildError { source: e.into() })?;
@@ -101,10 +103,25 @@ impl<'context, 'builder> MLBackendBuilder<'context, 'builder> for CoremlBuilder 
         )
         .map_err(|e| Error::GraphBuildError { source: e.into() })?;
         MLGraph::new(
-            MLBackendGraph::CoremlModel(CoremlGraph { model }),
+            MLBackendGraph::CoremlModel(CoremlGraph {
+                model,
+                output_backings_eligible,
+            }),
             &graph_info,
         )
     }
+}
+
+/// A fixed output feature does not prove that the whole graph is static.
+/// Dynamic intermediates can still make a proposed output backing unsafe.
+fn supports_output_backings(graph: &GraphInfo) -> bool {
+    graph.operands.iter().all(|operand| {
+        operand
+            .descriptor
+            .shape
+            .iter()
+            .all(|dimension| matches!(dimension, crate::graph::Dimension::Static(_)))
+    })
 }
 
 /// CoreML's in-memory model compiler does not currently behave identically to
@@ -170,13 +187,14 @@ impl CoremlContext {
         inputs: &MLNamedTensors,
         outputs: &MLNamedTensors,
     ) -> crate::error::Result<HashMap<String, Vec<u8>>> {
-        let model = &graph
-            .backend
-            .as_coreml_model()
-            .ok_or_else(|| Error::GraphDispatchError {
-                source: "MLGraph is not a CoreML model graph".into(),
-            })?
-            .model;
+        let coreml_graph =
+            graph
+                .backend
+                .as_coreml_model()
+                .ok_or_else(|| Error::GraphDispatchError {
+                    source: "MLGraph is not a CoreML model graph".into(),
+                })?;
+        let model = &coreml_graph.model;
         self.statistics.last_compute_units = model.compute_unit();
         let active = |descriptors: &HashMap<String, crate::graph::OperandDescriptor>,
                       bindings: &MLNamedTensors| {
@@ -222,7 +240,7 @@ impl CoremlContext {
             model,
             &native_inputs,
             &native_outputs,
-            self.options.output_backings,
+            self.options.output_backings && coreml_graph.output_backings_eligible,
             &mut self.statistics,
         )
         .map_err(|e| Error::GraphDispatchError { source: e.into() })
@@ -525,6 +543,52 @@ impl<'context> MLBackendContext<'context> for CoremlContext {
 
 #[cfg(test)]
 mod test {
+    #[test]
+    fn output_backings_require_static_intermediates_as_well_as_inputs_and_outputs() {
+        use crate::graph::{
+            DataType, Dimension, DynamicDimension, GraphInfo, Operand, OperandDescriptor,
+            OperandKind,
+        };
+
+        let mut graph = GraphInfo {
+            operands: [
+                OperandKind::Input,
+                OperandKind::Intermediate,
+                OperandKind::Output,
+            ]
+            .into_iter()
+            .map(|kind| Operand {
+                kind,
+                name: None,
+                descriptor: OperandDescriptor {
+                    data_type: DataType::Float32,
+                    shape: vec![Dimension::Static(1)],
+                    pending_permutation: vec![],
+                },
+            })
+            .collect(),
+            input_operands: vec![0],
+            output_operands: vec![2],
+            ..Default::default()
+        };
+        assert!(super::supports_output_backings(&graph));
+        for index in 0..graph.operands.len() {
+            for name in ["sequence", ""] {
+                // Even max_size=1 is a dynamic dimension, not a static proof.
+                graph.operands[index].descriptor.shape[0] = Dimension::Dynamic(DynamicDimension {
+                    name: name.into(),
+                    max_size: 1,
+                });
+                assert!(!super::supports_output_backings(&graph));
+                graph.operands[index].descriptor.shape[0] = Dimension::Static(1);
+            }
+        }
+        for operand in &mut graph.operands {
+            operand.descriptor.shape.clear();
+        }
+        assert!(super::supports_output_backings(&graph));
+    }
+
     use crate::mlcontext::{
         Backend, MLContext, MLContextOptions, MLNamedOperands, MLNamedTensors, MLOperandDescriptor,
         MLPowerPreference, MLTensorDescriptor,
