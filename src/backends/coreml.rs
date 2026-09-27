@@ -27,7 +27,7 @@ use crate::mlcontext::{
     MLBackendBuilder, MLBackendContext, MLBackendGraph, MLGraph, MLNamedTensors, MLTensor,
     MLTensorDescriptor,
 };
-use crate::mlcontextoptions::{CoremlOptions, CoremlTensorStatistics};
+use crate::mlcontextoptions::{BackendStatistics, CoremlOptions, CoremlTensorStatistics};
 use crate::operators::Operation;
 
 /// Number of bytes required to store a tensor described by `descriptor`.
@@ -248,8 +248,8 @@ impl CoremlContext {
 }
 
 impl<'context> MLBackendContext<'context> for CoremlContext {
-    fn coreml_tensor_statistics(&self) -> Option<CoremlTensorStatistics> {
-        Some(self.statistics)
+    fn backend_statistics(&self) -> Option<BackendStatistics> {
+        Some(BackendStatistics::Coreml(self.statistics))
     }
     fn accelerated(&self) -> bool {
         self.device_type != DeviceType::Cpu

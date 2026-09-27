@@ -76,8 +76,11 @@ active shape between dispatches. Shape changes rebuild the array view, but do no
 another data buffer while they fit the reserved capacity. Reserve replaces storage with
 zeroed bytes; growth during resize preserves the existing prefix.
 
-`MLContext::rustnn_coreml_tensor_statistics()` reports cumulative host reads/writes, native
-allocations, direct input bindings, proposed/accepted backings and logical copied payloads.
+`MLContext::rustnn_backend_statistics()` returns `Some(BackendStatistics::Coreml(...))`
+for this backend; backends that do not report statistics return `None`.
+`MLContext::rustnn_coreml_tensor_statistics()` is a convenience adapter for the CoreML
+variant. Its counters report cumulative host reads/writes, native allocations, direct input
+bindings, proposed/accepted backings and logical copied payloads.
 These count rustnn-side work, not total memory traffic or internal CoreML allocations. The
 reported compute-unit policy includes load fallback but does not measure accelerator
 placement. Take counter differences around the decode loop to exclude prefill and setup.

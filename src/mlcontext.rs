@@ -34,8 +34,8 @@ use std::collections::BTreeMap;
 use std::{collections::HashMap, fmt::Display, marker::PhantomData};
 
 pub use crate::mlcontextoptions::{
-    CoremlOptions, CoremlTensorStatistics, LiteRtOptions, MLContextOptions, MLPowerPreference,
-    OrtOptions, RustNNOptions, TrtxOptions,
+    BackendStatistics, CoremlOptions, CoremlTensorStatistics, LiteRtOptions, MLContextOptions,
+    MLPowerPreference, OrtOptions, RustNNOptions, TrtxOptions,
 };
 
 /// <https://www.w3.org/TR/webnn/#typedefdef-mlnamedtensors>
@@ -75,7 +75,7 @@ pub(crate) trait ListDevices {
 
 // could make public later if interface stabilized
 pub(crate) trait MLBackendContext<'context>: std::fmt::Debug + Send + Sync {
-    fn coreml_tensor_statistics(&self) -> Option<CoremlTensorStatistics> {
+    fn backend_statistics(&self) -> Option<BackendStatistics> {
         None
     }
     fn accelerated(&self) -> bool;
@@ -743,16 +743,40 @@ impl<'context> MLContext<'context> {
         self.backend.rustnn_set_tensor_capacity(tensor, max_shape)
     }
 
-    /// Cumulative tensor I/O counters for a CoreML context, or `None` for another backend.
-    /// Counts only rustnn-side work, not internal CoreML/driver copies or hardware placement.
+    /// Snapshot the selected backend's diagnostics, or `None` if it does not report them.
+    /// Counter meanings are specific to the [`BackendStatistics`] variant; they are not
+    /// standardized WebNN metrics or a guarantee of measured accelerator placement.
+    pub fn rustnn_backend_statistics(&self) -> Option<BackendStatistics> {
+        self.backend.backend_statistics()
+    }
+
+    /// CoreML-specific convenience adapter for [`Self::rustnn_backend_statistics`].
+    /// Returns cumulative tensor I/O counters, or `None` for another backend. Counts only
+    /// rustnn-side work, not internal CoreML/driver copies or hardware placement.
     pub fn rustnn_coreml_tensor_statistics(&self) -> Option<CoremlTensorStatistics> {
-        self.backend.coreml_tensor_statistics()
+        match self.rustnn_backend_statistics() {
+            Some(BackendStatistics::Coreml(statistics)) => Some(statistics),
+            _ => None,
+        }
     }
 }
 
 #[cfg(test)]
 mod test {
     use crate::{mlcontext::*, mlgraphbuilder::MLGraphBuilder, webnn_json::from_graph_json};
+
+    #[test]
+    fn backend_statistics_are_optional() {
+        // This backend uses the default trait method, without a runtime dependency.
+        let context = MLContext {
+            backend: Box::new(crate::backends::DisabledContext {}),
+            device: BackendDevice::LiteRt {
+                device_type: DeviceType::Cpu,
+            },
+        };
+        assert_eq!(context.rustnn_backend_statistics(), None);
+        assert_eq!(context.rustnn_coreml_tensor_statistics(), None);
+    }
 
     fn create_add_graph_context_and_graph() -> Option<(MLContext<'static>, MLGraph<'static>)> {
         let contents = r#"

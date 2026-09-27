@@ -2,11 +2,12 @@
 //
 // SPDX-License-Identifier: Apache-2
 
-//! Options for [`crate::mlcontext::MLContext::create`].
+//! Options and backend diagnostics for [`crate::mlcontext::MLContext`].
 //!
 //! [`MLContextOptions`] carries the two WebNN hints (`powerPreference`, `accelerated`) plus
 //! rustnn extensions: a backend or device hint that overrides automatic selection, and
 //! [`RustNNOptions`] with per-backend tuning such as [`TrtxOptions`].
+//! [`BackendStatistics`] holds optional, backend-specific diagnostic snapshots.
 
 use crate::mlcontext::{Backend, BackendDevice};
 
@@ -180,6 +181,18 @@ impl Default for CoremlOptions {
             output_backings: true,
         }
     }
+}
+
+/// A snapshot of the selected backend's diagnostics (rustnn extension).
+///
+/// Backends opt into reporting statistics; an unsupported capability is returned as `None`
+/// by [`crate::mlcontext::MLContext::rustnn_backend_statistics`]. Each variant retains its
+/// backend's counter definitions rather than implying comparable measurements across backends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BackendStatistics {
+    /// Cumulative CoreML tensor I/O counters.
+    Coreml(CoremlTensorStatistics),
 }
 
 /// Cumulative CoreML tensor I/O counters for a context (rustnn extension).

@@ -5,8 +5,9 @@
 use rustnn::error::Error;
 use rustnn::graph::{DataType, Dimension, GraphInfo, Operand, OperandDescriptor, OperandKind};
 use rustnn::mlcontext::{
-    Backend, MLContext, MLContextOptions, MLGraphBuilder, MLNamedOperands, MLNamedTensors,
-    MLOperandDescriptor, MLPowerPreference, MLTensor, MLTensorDescriptor, RustNNOptions,
+    Backend, BackendStatistics, CoremlTensorStatistics, MLContext, MLContextOptions,
+    MLGraphBuilder, MLNamedOperands, MLNamedTensors, MLOperandDescriptor, MLPowerPreference,
+    MLTensor, MLTensorDescriptor, RustNNOptions,
 };
 use rustnn::operator_enums::MLOperandDataType;
 use rustnn::operator_options::MLDimension;
@@ -47,6 +48,32 @@ fn read(context: &mut MLContext<'_>, tensor: &MLTensor) -> Vec<u8> {
     let mut result = vec![0; tensor.rustnn_required_bytes()];
     context.read_tensor(tensor, &mut result).unwrap();
     result
+}
+
+#[test]
+fn backend_statistics_reports_typed_coreml_snapshots() {
+    for mode in MODES {
+        let mut context = context(mode);
+        let initial = context.rustnn_backend_statistics();
+        assert_eq!(
+            initial,
+            Some(BackendStatistics::Coreml(CoremlTensorStatistics::default()))
+        );
+
+        let tensor = tensor(&mut context, MLOperandDataType::Float32, &[2]);
+        context.write_tensor(&tensor, &[1.0f32, 2.0]).unwrap();
+        let Some(BackendStatistics::Coreml(statistics)) = context.rustnn_backend_statistics()
+        else {
+            panic!("CoreML should report its typed statistics");
+        };
+        assert_eq!(statistics.host_write_bytes, 8);
+        assert_eq!(context.rustnn_coreml_tensor_statistics(), Some(statistics));
+        assert_ne!(initial, context.rustnn_backend_statistics());
+        assert_eq!(
+            initial,
+            Some(BackendStatistics::Coreml(CoremlTensorStatistics::default()))
+        );
+    }
 }
 
 fn identity(

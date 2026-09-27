@@ -716,7 +716,7 @@ fn smollm_probe(config: &BenchmarkConfig, path: &Path, device_type: DeviceType) 
     eprintln!("Importing supplied SmolLM source {}", path.display());
     let graph = rustnn::load_graph_from_path(path).context("SmolLM import")?;
     let properties = ContextProperties {
-        tensor_byte_length_limit: 500_000_000_000,
+        tensor_byte_length_limit: usize::try_from(500_000_000_000_u64).unwrap_or(usize::MAX),
         ..ContextProperties::default()
     };
     GraphValidator::new(&graph, properties)
