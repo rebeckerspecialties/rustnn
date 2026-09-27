@@ -13,6 +13,7 @@ use std::ptr;
 use std::sync::Arc;
 use std::sync::mpsc;
 
+use crate::converters::coreml_names;
 use block::ConcreteBlock;
 use objc::rc::autoreleasepool;
 use objc::runtime::{Class, Object};
@@ -28,7 +29,9 @@ use crate::runtime_checks::{RuntimeShapeState, TensorKind, validate_shape_data_l
 unsafe extern "C" {}
 #[cfg(target_os = "macos")]
 #[link(name = "CoreML", kind = "framework")]
-unsafe extern "C" {}
+unsafe extern "C" {
+    static MLModelCreatorDefinedKey: *mut Object;
+}
 
 // Objective-C++ exception firewall (src/executors/coreml_shim.mm).
 // Return codes: 0 = success, 1 = NSError, 2 = NSException, 3 = C++ exception.
@@ -120,6 +123,33 @@ fn shim_error_to_string(buffer: &[u8]) -> String {
         .position(|&byte| byte == 0)
         .unwrap_or(buffer.len());
     String::from_utf8_lossy(&buffer[..end]).into_owned()
+}
+
+fn feature_name(name: &str, escaped: bool) -> std::borrow::Cow<'_, str> {
+    if escaped {
+        coreml_names::encode(name)
+    } else {
+        std::borrow::Cow::Borrowed(name)
+    }
+}
+
+/// Only models carrying our explicit marker use the reversible name contract.
+/// Legacy and third-party models may legitimately use the escape prefix.
+unsafe fn model_uses_escaped_names(model: *mut Object) -> Result<bool, GraphError> {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        let description: *mut Object = msg_send![model, modelDescription];
+        let metadata: *mut Object = msg_send![description, metadata];
+        let user_defined: *mut Object = msg_send![metadata, objectForKey: MLModelCreatorDefinedKey];
+        let key = nsstring_from_str(coreml_names::METADATA_KEY)?;
+        let value: *mut Object = msg_send![user_defined, objectForKey: key];
+        Ok(!value.is_null() && nsstring_to_string(value) == coreml_names::METADATA_VALUE)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = model;
+        Ok(false)
+    }
 }
 
 /// Input tensor for the one-shot CoreML executors.
@@ -254,6 +284,7 @@ pub(crate) struct CompiledCoremlModel {
     model: *mut Object,
     /// Compute unit the model was successfully loaded with (diagnostic only).
     compute_unit: &'static str,
+    escaped_names: bool,
     backing: CoremlModelBacking,
 }
 
@@ -367,7 +398,8 @@ pub(crate) fn compile_model(
             let () = msg_send![config, setComputeUnits: code];
             match load_model_asset(asset, config) {
                 Ok(model) => {
-                    return Ok(CompiledCoremlModel {
+                    let mut compiled = CompiledCoremlModel {
+                        escaped_names: false,
                         model,
                         compute_unit: name,
                         backing: CoremlModelBacking::InMemory {
@@ -375,7 +407,9 @@ pub(crate) fn compile_model(
                             specification_data,
                             weights_data: retained_weights_data,
                         },
-                    });
+                    };
+                    compiled.escaped_names = model_uses_escaped_names(model)?;
+                    return Ok(compiled);
                 }
                 Err(reason) => last_error = reason,
             }
@@ -438,14 +472,17 @@ fn compile_model_from_url(
             }
             // The shim returns an owned (+1) model; `CompiledCoremlModel`'s
             // Drop releases it.
-            return Ok(CompiledCoremlModel {
+            let mut compiled = CompiledCoremlModel {
+                escaped_names: false,
                 model,
                 compute_unit: name,
                 backing: CoremlModelBacking::OnDisk {
                     compiled_dir,
                     temp_model,
                 },
-            });
+            };
+            compiled.escaped_names = model_uses_escaped_names(model)?;
+            return Ok(compiled);
         }
 
         let _ = std::fs::remove_dir_all(&compiled_dir);
@@ -592,7 +629,7 @@ pub(crate) fn run_coreml_bytes(
         let input_descs: *mut Object = msg_send![model_description, inputDescriptionsByName];
 
         for (name, input) in inputs {
-            let key = nsstring_from_str(name)?;
+            let key = nsstring_from_str(&feature_name(name, model.escaped_names))?;
             let mut shape_i64: Vec<i64> = input
                 .descriptor
                 .static_or_max_shape()
@@ -647,7 +684,7 @@ pub(crate) fn run_coreml_bytes(
 
         let mut result = HashMap::with_capacity(output_descriptors.len());
         for (name, descriptor) in output_descriptors {
-            let key = nsstring_from_str(name)?;
+            let key = nsstring_from_str(&feature_name(name, model.escaped_names))?;
             let value: *mut Object = msg_send![output_provider, featureValueForName: key];
             if value.is_null() {
                 return Err(GraphError::CoremlRuntimeFailed {
@@ -882,12 +919,16 @@ unsafe fn extract_multiarray_bytes(
         // Int32, not Float32 — do not route it through normalize_dtype_code here.
         let is_float = matches!(actual_dtype_code as i32, 32 | 65568 | 16 | 65552);
         let ints: Vec<i32> = if is_float {
-            raw.chunks_exact(4)
-                .map(|c| f32::from_le_bytes(c.try_into().unwrap()) as i32)
+            raw.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&c| f32::from_le_bytes(c) as i32)
                 .collect()
         } else {
-            raw.chunks_exact(4)
-                .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+            raw.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&c| i32::from_le_bytes(c))
                 .collect()
         };
         let packed = if matches!(descriptor.data_type, DataType::Int4) {
@@ -1158,13 +1199,14 @@ fn run_impl_zeroed_with_weights(
             }
             // Owned (+1) by us for this attempt; released at end of iteration.
             let _model_guard = ReleaseOnDrop(model);
+            let escaped_names = model_uses_escaped_names(model)?;
             let model_description: *mut Object = msg_send![model, modelDescription];
             let input_descs: *mut Object = msg_send![model_description, inputDescriptionsByName];
 
             let dict: *mut Object = msg_send![class!(NSMutableDictionary), dictionary];
             let mut feature_err: Option<String> = None;
             for (name, descriptor) in inputs {
-                let key = nsstring_from_str(name)?;
+                let key = nsstring_from_str(&feature_name(name, escaped_names))?;
                 let desc_obj: *mut Object = msg_send![input_descs, objectForKey: key];
                 let (shape, data_type_code) = if desc_obj.is_null() {
                     (
@@ -1342,6 +1384,7 @@ fn run_impl_with_inputs_with_weights(
             let _model_guard = ReleaseOnDrop(model);
 
             // Get model input descriptions to query expected data types
+            let escaped_names = model_uses_escaped_names(model)?;
             let model_description: *mut Object = msg_send![model, modelDescription];
             let input_descs: *mut Object = msg_send![model_description, inputDescriptionsByName];
 
@@ -1350,7 +1393,7 @@ fn run_impl_with_inputs_with_weights(
 
             // Create input features with actual data
             for input in &inputs {
-                let key = nsstring_from_str(&input.name)?;
+                let key = nsstring_from_str(&feature_name(&input.name, escaped_names))?;
                 let shape_i64: Vec<i64> = input.shape.iter().map(|&s| s as i64).collect();
 
                 // Query model's expected data type for this input
@@ -1538,7 +1581,17 @@ unsafe fn collect_outputs(
 ) -> Result<Vec<CoremlOutput>, GraphError> {
     let feature_names: *mut Object = msg_send![provider, featureNames];
     let names_array: *mut Object = msg_send![feature_names, allObjects];
-    let advertised_names = unsafe { nsarray_to_strings(names_array) };
+    let escaped_names = unsafe { model_uses_escaped_names(model)? };
+    let advertised_names: Vec<_> = unsafe { nsarray_to_strings(names_array) }
+        .into_iter()
+        .map(|name| {
+            if escaped_names {
+                coreml_names::decode(&name).into_owned()
+            } else {
+                name
+            }
+        })
+        .collect();
 
     let lookup_error = |name: &str, detail: &str| {
         let model_description: *mut Object = msg_send![model, modelDescription];
@@ -1555,7 +1608,7 @@ unsafe fn collect_outputs(
     };
 
     collect_named_outputs(advertised_names.clone(), expected, |name| {
-        let name_obj = unsafe { nsstring_from_str(name)? };
+        let name_obj = unsafe { nsstring_from_str(&feature_name(name, escaped_names))? };
         let value: *mut Object = msg_send![provider, featureValueForName: name_obj];
         if value.is_null() {
             return Err(lookup_error(name, "direct lookup returned nil"));

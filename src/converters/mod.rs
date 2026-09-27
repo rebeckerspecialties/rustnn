@@ -15,6 +15,7 @@ use crate::error::GraphError;
 use crate::graph::GraphInfo;
 
 mod coreml_mlprogram;
+pub(crate) mod coreml_names;
 #[cfg(feature = "litert-runtime")]
 pub mod litert;
 pub mod onnx;

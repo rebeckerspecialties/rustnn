@@ -25,7 +25,7 @@
 /// - Better optimization
 ///
 /// This replaces the legacy NeuralNetwork format.
-use crate::converters::operand_name;
+use crate::converters::coreml_names;
 use crate::error::GraphError;
 use crate::graph::{DataType, Dimension as GraphDimension, GraphInfo, OperandKind};
 use crate::operator_enums::MLOperandDataType;
@@ -38,6 +38,10 @@ use crate::protos::coreml::mil_spec::{
 use crate::protos::coreml::specification::Model;
 use prost::Message;
 use std::collections::HashMap;
+
+fn operand_name(graph: &GraphInfo, id: u32) -> String {
+    coreml_names::encode(&crate::converters::operand_name(graph, id)).into_owned()
+}
 
 /// Convert zero_point byte data from a source dtype to a target dtype.
 /// Only Int32 → Uint8 and Int32 → Int8 are supported; all other pairs are returned as-is.
@@ -691,8 +695,10 @@ impl CoremlMlProgramConverter {
                 // int64 has no MIL tensor type; emit as int32 values (narrowing).
                 let values: Vec<i32> = constant_data
                     .data
-                    .chunks_exact(8)
-                    .map(|chunk| i64::from_le_bytes(chunk.try_into().unwrap()) as i32)
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|&chunk| i64::from_le_bytes(chunk) as i32)
                     .collect();
                 TensorValue {
                     value: Some(tensor_value::Value::Ints(tensor_value::RepeatedInts {
@@ -704,8 +710,10 @@ impl CoremlMlProgramConverter {
                 // uint32 has no MIL tensor type; emit as int32 (bit-preserving).
                 let values: Vec<i32> = constant_data
                     .data
-                    .chunks_exact(4)
-                    .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()) as i32)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|&chunk| u32::from_le_bytes(chunk) as i32)
                     .collect();
                 TensorValue {
                     value: Some(tensor_value::Value::Ints(tensor_value::RepeatedInts {
@@ -717,8 +725,10 @@ impl CoremlMlProgramConverter {
                 // uint64 has no MIL tensor type; emit as int32 (narrowing).
                 let values: Vec<i32> = constant_data
                     .data
-                    .chunks_exact(8)
-                    .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()) as i32)
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|&chunk| u64::from_le_bytes(chunk) as i32)
                     .collect();
                 TensorValue {
                     value: Some(tensor_value::Value::Ints(tensor_value::RepeatedInts {
@@ -2441,7 +2451,9 @@ impl CoremlMlProgramConverter {
                     value: Some(tensor_value::Value::Floats(tensor_value::RepeatedFloats {
                         values: constant
                             .data
-                            .chunks_exact(4)
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
                             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                             .collect(),
                     })),
@@ -10574,6 +10586,13 @@ impl super::GraphConverter for CoremlMlProgramConverter {
         model.description = Some(ModelDescription {
             input: input_descriptions,
             output: output_descriptions,
+            metadata: Some(crate::protos::coreml::specification::Metadata {
+                user_defined: HashMap::from([(
+                    coreml_names::METADATA_KEY.into(),
+                    coreml_names::METADATA_VALUE.into(),
+                )]),
+                ..Default::default()
+            }),
             ..Default::default()
         });
 

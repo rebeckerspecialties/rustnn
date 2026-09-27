@@ -43,6 +43,22 @@ guarantee. The WPT harness pins `accelerated = false` (CPU) so that results are 
    turn and reports each attempt; `--coreml-compiled-output <dir>` stores the compiled
    `.mlmodelc` for reuse.
 
+## Tensor names
+
+WebNN names remain unchanged in graph descriptors and dispatch/readback APIs. MIL identifiers
+cannot contain arbitrary Unicode or punctuation, start with a digit, or use reserved words
+such as `state`. The converter reversibly escapes these names as `rustnn_escaped_` followed by
+lowercase UTF-8 hex. Names already using that prefix are escaped too, preventing collisions;
+ordinary identifiers are unchanged. Internal operand bindings and model feature names use
+the same encoding.
+
+Exported models carry `rustnn.coreml.name_encoding = hex-v1` in creator-defined metadata.
+RustNN's repeated and one-shot executors translate names only when this marker is present,
+so legacy/third-party models keep their existing feature contract. Applications consuming
+exported CoreML models directly must use their declared feature names; a portable `.mlmodelc`
+exporter must retain the metadata and feature bindings. This changes no tensor values, shape
+semantics, or device-selection policy.
+
 ## Testing
 
 ```bash
