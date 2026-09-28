@@ -196,6 +196,95 @@ fn reuse_host_roundtrip_keeps_all_int32_bits_without_model_execution() {
 }
 
 #[test]
+fn reuse_cast_converts_same_width_types_and_preserves_owned_output_across_dispatch() {
+    for mode in MODES {
+        for (source, target) in [
+            (MLOperandDataType::Int32, MLOperandDataType::Float32),
+            (MLOperandDataType::Float32, MLOperandDataType::Int32),
+            (MLOperandDataType::Float16, MLOperandDataType::Float32),
+            (MLOperandDataType::Float32, MLOperandDataType::Float16),
+            // Int64 uses host storage and a CoreML Int32 proxy.
+            (MLOperandDataType::Int64, MLOperandDataType::Float32),
+            (MLOperandDataType::Float32, MLOperandDataType::Int64),
+        ] {
+            let mut context = context(mode);
+            let mut builder = MLGraphBuilder::new(&mut context).unwrap();
+            let input = builder
+                .input("input", &MLOperandDescriptor::new(source, vec![2, 3]))
+                .unwrap();
+            let converted = builder.cast(input, target).unwrap();
+            let transposed = builder.transpose(converted).unwrap();
+            let mut graph = builder
+                .build(&MLNamedOperands::from([
+                    ("converted", converted),
+                    ("transposed", transposed),
+                ]))
+                .unwrap();
+            let input = tensor(&mut context, source, &[2, 3]);
+            let converted = tensor(&mut context, target, &[2, 3]);
+            let transposed = tensor(&mut context, target, &[3, 2]);
+            let encode = |dtype, values: &[i32]| -> Vec<u8> {
+                match dtype {
+                    MLOperandDataType::Int32 => bytemuck::cast_slice(values).to_vec(),
+                    MLOperandDataType::Int64 => values
+                        .iter()
+                        .flat_map(|&value| i64::from(value).to_ne_bytes())
+                        .collect(),
+                    MLOperandDataType::Float32 => values
+                        .iter()
+                        .flat_map(|&value| (value as f32).to_ne_bytes())
+                        .collect(),
+                    MLOperandDataType::Float16 => values
+                        .iter()
+                        .flat_map(|&value| {
+                            half::f16::from_f32(value as f32).to_bits().to_ne_bytes()
+                        })
+                        .collect(),
+                    _ => unreachable!(),
+                }
+            };
+            for offset in [0, 1, -1] {
+                let values = [-31, -2, -1, 0, 123, 1024].map(|v| v + offset);
+                let expected = encode(target, &values);
+                let expected_transpose = encode(
+                    target,
+                    &[
+                        values[0], values[3], values[1], values[4], values[2], values[5],
+                    ],
+                );
+                context
+                    .write_tensor(&input, &encode(source, &values))
+                    .unwrap();
+                context
+                    .dispatch(
+                        &mut graph,
+                        &MLNamedTensors::from([("input", &input)]),
+                        &MLNamedTensors::from([
+                            ("converted", &converted),
+                            ("transposed", &transposed),
+                        ]),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    read(&mut context, &converted),
+                    expected,
+                    "{mode:?} {source:?}->{target:?}"
+                );
+                assert_eq!(read(&mut context, &transposed), expected_transpose);
+                context
+                    .write_tensor(&input, &encode(source, &[0; 6]))
+                    .unwrap();
+                assert_eq!(read(&mut context, &converted), expected);
+                context
+                    .write_tensor(&converted, &encode(target, &[1; 6]))
+                    .unwrap();
+                assert_eq!(read(&mut context, &transposed), expected_transpose);
+            }
+        }
+    }
+}
+
+#[test]
 fn reuse_view_and_multiple_outputs_never_alias_input_or_each_other() {
     for mode in MODES {
         let mut context = context(mode);

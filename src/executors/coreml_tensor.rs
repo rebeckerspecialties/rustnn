@@ -16,20 +16,15 @@ fn failed(reason: impl Into<String>) -> GraphError {
 
 fn native_code(dtype: DataType) -> Option<i32> {
     match dtype {
-        DataType::Float32 => Some(65568),
-        DataType::Float16 => Some(65552),
-        DataType::Int32 => Some(131104),
+        DataType::Float32 => Some(NativeType::Float32.code()),
+        DataType::Float16 => Some(NativeType::Float16.code()),
+        DataType::Int32 => Some(NativeType::Int32.code()),
         _ => None,
     }
 }
 
 fn same_type(dtype: DataType, code: i32) -> bool {
-    matches!(
-        (dtype, code),
-        (DataType::Float32, 32 | 65568)
-            | (DataType::Float16, 16 | 65552)
-            | (DataType::Int32, 3 | 131104)
-    )
+    NativeType::from_code(i64::from(code)).is_ok_and(|kind| kind.matches(dtype))
 }
 
 fn is_fixed_output_shape(constraint_type: i64, enumerated_count: usize) -> bool {
@@ -441,52 +436,39 @@ unsafe fn copy_output(
     destination: &mut NativeTensor,
     descriptor: &OperandDescriptor,
 ) -> Result<(), GraphError> {
-    let code: i64 = msg_send![array, dataType];
-    if !same_type(descriptor.data_type, code as i32) {
-        return destination.write(&unsafe { extract_multiarray_bytes(array, descriptor)? });
-    }
-    let shape_obj: *mut Object = msg_send![array, shape];
-    let stride_obj: *mut Object = msg_send![array, strides];
-    let shape = unsafe { nsarray_to_i64_vec(shape_obj)? };
-    let strides = unsafe { nsarray_to_i64_vec(stride_obj)? };
+    let (kind, layout, source) = unsafe { multiarray_storage(array)? };
     let logical = descriptor
         .byte_length()
         .ok_or_else(|| failed("output size overflow"))?;
     if logical > destination.capacity
-        || shape.len() != strides.len()
-        || strides.iter().any(|&s| s < 0)
+        || descriptor.data_type != destination.dtype
+        || Some(logical)
+            != layout
+                .count
+                .checked_mul(descriptor.data_type.bytes_per_element())
     {
         return Err(failed("invalid native output layout"));
     }
-    let source: *const u8 = msg_send![array, dataPointer];
-    if source.is_null() {
-        return Err(failed("null native output buffer"));
+    if layout.count == 0 {
+        return Ok(());
     }
-    if is_contiguous(&shape, &strides) {
+    if !kind.matches(descriptor.data_type) {
+        let bytes = unsafe { read_array_storage(source, &layout, kind.element_size()) };
+        return destination.write(&from_native(
+            &bytes,
+            kind,
+            descriptor.data_type,
+            layout.count,
+        )?);
+    }
+    if layout.contiguous {
         // Overlap is legal if CoreML returns another view of the proposed backing.
         unsafe { ptr::copy(source, destination.data.as_ptr(), logical) };
     } else {
-        let element = descriptor.data_type.bytes_per_element();
-        let mut maximum = 0usize;
-        for (&size, &stride) in shape.iter().zip(&strides) {
-            let span = usize::try_from(size - 1)
-                .ok()
-                .and_then(|s| s.checked_mul(stride as usize))
-                .ok_or_else(|| failed("output stride overflow"))?;
-            maximum = maximum
-                .checked_add(span)
-                .ok_or_else(|| failed("output offset overflow"))?;
-        }
-        if maximum
-            .checked_add(1)
-            .and_then(|n| n.checked_mul(element))
-            .is_none_or(|n| n > isize::MAX as usize)
-        {
-            return Err(failed("output offset exceeds addressable storage"));
-        }
+        let element = kind.element_size();
         let source_end = source
             .addr()
-            .checked_add((maximum + 1) * element)
+            .checked_add(layout.storage_byte_length)
             .ok_or_else(|| failed("output address overflow"))?;
         let destination_end = destination
             .data
@@ -497,21 +479,15 @@ unsafe fn copy_output(
         if source.addr() < destination_end && destination.data.as_ptr().addr() < source_end {
             // Per-element memmove is insufficient for an overlapping transpose:
             // an early destination write can destroy a later source element.
-            let gathered = unsafe { gather_strided_bytes(source, &shape, &strides, element) };
+            let gathered = unsafe { read_array_storage(source, &layout, element) };
             return destination.write(&gathered);
         }
         // Distinct returned arrays may alias input buffers, so never retain them
         // as a logical output tensor. Gather into this tensor's private allocation.
-        for index in 0..logical / element {
-            let mut remaining = index;
-            let mut offset = 0usize;
-            for axis in (0..shape.len()).rev() {
-                offset += (remaining % shape[axis] as usize) * strides[axis] as usize;
-                remaining /= shape[axis] as usize;
-            }
+        for index in 0..layout.count {
             unsafe {
                 ptr::copy(
-                    source.add(offset * element),
+                    source.add(layout.byte_offset(index)),
                     destination.data.as_ptr().add(index * element),
                     element,
                 )
@@ -571,7 +547,24 @@ unsafe fn rustnn_coreml_predict_backed(
 
 #[cfg(test)]
 mod shape_tests {
-    use super::is_fixed_output_shape;
+    use super::{DataType, is_fixed_output_shape, same_type};
+
+    #[test]
+    fn native_tensor_bindings_require_canonical_matching_types() {
+        for (dtype, code) in [
+            (DataType::Float16, 65552),
+            (DataType::Float32, 65568),
+            (DataType::Int32, 131104),
+        ] {
+            assert!(same_type(dtype, code));
+            for other in [16, 32, 3, 65600, 131080, -1] {
+                assert!(!same_type(dtype, other));
+            }
+            for other in [DataType::Float16, DataType::Float32, DataType::Int32] {
+                assert_eq!(same_type(other, code), other == dtype);
+            }
+        }
+    }
 
     #[test]
     fn output_backings_require_a_single_enumerated_shape() {
@@ -595,6 +588,126 @@ mod tests {
             shape: crate::graph::to_dimension_vector(shape),
             pending_permutation: vec![],
         }
+    }
+
+    unsafe fn view(
+        data: *mut u8,
+        shape: &[i64],
+        strides: &[i64],
+        kind: NativeType,
+    ) -> ReleaseOnDrop {
+        let mut view = ptr::null_mut();
+        let mut error = [0u8; 1024];
+        let status = unsafe {
+            rustnn_coreml_array_view(
+                data.cast(),
+                shape.as_ptr(),
+                strides.as_ptr(),
+                shape.len(),
+                kind.code(),
+                &mut view,
+                error.as_mut_ptr().cast(),
+                error.len(),
+            )
+        };
+        assert_eq!(status, 0, "{}", shim_error_to_string(&error));
+        assert!(!view.is_null());
+        ReleaseOnDrop(view)
+    }
+
+    #[test]
+    fn native_output_fallback_converts_types_and_gathers_checked_strides() {
+        let cases: [(NativeType, DataType, Vec<u8>, Vec<u8>); 6] = [
+            (
+                NativeType::Int32,
+                DataType::Int32,
+                bytemuck::cast_slice(&[i32::MIN, -16_777_217, 16_777_217, i32::MAX]).to_vec(),
+                bytemuck::cast_slice(&[i32::MIN, -16_777_217, 16_777_217, i32::MAX]).to_vec(),
+            ),
+            (
+                NativeType::Int32,
+                DataType::Float32,
+                bytemuck::cast_slice(&[-2i32, 1, 123, 16_777_217]).to_vec(),
+                bytemuck::cast_slice(&[-2f32, 1., 123., 16_777_216.]).to_vec(),
+            ),
+            (
+                NativeType::Float32,
+                DataType::Int32,
+                bytemuck::cast_slice(&[-2.75f32, 1., 123., 65504.]).to_vec(),
+                bytemuck::cast_slice(&[-2i32, 1, 123, 65504]).to_vec(),
+            ),
+            (
+                NativeType::Float16,
+                DataType::Float16,
+                bytemuck::cast_slice(&[0xc180u16, 0x8000, 0x0001, 0x7bff]).to_vec(),
+                bytemuck::cast_slice(&[0xc180u16, 0x8000, 0x0001, 0x7bff]).to_vec(),
+            ),
+            (
+                NativeType::Float16,
+                DataType::Float32,
+                bytemuck::cast_slice(&[0xc180u16, 0x3c00, 0x57b0, 0x7bff]).to_vec(),
+                bytemuck::cast_slice(&[-2.75f32, 1., 123., 65504.]).to_vec(),
+            ),
+            (
+                NativeType::Double,
+                DataType::Float16,
+                bytemuck::cast_slice(&[-2.75f64, 1., 123., 65504.]).to_vec(),
+                bytemuck::cast_slice(&[0xc180u16, 0x3c00, 0x57b0, 0x7bff]).to_vec(),
+            ),
+        ];
+        autoreleasepool(|| {
+            for (kind, dtype, packed, expected) in cases {
+                for strides in [[2i64, 1], [3, 1], [1, 2]] {
+                    let element = kind.element_size();
+                    // Padded source and destination canaries catch width errors.
+                    let mut source = vec![0xa5u8; 8 * element];
+                    for index in 0..4 {
+                        let offset = (index / 2 * strides[0] as usize
+                            + index % 2 * strides[1] as usize)
+                            * element;
+                        source[offset..offset + element]
+                            .copy_from_slice(&packed[index * element..(index + 1) * element]);
+                    }
+                    let before = source.clone();
+                    let view = unsafe { view(source.as_mut_ptr(), &[2, 2], &strides, kind) };
+                    let mut destination = NativeTensor::new(dtype, expected.len() + 16).unwrap();
+                    destination.write(&vec![0xa5; expected.len() + 16]).unwrap();
+                    let mut desc = descriptor(&[2, 2]);
+                    desc.data_type = dtype;
+                    unsafe { copy_output(view.0, &mut destination, &desc).unwrap() };
+                    assert_eq!(destination.bytes(expected.len()).unwrap(), expected);
+                    assert_eq!(
+                        &destination.bytes(expected.len() + 16).unwrap()[expected.len()..],
+                        &[0xa5; 16]
+                    );
+                    assert_eq!(source, before);
+                    source.fill(0);
+                    assert_eq!(destination.bytes(expected.len()).unwrap(), expected);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn native_output_fallback_rejects_mismatched_count_and_destination_type() {
+        autoreleasepool(|| {
+            let mut source = [1f32, 2., 3., 4.];
+            let view = unsafe {
+                view(
+                    source.as_mut_ptr().cast(),
+                    &[2, 2],
+                    &[2, 1],
+                    NativeType::Float32,
+                )
+            };
+            let mut destination = NativeTensor::new(DataType::Float32, 16).unwrap();
+            destination.write(&[0xa5; 16]).unwrap();
+            assert!(unsafe { copy_output(view.0, &mut destination, &descriptor(&[3])) }.is_err());
+            let mut wrong_type = descriptor(&[2, 2]);
+            wrong_type.data_type = DataType::Int32;
+            assert!(unsafe { copy_output(view.0, &mut destination, &wrong_type) }.is_err());
+            assert_eq!(destination.bytes(16).unwrap(), &[0xa5; 16]);
+        });
     }
 
     #[test]
@@ -663,8 +776,7 @@ mod tests {
             let allowed: bool = msg_send![description, isAllowedValue: feature];
             // Inspect the loaded model independently of the production predicate.
             // Metadata can differ by runtime; an ineligible output must still copy.
-            let eligible =
-                matches!(dtype, 32 | 65568) && constraint_type == 2 && shape_count == 1 && allowed;
+            let eligible = dtype == 65568 && constraint_type == 2 && shape_count == 1 && allowed;
             (eligible, dtype, constraint_type, shape_count, allowed)
         });
         let mut statistics = CoremlTensorStatistics::default();
@@ -774,6 +886,54 @@ mod tests {
                 bytemuck::cast_slice::<u8, f32>(destination.bytes(16).unwrap()),
                 &[1.0, 3.0, 2.0, 4.0]
             );
+        });
+    }
+
+    #[test]
+    fn overlapping_native_outputs_preserve_int32_bits_and_fp16_widths() {
+        autoreleasepool(|| {
+            for (dtype, kind, values) in [
+                (
+                    DataType::Int32,
+                    NativeType::Int32,
+                    bytemuck::cast_slice(&[i32::MIN, -16_777_217, 16_777_217, i32::MAX]).to_vec(),
+                ),
+                (
+                    DataType::Float16,
+                    NativeType::Float16,
+                    bytemuck::cast_slice(&[0xc180u16, 0x8000, 0x0001, 0x7bff]).to_vec(),
+                ),
+            ] {
+                let element = kind.element_size();
+                let mut destination = NativeTensor::new(dtype, values.len() + element).unwrap();
+                destination.write(&values).unwrap();
+                let transpose = unsafe { view(destination.data.as_ptr(), &[2, 2], &[1, 2], kind) };
+                let mut desc = descriptor(&[2, 2]);
+                desc.data_type = dtype;
+                unsafe { copy_output(transpose.0, &mut destination, &desc).unwrap() };
+                let expected: Vec<u8> = [0, 2, 1, 3]
+                    .into_iter()
+                    .flat_map(|index| {
+                        values[index * element..(index + 1) * element]
+                            .iter()
+                            .copied()
+                    })
+                    .collect();
+                assert_eq!(destination.bytes(values.len()).unwrap(), expected);
+
+                // A shifted contiguous view overlaps too, but memmove is sufficient.
+                let shifted_bytes: Vec<u8> = vec![0xa5; element]
+                    .into_iter()
+                    .chain(values.iter().copied())
+                    .collect();
+                destination.write(&shifted_bytes).unwrap();
+                let shifted =
+                    unsafe { view(destination.data.as_ptr().add(element), &[4], &[1], kind) };
+                let mut desc = descriptor(&[4]);
+                desc.data_type = dtype;
+                unsafe { copy_output(shifted.0, &mut destination, &desc).unwrap() };
+                assert_eq!(destination.bytes(values.len()).unwrap(), values);
+            }
         });
     }
 

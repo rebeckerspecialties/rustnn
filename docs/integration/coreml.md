@@ -64,6 +64,11 @@ into the destination's owned storage. Returned arrays are never adopted as tenso
 because CoreML may alias them to an input or another output. This is not a guarantee of zero
 copies inside CoreML, GPU or Neural Engine drivers.
 
+Both host and retained-storage paths use the same checked numeric conversion and array
+layout rules. Equal element widths do not imply equal types (for example int32 and
+float32). Same-type copies preserve integer bits and float16 storage widths; overlapping
+strided views are gathered before writing the destination.
+
 `RustNNOptions::coreml` controls this experimental path. `reuse_tensor_storage` defaults to
 `false`, preserving the byte-buffer reference implementation until an application measures
 a benefit on its workload. `output_backings` defaults to `true` when reuse is enabled and
