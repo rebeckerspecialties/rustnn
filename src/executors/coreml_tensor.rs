@@ -273,7 +273,7 @@ pub(crate) fn run_coreml_tensors(
         for (name, binding) in inputs {
             let key = nsstring_from_str(name)?;
             let code = model_input_dtype_code(input_descs, key)
-                .map_or_else(|| map_dtype(binding.descriptor.data_type), Ok)?;
+                .unwrap_or_else(|| map_dtype(binding.descriptor.data_type));
             let logical = binding
                 .descriptor
                 .byte_length()
