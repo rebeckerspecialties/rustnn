@@ -23,7 +23,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::operator_enums::MLOperandDataType;
+use crate::operator_enums::{
+    MLConv2dFilterOperandLayout, MLConvTranspose2dFilterOperandLayout, MLInputOperandLayout,
+    MLOperandDataType,
+};
 
 /// Operand reference (graph operand index). Used in option structs for MLOperand fields.
 pub type OperandIndex = u32;
@@ -374,12 +377,12 @@ pub struct MLConv2dOptions {
     /// Number of groups the input channels are split into (default `1`; equal to the channel count for depthwise).
     #[serde(default = "default_conv_groups")]
     pub groups: u32,
-    /// Input layout, `"nchw"` (default when empty) or `"nhwc"`.
+    /// Input layout; defaults to `nchw`.
     #[serde(default)]
-    pub input_layout: String, // "nchw" | "nhwc"
-    /// Filter layout, `"oihw"` (default when empty), `"hwio"`, `"ohwi"` or `"ihwo"`.
+    pub input_layout: MLInputOperandLayout,
+    /// Filter layout; defaults to `oihw`.
     #[serde(default)]
-    pub filter_layout: String, // "oihw" | "hwio" | "ohwi" | "ihwo"
+    pub filter_layout: MLConv2dFilterOperandLayout,
     /// 1-D bias operand with one value per output channel (see `MLOperand::rustnn_index`).
     pub bias: Option<OperandIndex>,
 }
@@ -392,8 +395,8 @@ impl Default for MLConv2dOptions {
             strides: Vec::new(),
             dilations: Vec::new(),
             groups: default_conv_groups(),
-            input_layout: String::new(),
-            filter_layout: String::new(),
+            input_layout: MLInputOperandLayout::default(),
+            filter_layout: MLConv2dFilterOperandLayout::default(),
             bias: None,
         }
     }
@@ -423,12 +426,12 @@ pub struct MLConvTranspose2dOptions {
     /// Number of groups (default `1`).
     #[serde(default = "default_conv_groups")]
     pub groups: u32,
-    /// Input layout, `"nchw"` (default when empty) or `"nhwc"`.
+    /// Input layout; defaults to `nchw`.
     #[serde(default)]
-    pub input_layout: String,
-    /// Filter layout, `"iohw"` (default when empty), `"hwoi"` or `"ohwi"`.
+    pub input_layout: MLInputOperandLayout,
+    /// Filter layout; defaults to `iohw`.
     #[serde(default)]
-    pub filter_layout: String, // "iohw" | "hwoi" | "ohwi"
+    pub filter_layout: MLConvTranspose2dFilterOperandLayout,
     /// 1-D bias operand with one value per output channel.
     pub bias: Option<OperandIndex>,
 }
@@ -443,33 +446,11 @@ impl Default for MLConvTranspose2dOptions {
             output_padding: Vec::new(),
             output_sizes: None,
             groups: default_conv_groups(),
-            input_layout: String::new(),
-            filter_layout: String::new(),
+            input_layout: MLInputOperandLayout::default(),
+            filter_layout: MLConvTranspose2dFilterOperandLayout::default(),
             bias: None,
         }
     }
-}
-
-/// MLConstantOptions. constant (interchange: init, data, dataType, shape).
-///
-/// Not an IDL dictionary; closest normative API is [`MLGraphBuilder`](https://www.w3.org/TR/webnn/#dom-mlgraphbuilder) (`constant()` methods).
-// TODO MTAX non-existing struct. defer removal for now since it's not like any other operation.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "camelCase")]
-pub struct MLConstantOptions {
-    /// Operation label.
-    #[serde(default)]
-    pub label: String,
-    /// Initializer expression of the interchange format (for example a scalar fill).
-    pub init: Option<String>,
-    /// Base64-encoded little-endian constant bytes.
-    pub data: Option<String>, // base64
-    /// WebNN data type name of the constant.
-    pub data_type: String,
-    /// Required constant shape. `Some(vec![])` is a rank-0 scalar; `None`
-    /// means the shape was omitted and is rejected before entering `GraphInfo`.
-    #[serde(default)]
-    pub shape: Option<Vec<u32>>,
 }
 
 /// MLCumulativeSumOptions. cumulativeSum (axis is a builder method parameter).
@@ -1165,9 +1146,6 @@ pub enum OperatorOptions {
     /// MLClampOptions.
     Clamp(MLClampOptions),
 
-    /// MLConstantOptions.
-    Constant(MLConstantOptions),
-
     /// MLConv2dOptions.
     Conv2d(MLConv2dOptions),
 
@@ -1264,7 +1242,6 @@ impl OperatorOptions {
             OperatorOptions::ArgMinMax(opt) => &opt.label,
             OperatorOptions::BatchNormalization(opt) => &opt.label,
             OperatorOptions::Clamp(opt) => &opt.label,
-            OperatorOptions::Constant(opt) => &opt.label,
             OperatorOptions::Conv2d(opt) => &opt.label,
             OperatorOptions::ConvTranspose2d(opt) => &opt.label,
             OperatorOptions::CumulativeSum(opt) => &opt.label,
@@ -1318,7 +1295,6 @@ impl OperatorOptions {
                 "conv2d" => try_opt!(MLConv2dOptions, Conv2d),
                 "convTranspose2d" => try_opt!(MLConvTranspose2dOptions, ConvTranspose2d),
                 "concat" => try_opt!(MLOperatorOptions, Operator),
-                "constant" => try_opt!(MLConstantOptions, Constant),
                 "cumulativeSum" => try_opt!(MLCumulativeSumOptions, CumulativeSum),
                 "expand" => try_opt!(MLOperatorOptions, Operator),
                 "elu" => try_opt!(MLEluOptions, Elu),
@@ -1429,13 +1405,6 @@ impl OperatorOptions {
     pub fn as_conv2d(&self) -> Option<&MLConv2dOptions> {
         match self {
             OperatorOptions::Conv2d(o) => Some(o),
-            _ => None,
-        }
-    }
-    /// The [`MLConstantOptions`] when this is the `constant` variant.
-    pub fn as_constant(&self) -> Option<&MLConstantOptions> {
-        match self {
-            OperatorOptions::Constant(o) => Some(o),
             _ => None,
         }
     }
