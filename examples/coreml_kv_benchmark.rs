@@ -17,7 +17,7 @@ use rustnn::mlcontext::{
     BackendDevice, MLContext, MLContextOptions, MLGraph, MLNamedTensors, MLPowerPreference,
     MLTensor, MLTensorDescriptor,
 };
-use rustnn::mlcontextoptions::{CoremlTensorStatistics, RustNNOptions};
+use rustnn::mlcontextoptions::{BackendStatistics, CoremlTensorStatistics, RustNNOptions};
 use rustnn::operator_enums::MLOperandDataType;
 use rustnn::{ContextProperties, GraphValidator};
 use serde::{Deserialize, Serialize};
@@ -172,6 +172,13 @@ struct Runner<'a> {
     rtol: f64,
     mode: String,
     report_path: &'a Path,
+}
+
+fn statistics(context: &MLContext<'_>) -> Result<CoremlTensorStatistics> {
+    match context.rustnn_backend_statistics() {
+        Some(BackendStatistics::Coreml(statistics)) => Ok(statistics),
+        _ => anyhow::bail!("CoreML counters unavailable"),
+    }
 }
 
 fn statistics_json(s: CoremlTensorStatistics) -> Value {
@@ -395,10 +402,7 @@ impl Runner<'_> {
         } else {
             None
         };
-        let run_start = self
-            .context
-            .rustnn_coreml_tensor_statistics()
-            .context("CoreML counters unavailable")?;
+        let run_start = statistics(&self.context)?;
         let mut execution_io = CoremlTensorStatistics::default();
         let mut decode_io = CoremlTensorStatistics::default();
         let mut prefill_io = CoremlTensorStatistics::default();
@@ -413,7 +417,7 @@ impl Runner<'_> {
         for (index, step) in stream.steps.iter().enumerate() {
             let prefix = step.tokens.len();
             let destination = index % 2;
-            let step_start = self.context.rustnn_coreml_tensor_statistics().unwrap();
+            let step_start = statistics(&self.context)?;
             let start = Instant::now();
             let tokens = if index == 0 {
                 step.tokens.as_slice()
@@ -497,10 +501,7 @@ impl Runner<'_> {
             // Cache ownership advances by alternating these two distinct sets.
             // No cache readback, repacking or writeback is needed for chaining.
             let elapsed = start.elapsed().as_secs_f64();
-            let step_io = statistics_delta(
-                step_start,
-                self.context.rustnn_coreml_tensor_statistics().unwrap(),
-            )?;
+            let step_io = statistics_delta(step_start, statistics(&self.context)?)?;
             let payload = LogicalPayload::step(sequence, prefix, index > 0, self.vocab);
             check_copy_accounting(&self.mode, step_io, &payload, index > 0)
                 .with_context(|| format!("copy accounting {} step {index}", stream.name))?;
@@ -560,10 +561,7 @@ impl Runner<'_> {
         } else {
             0
         };
-        let total_io = statistics_delta(
-            run_start,
-            self.context.rustnn_coreml_tensor_statistics().unwrap(),
-        )?;
+        let total_io = statistics_delta(run_start, statistics(&self.context)?)?;
         let verification_io = statistics_delta(execution_io, total_io)?;
         let elapsed: f64 = seconds.iter().sum();
         let windows: Vec<_> = seconds

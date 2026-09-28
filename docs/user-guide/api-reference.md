@@ -19,6 +19,12 @@ locally into `target/doc/rustnn/`).
   quantization zero points) hold operand indices: pass `operand.rustnn_index()` or
   `operand.into()`.
 - Methods that are not part of the WebNN specification carry the `rustnn_` prefix.
+
+`MLGraph::rustnn_load_diagnostics()` returns a backend-specific `LoadDiagnostics` snapshot,
+or `None` when the backend does not provide diagnostics. With `coreml-runtime`, the
+`Coreml` variant exposes requested and loaded policies, loading route and earlier failures.
+These are load diagnostics, not accelerator-placement measurements; see the
+[CoreML backend](../integration/coreml.md#selection-and-devices).
 - The API is synchronous. `dispatch`, `read_tensor` and `write_tensor` return when the work is
   done.
 - Results are `rustnn::error::Result<T>`, an alias for `Result<T, rustnn::error::Error>`.
@@ -56,7 +62,6 @@ locally into `target/doc/rustnn/`).
 | `dispatch(&mut graph, &inputs, &outputs)` | implemented | Validates bindings, then runs |
 | `rustnn_backend()`, `rustnn_device()`, `rustnn_device_type()` | extension | Inspect the selection |
 | `rustnn_backend_statistics()` | extension | Optional typed `BackendStatistics` snapshot; counter meanings remain backend-specific |
-| `rustnn_coreml_tensor_statistics()` | extension | CoreML tensor I/O counters, or `None` for another backend; not hardware placement or driver memory traffic |
 | `rustnn_set_tensor_capacity(&mut tensor, max_shape)`, `rustnn_resize_tensor(&mut tensor, shape)` | extension | Dynamic shapes; see [Advanced Topics](advanced.md) |
 | `create_from_gpu_device`, `lost`, `create_constant_tensor`, `destroy`, `op_support_limits` | not implemented (`todo!()`) | Tensors and contexts are released by `Drop` |
 

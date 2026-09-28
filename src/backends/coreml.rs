@@ -69,6 +69,12 @@ pub(crate) struct CoremlGraph {
     output_backings_eligible: bool,
 }
 
+impl CoremlGraph {
+    pub(crate) fn load_diagnostics(&self) -> &crate::executors::coreml::CoremlLoadDiagnostics {
+        self.model.load_diagnostics()
+    }
+}
+
 impl fmt::Debug for CoremlGraph {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CoremlGraph")

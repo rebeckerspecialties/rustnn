@@ -239,6 +239,18 @@ impl MLTensor {
     }
 }
 
+/// Backend-specific details of a successful graph load.
+///
+/// This RustNN extension reports loading, not measured operator placement or
+/// prediction-time scheduling. More backends may add variants in the future.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LoadDiagnostics {
+    /// CoreML's requested and successful load policy, route and earlier failures.
+    #[cfg(feature = "coreml-runtime")]
+    Coreml(crate::executors::coreml::CoremlLoadDiagnostics),
+}
+
 /// A graph compiled for one backend by [`MLGraphBuilder::build`]. <https://www.w3.org/TR/webnn/#api-mlgraph>
 ///
 /// `input_descriptors` and `output_descriptors` are the named graph inputs and outputs that
@@ -254,6 +266,23 @@ pub struct MLGraph<'context> {
 }
 
 impl<'context> MLGraph<'context> {
+    /// Inspect a snapshot of this backend's successful load diagnostics.
+    ///
+    /// Returns `None` when the backend does not provide diagnostics. This extension reports loading,
+    /// not measured operator placement or prediction-time scheduling decisions.
+    pub fn rustnn_load_diagnostics(&self) -> Option<LoadDiagnostics> {
+        #[cfg(feature = "coreml-runtime")]
+        {
+            self.backend
+                .as_coreml_model()
+                .map(|graph| LoadDiagnostics::Coreml(graph.load_diagnostics().clone()))
+        }
+        #[cfg(not(feature = "coreml-runtime"))]
+        {
+            None
+        }
+    }
+
     pub(crate) fn new(backend: MLBackendGraph<'context>, graph_info: &GraphInfo) -> Result<Self> {
         let (input_descriptors, output_descriptors) = graph_info
             .io_binding_maps()
@@ -749,16 +778,6 @@ impl<'context> MLContext<'context> {
     pub fn rustnn_backend_statistics(&self) -> Option<BackendStatistics> {
         self.backend.backend_statistics()
     }
-
-    /// CoreML-specific convenience adapter for [`Self::rustnn_backend_statistics`].
-    /// Returns cumulative tensor I/O counters, or `None` for another backend. Counts only
-    /// rustnn-side work, not internal CoreML/driver copies or hardware placement.
-    pub fn rustnn_coreml_tensor_statistics(&self) -> Option<CoremlTensorStatistics> {
-        match self.rustnn_backend_statistics() {
-            Some(BackendStatistics::Coreml(statistics)) => Some(statistics),
-            _ => None,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -775,7 +794,16 @@ mod test {
             },
         };
         assert_eq!(context.rustnn_backend_statistics(), None);
-        assert_eq!(context.rustnn_coreml_tensor_statistics(), None);
+    }
+
+    #[test]
+    fn graph_without_backend_diagnostics_returns_none() {
+        let graph = MLGraph::new(
+            MLBackendGraph::PhantomData(PhantomData),
+            &GraphInfo::default(),
+        )
+        .unwrap();
+        assert_eq!(graph.rustnn_load_diagnostics(), None);
     }
 
     fn create_add_graph_context_and_graph() -> Option<(MLContext<'static>, MLGraph<'static>)> {

@@ -22,6 +22,13 @@ enum Mode {
 
 const MODES: [Mode; 3] = [Mode::Persistent, Mode::Backings, Mode::Baseline];
 
+fn statistics(context: &MLContext<'_>) -> CoremlTensorStatistics {
+    match context.rustnn_backend_statistics() {
+        Some(BackendStatistics::Coreml(statistics)) => statistics,
+        _ => panic!("CoreML should report its typed statistics"),
+    }
+}
+
 fn context(mode: Mode) -> MLContext<'static> {
     let mut options = RustNNOptions::default();
     options.coreml.reuse_tensor_storage = !matches!(mode, Mode::Baseline);
@@ -67,7 +74,6 @@ fn backend_statistics_reports_typed_coreml_snapshots() {
             panic!("CoreML should report its typed statistics");
         };
         assert_eq!(statistics.host_write_bytes, 8);
-        assert_eq!(context.rustnn_coreml_tensor_statistics(), Some(statistics));
         assert_ne!(initial, context.rustnn_backend_statistics());
         assert_eq!(
             initial,
@@ -131,10 +137,7 @@ fn reuse_identity_preserves_native_types_and_owned_results() {
                 .unwrap();
             let input = tensor(&mut context, *dtype, &[6]);
             let output = tensor(&mut context, *dtype, &[6]);
-            let allocated = context
-                .rustnn_coreml_tensor_statistics()
-                .unwrap()
-                .native_allocations;
+            let allocated = statistics(&context).native_allocations;
             for _ in 0..4 {
                 context.write_tensor(&input, values).unwrap();
                 context
@@ -154,7 +157,7 @@ fn reuse_identity_preserves_native_types_and_owned_results() {
                     "input alias {mode:?} {dtype:?}"
                 );
             }
-            let stats = context.rustnn_coreml_tensor_statistics().unwrap();
+            let stats = statistics(&context);
             assert_eq!(stats.native_allocations, allocated);
             if matches!(mode, Mode::Baseline) {
                 assert_eq!(stats.native_input_bindings, 0);
@@ -362,7 +365,7 @@ fn reuse_rejects_duplicate_bindings_before_native_locks() {
         let b = tensor(&mut context, MLOperandDataType::Float32, &[2]);
         let result = tensor(&mut context, MLOperandDataType::Float32, &[2]);
         let alias = a.clone();
-        let before = context.rustnn_coreml_tensor_statistics().unwrap();
+        let before = statistics(&context);
         let error = context
             .dispatch(
                 &mut graph,
@@ -385,7 +388,7 @@ fn reuse_rejects_duplicate_bindings_before_native_locks() {
             matches!(error, Error::DuplicateTensorBinding { .. }),
             "{error}"
         );
-        assert_eq!(before, context.rustnn_coreml_tensor_statistics().unwrap());
+        assert_eq!(before, statistics(&context));
     }
 }
 
@@ -454,10 +457,7 @@ fn reuse_dynamic_shapes_grow_shrink_and_reset_without_new_allocations() {
         context
             .rustnn_set_tensor_capacity(&mut output, &[8, 2])
             .unwrap();
-        let allocations = context
-            .rustnn_coreml_tensor_statistics()
-            .unwrap()
-            .native_allocations;
+        let allocations = statistics(&context).native_allocations;
         for n in [1, 4, 2, 8, 1] {
             context.rustnn_resize_tensor(&mut input, &[n, 2]).unwrap();
             context.rustnn_resize_tensor(&mut output, &[n, 2]).unwrap();
@@ -477,15 +477,9 @@ fn reuse_dynamic_shapes_grow_shrink_and_reset_without_new_allocations() {
             );
             assert_eq!(output.shape(), [n, 2]);
         }
-        assert_eq!(
-            context
-                .rustnn_coreml_tensor_statistics()
-                .unwrap()
-                .native_allocations,
-            allocations
-        );
+        assert_eq!(statistics(&context).native_allocations, allocations);
         if matches!(mode, Mode::Backings) {
-            let stats = context.rustnn_coreml_tensor_statistics().unwrap();
+            let stats = statistics(&context);
             assert_eq!(stats.output_backings_requested, 0);
             assert_eq!(stats.output_backings_accepted, 0);
             assert!(stats.output_copy_bytes > 0);

@@ -53,6 +53,7 @@ Use the Makefile targets; they set feature flags and environment variables consi
 | `build-coreml`, `test-coreml` | Build all targets; run library and ordinary integration tests. `COREML_FEATURES=coreml-runtime` also checks the build without dynamic inputs |
 | `test-coreml-gather` | Focused active-dimension gather regressions, including scalar indices; `TEST_FILTER` selects a test |
 | `test-coreml-dtypes` | Focused numeric boundary regressions for typed dispatch and the convenience API; CI runs with and without dynamic inputs |
+| `test-coreml-tensor-reuse` | Retained storage ownership, type conversion and shape regressions; CI runs with and without dynamic inputs |
 | `litert`, `cann` | LiteRT and CANN conversion of the sample graph |
 | `validate-cann-env`, `cann-build`, `cann-device-test` | OpenHarmony toolchain check, cross build, device test through `hdc`; see [CANN](../integration/cann.md) |
 | `validate-all-env` | Build, unit tests, ONNX and CoreML validation in one run |
