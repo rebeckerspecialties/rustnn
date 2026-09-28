@@ -130,6 +130,10 @@ preserves the historical default while exposing numerical conformance gaps.
 A missing or malformed source tolerance fails explicitly rather than selecting
 a local default. Strict mode accepts upstream ULP and ATOL, not the local RTOL
 extension. Keep strict and compatibility results separate when reporting passes.
+Callbacks that require intermediate operands are reevaluated with shapes and
+types from the Rust builder, using Node.js and the fetched source file. No
+tolerance formula is reimplemented. An upstream callback that still returns
+an undefined or nonfinite budget remains a test failure.
 The strict finite-value comparator follows the upstream helpers: raw half-bit
 distance except signed zero, the helper's FP16 halfway rounding, and unrounded
 JavaScript-number expected values for ATOL. Its audit uses the same comparator
@@ -138,14 +142,16 @@ upstream bit-distance helper: NaN matches NaN regardless of payload, and
 infinities must match in sign. A large budget cannot hide a class mismatch.
 ULP classification uses the expected value after conversion to the output
 dtype; ATOL retains the original source number, including at overflow boundaries.
-Strict mode does not claim complete browser-harness parity or
-test browser API validation. Strict FP16 runtime inputs and constants also use
+Strict FP16 runtime inputs and constants also use
 the upstream halfway-rounding helper; compatibility packing is unchanged.
 
 `make test-wpt-tolerance` runs the comparator regressions without a backend.
 With Node.js and the fetched WPT corpus available, run
 `make test-wpt-tolerance-parity` to compare finite ULP cases directly with the
-upstream JavaScript helpers, including opposite signs, zeros and halfway values.
+upstream JavaScript helpers across every finite FP16 encoding, opposite signs,
+zeros and adjacent halfway values, plus FP32 and ATOL boundary cases. Set
+`WPT_TOLERANCE_PARITY_JSON=/path/to/parity.json` to save the vectors and checked
+distances for replay through the browser's upstream `testharness.js`/`utils.js`.
 The full ONNX and CoreML Make targets run this parity check after a successful
 WPT run, using the same fetched corpus. The reporting target used by CI runs
 parity after fetching the corpus and before executing the backend trials.

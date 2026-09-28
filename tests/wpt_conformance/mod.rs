@@ -372,36 +372,48 @@ pub fn run_one_test_case_with_audit(
     let graph_op_names = graph_operator_names(graph);
     let graph_op_refs: Vec<&str> = graph_op_names.iter().map(String::as_str).collect();
     let strict_tolerance = tolerance::strict_wpt_tolerance();
-    if strict_tolerance {
-        tolerance::validate_strict_source_tolerance(test_case.tolerance.as_ref())?;
-    }
-    let (tolerance_kind, tolerance_value) =
-        get_operation_tolerance(operation, test_case.tolerance.as_ref(), &graph_op_refs);
-    if strict_tolerance
-        && tolerance_kind != tolerance::ToleranceKind::Ulp
-        && graph
-            .expected_outputs
-            .values()
-            .any(|spec| !matches!(spec.data_type(), "float16" | "float32"))
-    {
-        return Err("strict integer comparison requires an upstream ULP budget".into());
-    }
-    // The compatibility mode retains CANN/HiAI's local FP16 allowance for
-    // float32 I/O. This is not an upstream WPT precision budget.
-    let (tolerance_kind, tolerance_value) = if backend.trial_prefix() == "cann" && !strict_tolerance
-    {
-        cann_fp16_tolerance(tolerance_kind, tolerance_value)
-    } else {
-        (tolerance_kind, tolerance_value)
-    };
-    let allow_absolute_floor = !strict_tolerance
-        && test_case
-            .tolerance
-            .as_ref()
-            .is_some_and(|t| t.metric_type.eq_ignore_ascii_case("ulp"));
 
     wpt_context_pool::with_context(backend, |context| {
-        let artifacts = wpt_execute_graph::execute_wpt_graph(context, graph)?;
+        let needs_intermediates = strict_tolerance && test_case.tolerance.is_none();
+        let artifacts = wpt_execute_graph::execute_wpt_graph(context, graph, needs_intermediates)?;
+        let mut resolved_case;
+        let test_case = if needs_intermediates {
+            resolved_case = test_case.clone();
+            resolved_case.tolerance = Some(wpt_js_loader::resolve_source_tolerance(
+                file_name,
+                &test_case.name,
+                &artifacts.intermediate_descriptors,
+            )?);
+            &resolved_case
+        } else {
+            test_case
+        };
+        if strict_tolerance {
+            tolerance::validate_strict_source_tolerance(test_case.tolerance.as_ref())?;
+        }
+        let (tolerance_kind, tolerance_value) =
+            get_operation_tolerance(operation, test_case.tolerance.as_ref(), &graph_op_refs);
+        if strict_tolerance
+            && tolerance_kind != tolerance::ToleranceKind::Ulp
+            && graph
+                .expected_outputs
+                .values()
+                .any(|spec| !matches!(spec.data_type(), "float16" | "float32"))
+        {
+            return Err("strict integer comparison requires an upstream ULP budget".into());
+        }
+        // CANN/HiAI's compatibility allowance is not an upstream WPT budget.
+        let (tolerance_kind, tolerance_value) =
+            if backend.trial_prefix() == "cann" && !strict_tolerance {
+                cann_fp16_tolerance(tolerance_kind, tolerance_value)
+            } else {
+                (tolerance_kind, tolerance_value)
+            };
+        let allow_absolute_floor = !strict_tolerance
+            && test_case
+                .tolerance
+                .as_ref()
+                .is_some_and(|t| t.metric_type.eq_ignore_ascii_case("ulp"));
         let webnn_text = artifacts.webnn_text.as_deref();
         let outputs = artifacts.outputs;
         let input_names = runtime_input_names(graph);

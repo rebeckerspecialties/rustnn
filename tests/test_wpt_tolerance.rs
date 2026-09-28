@@ -10,6 +10,9 @@ mod wpt_audit;
 #[path = "wpt_conformance/wpt_backend.rs"]
 mod wpt_backend;
 #[allow(dead_code)]
+#[path = "wpt_conformance/wpt_js_loader.rs"]
+mod wpt_js_loader;
+#[allow(dead_code)]
 #[path = "wpt_conformance/wpt_tensor.rs"]
 mod wpt_tensor;
 #[allow(dead_code)]
@@ -373,7 +376,7 @@ fn strict_comparator_matches_upstream_javascript() {
     let utils = wpt.join("webnn/resources/utils.js");
     let bridge = root.join("scripts/wpt_bridge/wpt-tolerance-env.mjs");
     // Expected values are JS Numbers; actual half values are raw Uint16 payloads.
-    let cases = [
+    let mut cases = vec![
         (1.0f32, 1.00048828125, true),
         (-1.0, -1.00048828125, true),
         (-1.0, 1.0, true),
@@ -397,6 +400,22 @@ fn strict_comparator_matches_upstream_javascript() {
         (f32::from_bits(1), 0.0, false),
         (-f32::from_bits(1), 0.0, false),
     ];
+    // Every finite FP16 encoding, including both signs and the entire
+    // subnormal range. Adjacent midpoints exercise the source toHalf helper's
+    // rounding; opposite signs exercise its raw-bit distance convention.
+    for bits in 0..=u16::MAX {
+        let value = half::f16::from_bits(bits);
+        if !value.is_finite() {
+            continue;
+        }
+        cases.push((value.to_f32(), value.to_f64(), true));
+        cases.push((value.to_f32(), -value.to_f64(), true));
+        if let Some(next) = bits.checked_add(1).map(half::f16::from_bits)
+            && next.is_finite()
+        {
+            cases.push((value.to_f32(), (value.to_f64() + next.to_f64()) * 0.5, true));
+        }
+    }
     let input: Vec<_> = cases.iter().map(|&(actual, expected, float16)| {
         serde_json::json!({"actualBits": actual.to_bits(), "halfBits": half::f16::from_f32(actual).to_bits(), "expected": expected, "float16": float16})
     }).collect();
@@ -411,10 +430,11 @@ fn strict_comparator_matches_upstream_javascript() {
     }).collect();
     let script = r#"
 import vm from 'node:vm';
+import {readFileSync} from 'node:fs';
 import {pathToFileURL} from 'node:url';
 const {createWptToleranceContext} = await import(pathToFileURL(process.argv[2]));
 const {context} = createWptToleranceContext(process.argv[1]);
-const input = JSON.parse(process.argv[3]);
+const input = JSON.parse(readFileSync(0, 'utf8'));
 context.cases = input.ulp;
 const result = vm.runInContext(`cases.map(c => {
  const actual = c.float16 ? c.halfBits : new Float32Array(new Uint32Array([c.actualBits]).buffer)[0];
@@ -424,20 +444,44 @@ const result = vm.runInContext(`cases.map(c => {
 const atol = input.atol.map(c => Math.abs(c.actual - c.expected) <= c.budget);
 process.stdout.write(JSON.stringify({ulp: result, atol}));
 "#;
-    let output = std::process::Command::new("node")
+    let payload = serde_json::json!({"ulp": input, "atol": atol_input});
+    let mut child = std::process::Command::new("node")
         .args(["--input-type=module", "-e", script])
         .arg(&utils)
         .arg(&bridge)
-        .arg(serde_json::json!({"ulp": input, "atol": atol_input}).to_string())
-        .output()
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .expect("run Node.js");
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.to_string().as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
     let results: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    // Optional artifact for running these same vectors through testharness.js
+    // and utils.js in a browser, without reimplementing either assertion.
+    if let Some(path) = std::env::var_os("WPT_TOLERANCE_PARITY_JSON") {
+        std::fs::write(
+            path,
+            serde_json::to_vec(&serde_json::json!({
+                "input": payload, "expected": results
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
     let distances: Vec<u32> = serde_json::from_value(results["ulp"].clone()).unwrap();
+    assert_eq!(cases.len(), distances.len());
     for ((actual, expected, float16), upstream) in cases.into_iter().zip(distances) {
         assert_eq!(
             tolerance::upstream_ulp_distance(actual, expected, float16),
@@ -446,6 +490,7 @@ process.stdout.write(JSON.stringify({ulp: result, atol}));
         );
     }
     let atol_results: Vec<bool> = serde_json::from_value(results["atol"].clone()).unwrap();
+    assert_eq!(atol_cases.len(), atol_results.len());
     for ((actual, expected, budget), js_pass) in atol_cases.into_iter().zip(atol_results) {
         assert_eq!(
             tolerance::validate_upstream_result(
@@ -459,4 +504,39 @@ process.stdout.write(JSON.stringify({ulp: result, atol}));
             js_pass
         );
     }
+}
+
+#[test]
+#[ignore = "requires Node.js and the fetched WPT corpus; run make test-wpt-tolerance-parity"]
+fn strict_comparator_matches_upstream_javascript_intermediate_budgets() {
+    use serde_json::json;
+    let resolve = |name, descriptors| {
+        wpt_js_loader::resolve_source_tolerance("subgraph.https.any.js", name, &descriptors)
+    };
+    assert!(resolve("gatherElements + matmul", json!({})).is_err());
+    let source = resolve(
+        "gatherElements + matmul",
+        json!({"gatherElementsOutput": {"shape": [2, 3], "dataType": "float32"}}),
+    )
+    .unwrap();
+    assert_eq!(source.metric_type, "ULP");
+    assert_eq!(source.value, 6);
+    let source = resolve(
+        "reshape + conv2d default/ float16",
+        json!({"reshapeOutput": {"shape": [1, 1, 3, 3], "dataType": "float16"}}),
+    )
+    .unwrap();
+    assert_eq!(source.value, 18);
+    // This source callback omits an int32 budget. Do not substitute the
+    // float32 allowance, compatibility default, or an invented exact budget.
+    let error = wpt_js_loader::resolve_source_tolerance(
+        "div.https.any.js",
+        "div int32 4D tensors",
+        &json!({}),
+    )
+    .unwrap_err();
+    assert!(
+        error.contains("Upstream tolerance callback returned no finite budget"),
+        "{error}"
+    );
 }
