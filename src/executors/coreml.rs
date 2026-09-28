@@ -18,9 +18,15 @@ use objc::rc::autoreleasepool;
 use objc::runtime::{Class, Object};
 use objc::{class, msg_send, sel, sel_impl};
 
+use super::coreml_dtype::{ArrayLayout, NativeType, boundary_error, from_native, to_native};
 use crate::error::GraphError;
 use crate::graph::{DataType, Dimension, OperandDescriptor, get_static_or_max_size};
 use crate::runtime_checks::{RuntimeShapeState, TensorKind, validate_shape_data_length};
+
+#[path = "coreml_load.rs"]
+mod load;
+use load::LoadTrace;
+pub use load::{CoremlLoadDiagnostics, CoremlLoadFailure, CoremlLoadRoute};
 
 // Link against the system frameworks we use.
 #[cfg(target_os = "macos")]
@@ -123,6 +129,10 @@ fn shim_error_to_string(buffer: &[u8]) -> String {
 }
 
 /// Input tensor for the one-shot CoreML executors.
+///
+/// Values are numerically converted to the model's native input type. This f32
+/// convenience API cannot represent every integer exactly; use typed
+/// [`crate::mlcontext::MLContext`] tensors when exact integer I/O is required.
 #[derive(Debug, Clone)]
 pub struct CoremlInput {
     /// Model input name.
@@ -142,7 +152,8 @@ pub struct CoremlOutput {
     pub shape: Vec<i64>,
     /// CoreML `MLMultiArrayDataType` code of the original output.
     pub data_type_code: i64,
-    /// Values converted to float32.
+    /// Values numerically converted to float32. Large integers can lose
+    /// precision here; typed MLTensor dispatch retains the declared host dtype.
     pub data: Vec<f32>, // Output data converted to f32 for consistency
 }
 
@@ -254,6 +265,7 @@ pub(crate) struct CompiledCoremlModel {
     model: *mut Object,
     /// Compute unit the model was successfully loaded with (diagnostic only).
     compute_unit: &'static str,
+    diagnostics: CoremlLoadDiagnostics,
     backing: CoremlModelBacking,
 }
 
@@ -279,6 +291,7 @@ impl std::fmt::Debug for CompiledCoremlModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CompiledCoremlModel")
             .field("compute_unit", &self.compute_unit)
+            .field("diagnostics", &self.diagnostics)
             .finish()
     }
 }
@@ -317,16 +330,9 @@ pub(crate) struct CoremlByteInput<'a> {
     pub(crate) descriptor: &'a OperandDescriptor,
 }
 
-/// Map a [`DeviceType`] to an `MLComputeUnits` raw value.
-///
-/// Apple's `MLComputeUnits`: `cpuOnly = 0`, `cpuAndGPU = 1`, `all = 2`, `cpuAndNeuralEngine = 3`.
-fn compute_unit_for_device(
-    device_type: crate::backend_selection::DeviceType,
-) -> (i64, &'static str) {
-    match device_type {
-        crate::backend_selection::DeviceType::Npu => (3, "CPU_AND_NE"),
-        crate::backend_selection::DeviceType::Gpu => (1, "CPU_AND_GPU"),
-        crate::backend_selection::DeviceType::Cpu => (0, "CPU_ONLY"),
+impl CompiledCoremlModel {
+    pub(crate) fn load_diagnostics(&self) -> &CoremlLoadDiagnostics {
+        &self.diagnostics
     }
 }
 
@@ -343,42 +349,46 @@ pub(crate) fn compile_model(
     // for the URL fallback below even after the NSData objects are released.
     let model_bytes = Arc::new(model_bytes);
     let weights_data = weights_data.map(Arc::new);
-    if !use_in_memory_asset {
-        return compile_model_from_url(
+    let mut trace = LoadTrace::new(device_type);
+    trace.routes(use_in_memory_asset, |trace, route| match route {
+        CoremlLoadRoute::InMemoryAsset => {
+            compile_model_from_asset(&model_bytes, weights_data.as_ref(), trace)
+        }
+        CoremlLoadRoute::CompiledUrl => compile_model_from_url(
             &model_bytes,
             weights_data.as_deref().map(Vec::as_slice),
-            device_type,
-        );
-    }
-    let memory_result = autoreleasepool(|| unsafe {
-        let (asset, specification_data, retained_weights_data) =
-            create_in_memory_model_asset(&model_bytes, weights_data.as_ref())?;
+            trace,
+        ),
+    })
+}
 
-        let (preferred_code, preferred_name) = compute_unit_for_device(device_type);
-        let mut candidates: Vec<(i64, &'static str)> = vec![(preferred_code, preferred_name)];
-        if preferred_code != 0 {
-            candidates.push((0, "CPU_ONLY"));
-        }
-
-        let mut last_error = String::from("MLModel load failed");
-        for (code, name) in candidates {
+fn compile_model_from_asset(
+    model_bytes: &Arc<Vec<u8>>,
+    weights_data: Option<&Arc<Vec<u8>>>,
+    trace: &mut LoadTrace,
+) -> Result<CompiledCoremlModel, GraphError> {
+    let route = CoremlLoadRoute::InMemoryAsset;
+    autoreleasepool(|| unsafe {
+        let (asset, specification_data, retained_weights_data) = trace.prepare(route, || {
+            create_in_memory_model_asset(model_bytes, weights_data)
+        })?;
+        let loaded = trace.policies(route, |code| {
             let config: *mut Object = msg_send![class!(MLModelConfiguration), new];
             let _config_guard = ReleaseOnDrop(config);
             let () = msg_send![config, setComputeUnits: code];
-            match load_model_asset(asset, config) {
-                Ok(model) => {
-                    return Ok(CompiledCoremlModel {
-                        model,
-                        compute_unit: name,
-                        backing: CoremlModelBacking::InMemory {
-                            asset,
-                            specification_data,
-                            weights_data: retained_weights_data,
-                        },
-                    });
-                }
-                Err(reason) => last_error = reason,
-            }
+            load_model_asset(asset, config)
+        });
+        if let Ok((model, name)) = loaded {
+            return Ok(CompiledCoremlModel {
+                model,
+                compute_unit: name,
+                diagnostics: trace.finish(route, name),
+                backing: CoremlModelBacking::InMemory {
+                    asset,
+                    specification_data,
+                    weights_data: retained_weights_data,
+                },
+            });
         }
 
         let _: () = msg_send![asset, release];
@@ -386,40 +396,23 @@ pub(crate) fn compile_model(
         if let Some(weights_data) = retained_weights_data {
             let _: () = msg_send![weights_data, release];
         }
-        Err(GraphError::CoremlRuntimeFailed { reason: last_error })
-    });
-    memory_result.or_else(|memory_error| {
-        compile_model_from_url(
-            &model_bytes,
-            weights_data.as_deref().map(Vec::as_slice),
-            device_type,
-        )
-        .map_err(|url_error| GraphError::CoremlRuntimeFailed {
-            reason: format!(
-                "in-memory model load failed ({memory_error}); URL fallback failed ({url_error})"
-            ),
-        })
+        loaded.map(|_| unreachable!("successful loads return above"))
     })
 }
 
 fn compile_model_from_url(
     model_bytes: &[u8],
     weights_data: Option<&[u8]>,
-    device_type: crate::backend_selection::DeviceType,
+    trace: &mut LoadTrace,
 ) -> Result<CompiledCoremlModel, GraphError> {
+    let route = CoremlLoadRoute::CompiledUrl;
     autoreleasepool(|| unsafe {
-        let (compiled_url, compiled_dir, temp_model) =
-            prepare_compiled_model_with_weights(model_bytes, weights_data, None)?;
+        let (compiled_url, compiled_dir, temp_model) = trace.prepare(route, || {
+            prepare_compiled_model_with_weights(model_bytes, weights_data, None)
+        })?;
         // Owned (+1) by us; released when this function returns on any path.
         let _compiled_url_guard = ReleaseOnDrop(compiled_url);
-        let (preferred_code, preferred_name) = compute_unit_for_device(device_type);
-        let mut candidates = vec![(preferred_code, preferred_name)];
-        if preferred_code != 0 {
-            candidates.push((0, "CPU_ONLY"));
-        }
-
-        let mut last_error = String::from("MLModel load failed");
-        for (code, name) in candidates {
+        let loaded = trace.policies(route, |code| {
             let config: *mut Object = msg_send![class!(MLModelConfiguration), new];
             let _config_guard = ReleaseOnDrop(config);
             let () = msg_send![config, setComputeUnits: code];
@@ -433,14 +426,20 @@ fn compile_model_from_url(
                 error.len(),
             );
             if status != 0 || model.is_null() {
-                last_error = format!("MLModel load failed: {}", shim_error_to_string(&error));
-                continue;
+                return Err(format!(
+                    "MLModel load failed: {}",
+                    shim_error_to_string(&error)
+                ));
             }
+            Ok(model)
+        });
+        if let Ok((model, name)) = loaded {
             // The shim returns an owned (+1) model; `CompiledCoremlModel`'s
             // Drop releases it.
             return Ok(CompiledCoremlModel {
                 model,
                 compute_unit: name,
+                diagnostics: trace.finish(route, name),
                 backing: CoremlModelBacking::OnDisk {
                     compiled_dir,
                     temp_model,
@@ -451,7 +450,7 @@ fn compile_model_from_url(
         let _ = std::fs::remove_dir_all(&compiled_dir);
         // `temp_model` removes its temp path when dropped at end of scope.
         drop(temp_model);
-        Err(GraphError::CoremlRuntimeFailed { reason: last_error })
+        loaded.map(|_| unreachable!("successful loads return above"))
     })
 }
 
@@ -607,7 +606,7 @@ pub(crate) fn run_coreml_bytes(
             // Prefer the model's own data type code; fall back to our mapping only when
             // the model exposes no constraint for this input.
             let code = model_input_dtype_code(input_descs, key)
-                .map_or_else(|| map_dtype(input.descriptor.data_type), Ok)?;
+                .unwrap_or_else(|| map_dtype(input.descriptor.data_type));
             let array = create_multi_array(&shape_i64, code)?;
             fill_multiarray_from_bytes(array, input.data, input.descriptor.data_type, code)?;
             let feature_value: *mut Object =
@@ -667,440 +666,115 @@ pub(crate) fn run_coreml_bytes(
     })
 }
 
-/// Copy raw bytes into a freshly created `MLMultiArray`. The array must have been
-/// created with the data type matching `dtype`, so the byte layout is identical.
+/// Read the actual allocation type and validate layout metadata before touching
+/// its storage. CoreML strides are element offsets, not byte offsets.
+unsafe fn multiarray_storage(
+    array: *mut Object,
+) -> Result<(NativeType, ArrayLayout, *mut u8), GraphError> {
+    let code: i64 = msg_send![array, dataType];
+    let kind = NativeType::from_code(code)?;
+    let count: isize = msg_send![array, count];
+    let count = usize::try_from(count)
+        .map_err(|_| boundary_error("negative MLMultiArray element count"))?;
+    let shape: *mut Object = msg_send![array, shape];
+    let shape = unsafe { nsarray_to_i64_vec(shape)? };
+    let strides: *mut Object = msg_send![array, strides];
+    let strides = unsafe { nsarray_to_i64_vec(strides)? };
+    let layout = ArrayLayout::new(&shape, &strides, count, kind.element_size())?;
+    let data: *mut c_void = msg_send![array, dataPointer];
+    if data.is_null() && count != 0 {
+        return Err(boundary_error("MLMultiArray has no backing storage"));
+    }
+    Ok((kind, layout, data.cast()))
+}
+
+/// Copy a packed C-order host buffer into native element strides.
+unsafe fn write_array_storage(
+    data: *mut u8,
+    layout: &ArrayLayout,
+    element_size: usize,
+    bytes: &[u8],
+) -> Result<(), GraphError> {
+    if bytes.len() != layout.byte_length {
+        return Err(boundary_error(format!(
+            "MLMultiArray input byte length mismatch: expected {}, got {}",
+            layout.byte_length,
+            bytes.len()
+        )));
+    }
+    if layout.count == 0 {
+        return Ok(());
+    }
+    if layout.contiguous {
+        unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), data, bytes.len()) };
+    } else {
+        for index in 0..layout.count {
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    bytes.as_ptr().add(index * element_size),
+                    data.add(layout.byte_offset(index)),
+                    element_size,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Gather every native type with the same checked, element-stride-aware path.
+unsafe fn read_array_storage(
+    data: *const u8,
+    layout: &ArrayLayout,
+    element_size: usize,
+) -> Vec<u8> {
+    if layout.count == 0 {
+        return vec![];
+    }
+    if layout.contiguous {
+        return unsafe { std::slice::from_raw_parts(data, layout.byte_length) }.to_vec();
+    }
+    let mut bytes = Vec::with_capacity(layout.byte_length);
+    for index in 0..layout.count {
+        bytes.extend_from_slice(unsafe {
+            std::slice::from_raw_parts(data.add(layout.byte_offset(index)), element_size)
+        });
+    }
+    bytes
+}
+
+/// Fill native storage by numeric type, never by element width alone.
 unsafe fn fill_multiarray_from_bytes(
     array: *mut Object,
     src: &[u8],
     dtype: DataType,
     array_code: i32,
 ) -> Result<(), GraphError> {
-    let count_obj: isize = msg_send![array, count];
-    let count = usize::try_from(count_obj).map_err(|_| GraphError::CoremlRuntimeFailed {
-        reason: format!("invalid element count: {count_obj}"),
-    })?;
-    // int4/uint4 inputs arrive packed two-per-byte and are exposed as float32 at the
-    // model boundary; unpack the nibbles and write them into the float32 array.
-    if matches!(dtype, DataType::Int4 | DataType::Uint4) {
-        if count == 0 {
-            return Ok(());
-        }
-        let floats: Vec<f32> = if matches!(dtype, DataType::Int4) {
-            crate::graph::unpack_int4(src, count)
-                .into_iter()
-                .map(|v| v as f32)
-                .collect()
-        } else {
-            crate::graph::unpack_uint4(src, count)
-                .into_iter()
-                .map(|v| v as f32)
-                .collect()
-        };
-        let ptr: *mut c_void = msg_send![array, dataPointer];
-        if ptr.is_null() {
-            return Err(GraphError::CoremlRuntimeFailed {
-                reason: format!("MLMultiArray has no backing buffer for data type {dtype:?}"),
-            });
-        }
-        let dst = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, count * 4) };
-        for (i, f) in floats.iter().enumerate() {
-            dst[i * 4..i * 4 + 4].copy_from_slice(&f.to_le_bytes());
-        }
-        return Ok(());
+    let (kind, layout, data) = unsafe { multiarray_storage(array)? };
+    if kind != NativeType::from_code(i64::from(array_code))? {
+        return Err(boundary_error(
+            "MLMultiArray allocation data type differs from its requested type",
+        ));
     }
-    let elem = dtype.bytes_per_element();
-    let expected = count.saturating_mul(elem);
-    if src.len() != expected {
-        return Err(GraphError::CoremlRuntimeFailed {
-            reason: format!(
-                "input byte length mismatch: expected {expected} bytes ({count} elements), got {}",
-                src.len()
-            ),
-        });
-    }
-    // When the model boundary promotes the input type (e.g. a WebNN uint8 boolean
-    // condition exposed as Float32 by CoreML), convert the source bytes to the
-    // required element size before writing.
-    let canonical_code = normalize_dtype_code(array_code);
-    // A different element size always needs conversion. So does a same-width
-    // dtype mismatch: uint32 (4 bytes) promoted into an fp32 (4 bytes) array must
-    // be converted by value, not copied as raw bits.
-    let same_width_mismatch =
-        canonical_code == 32 && !matches!(dtype, DataType::Float32 | DataType::Int32);
-    if let Some(array_elem) = ml_dtype_code_element_size(canonical_code)
-        && (array_elem != elem || same_width_mismatch)
-    {
-        if count == 0 {
-            return Ok(());
-        }
-        let ptr: *mut c_void = msg_send![array, dataPointer];
-        if ptr.is_null() {
-            return Err(GraphError::CoremlRuntimeFailed {
-                reason: format!("MLMultiArray has no backing buffer for data type {dtype:?}"),
-            });
-        }
-        // Convert src bytes (dtype) → array bytes (canonical_code).
-        let converted = convert_input_bytes(src, dtype, canonical_code, count);
-        let dst = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, count * array_elem) };
-        dst.copy_from_slice(&converted);
-        return Ok(());
-    }
-    if expected == 0 {
-        return Ok(());
-    }
-    let ptr: *mut c_void = msg_send![array, dataPointer];
-    if ptr.is_null() {
-        return Err(GraphError::CoremlRuntimeFailed {
-            reason: format!("MLMultiArray has no backing buffer for data type {dtype:?}"),
-        });
-    }
-    unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), ptr as *mut u8, expected) };
-    Ok(())
-}
-
-/// Convert input bytes from `src_dtype` to a buffer compatible with `target_code`.
-/// Used when CoreML promotes an input type (e.g. uint8 boolean → float32).
-fn convert_input_bytes(src: &[u8], src_dtype: DataType, target_code: i32, count: usize) -> Vec<u8> {
-    match (src_dtype, target_code) {
-        (DataType::Uint8, 32) => {
-            // uint8/bool → float32: 0→0.0, 1→1.0 (also used for boolean condition inputs)
-            let mut out = Vec::with_capacity(count * 4);
-            for &b in src.iter().take(count) {
-                out.extend_from_slice(&(b as f32).to_le_bytes());
-            }
-            out
-        }
-        (DataType::Int8, 32) => {
-            // int8 → float32: reinterpret the byte as signed so negatives are preserved
-            // (a raw `b as f32` would turn -128 into 128.0).
-            let mut out = Vec::with_capacity(count * 4);
-            for &b in src.iter().take(count) {
-                out.extend_from_slice(&((b as i8) as f32).to_le_bytes());
-            }
-            out
-        }
-        (DataType::Int32, 32) => {
-            // int32 as float32 bits (reinterpret, same size — shouldn't normally happen)
-            src.to_vec()
-        }
-        (DataType::Uint32, 32) => {
-            // uint32 → float32 by value (the interface promotes uint32 to float32).
-            let src_u32 = unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u32, count) };
-            let mut out = Vec::with_capacity(count * 4);
-            for &v in src_u32 {
-                out.extend_from_slice(&(v as f32).to_le_bytes());
-            }
-            out
-        }
-        (DataType::Uint64, 32) => {
-            // uint64 → float32 by value (the interface promotes uint64 to float32).
-            let src_u64 = unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u64, count) };
-            let mut out = Vec::with_capacity(count * 4);
-            for &v in src_u64 {
-                out.extend_from_slice(&(v as f32).to_le_bytes());
-            }
-            out
-        }
-        (DataType::Float32, 16) => {
-            // float32 → float16
-            let src_f32 = unsafe { std::slice::from_raw_parts(src.as_ptr() as *const f32, count) };
-            let mut out = Vec::with_capacity(count * 2);
-            for &v in src_f32 {
-                out.extend_from_slice(&half::f16::from_f32(v).to_bits().to_le_bytes());
-            }
-            out
-        }
-        (DataType::Float16, 32) => {
-            // float16 → float32
-            let src_f16 = unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u16, count) };
-            let mut out = Vec::with_capacity(count * 4);
-            for &bits in src_f16 {
-                out.extend_from_slice(&half::f16::from_bits(bits).to_f32().to_le_bytes());
-            }
-            out
-        }
-        (DataType::Int64, 32) => {
-            // int64 → float32: used for int64 inputs promoted to float32 by CoreML
-            let src_i64 = unsafe { std::slice::from_raw_parts(src.as_ptr() as *const i64, count) };
-            let mut out = Vec::with_capacity(count * 4);
-            for &v in src_i64 {
-                out.extend_from_slice(&(v as f32).to_le_bytes());
-            }
-            out
-        }
-        _ => {
-            // Fallback: pass bytes as-is (may be wrong but avoids panic)
-            src.to_vec()
-        }
+    // Matching types retain all integer bits/NaN payloads without an extra
+    // whole-tensor allocation. Promoted types require numeric conversion.
+    if kind.matches(dtype) {
+        unsafe { write_array_storage(data, &layout, kind.element_size(), src) }
+    } else {
+        let bytes = to_native(src, dtype, kind, layout.count)?;
+        unsafe { write_array_storage(data, &layout, kind.element_size(), &bytes) }
     }
 }
 
-/// Extract a `MLMultiArray` into raw bytes laid out per the output descriptor's dtype.
-///
-/// Handles non-contiguous layouts (e.g. 64-byte aligned outputs from the Apple
-/// Neural Engine) by gathering elements according to the array's strides.
-/// Also handles dtype mismatches: CoreML may return a different dtype than requested
-/// (e.g. float32 for a uint8-declared output from a comparison op). In that case the
-/// data is converted element-by-element to the expected dtype.
 unsafe fn extract_multiarray_bytes(
     array: *mut Object,
     descriptor: &OperandDescriptor,
 ) -> Result<Vec<u8>, GraphError> {
-    let count_obj: isize = msg_send![array, count];
-    let count = usize::try_from(count_obj).map_err(|_| GraphError::CoremlRuntimeFailed {
-        reason: format!("invalid element count: {count_obj}"),
-    })?;
-
-    // Query the actual data type code from the MLMultiArray — CoreML may promote
-    // the dtype (e.g. uint8 cast result returned as float32).
-    let actual_dtype_code: i64 = msg_send![array, dataType];
-    let actual_elem = ml_dtype_code_element_size(actual_dtype_code as i32).unwrap_or(4);
-
-    // int4/uint4 outputs are produced as int32 (the proxy). Read the int32 values and
-    // re-pack them two-per-byte into the sub-byte layout the host tensor expects.
-    if matches!(descriptor.data_type, DataType::Int4 | DataType::Uint4) {
-        let ptr: *const u8 = {
-            let p: *mut c_void = msg_send![array, dataPointer];
-            if p.is_null() {
-                return Err(GraphError::CoremlRuntimeFailed {
-                    reason: "output MLMultiArray has no backing buffer for int4/uint4".to_string(),
-                });
-            }
-            p as *const u8
-        };
-        let shape_ns: *mut Object = msg_send![array, shape];
-        let shape = unsafe { nsarray_to_i64_vec(shape_ns)? };
-        let strides_ns: *mut Object = msg_send![array, strides];
-        let strides = unsafe { nsarray_to_i64_vec(strides_ns)? };
-        let raw = if is_contiguous(&shape, &strides) {
-            unsafe { std::slice::from_raw_parts(ptr, count.saturating_mul(actual_elem)) }.to_vec()
-        } else {
-            unsafe { gather_strided_bytes(ptr, &shape, &strides, actual_elem) }
-        };
-        // Float codes (Float32 = 32/0x10020, Float16 = 16/0x10010) must be read as
-        // floats; int codes (Int32 = 3/0x20020) as integers. NOTE: 0x20020 (131104) is
-        // Int32, not Float32 — do not route it through normalize_dtype_code here.
-        let is_float = matches!(actual_dtype_code as i32, 32 | 65568 | 16 | 65552);
-        let ints: Vec<i32> = if is_float {
-            raw.chunks_exact(4)
-                .map(|c| f32::from_le_bytes(c.try_into().unwrap()) as i32)
-                .collect()
-        } else {
-            raw.chunks_exact(4)
-                .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
-                .collect()
-        };
-        let packed = if matches!(descriptor.data_type, DataType::Int4) {
-            crate::graph::pack_int4(&ints)
-        } else {
-            let u: Vec<u8> = ints.iter().map(|&v| v as u8).collect();
-            crate::graph::pack_uint4(&u)
-        };
-        return Ok(packed);
+    let (kind, layout, data) = unsafe { multiarray_storage(array)? };
+    let bytes = unsafe { read_array_storage(data, &layout, kind.element_size()) };
+    if kind.matches(descriptor.data_type) {
+        return Ok(bytes);
     }
-
-    let expected_elem = descriptor.data_type.bytes_per_element();
-
-    let ptr: *const u8 = {
-        let p: *mut c_void = msg_send![array, dataPointer];
-        if p.is_null() {
-            return Err(GraphError::CoremlRuntimeFailed {
-                reason: format!(
-                    "output MLMultiArray has no backing buffer for data type {:?}",
-                    descriptor.data_type
-                ),
-            });
-        }
-        p as *const u8
-    };
-
-    let shape_nsarray: *mut Object = msg_send![array, shape];
-    let shape = unsafe { nsarray_to_i64_vec(shape_nsarray)? };
-    let strides_nsarray: *mut Object = msg_send![array, strides];
-    let strides = unsafe { nsarray_to_i64_vec(strides_nsarray)? };
-
-    // Read raw bytes using the ACTUAL element size from the MLMultiArray.
-    let actual_bytes = if is_contiguous(&shape, &strides) {
-        let total = count.saturating_mul(actual_elem);
-        let slice = unsafe { std::slice::from_raw_parts(ptr, total) };
-        slice.to_vec()
-    } else {
-        unsafe { gather_strided_bytes(ptr, &shape, &strides, actual_elem) }
-    };
-
-    if actual_elem == expected_elem {
-        return Ok(actual_bytes);
-    }
-
-    // Dtype mismatch: convert from the actual dtype to the expected dtype.
-    Ok(convert_multiarray_bytes(
-        actual_bytes,
-        actual_dtype_code as i32,
-        descriptor.data_type,
-    ))
-}
-
-/// Normalize non-standard MLMultiArrayDataType codes to canonical ones.
-/// CoreML sometimes returns vendor-specific codes (e.g. 65568 for Float32).
-fn normalize_dtype_code(code: i32) -> i32 {
-    match code {
-        65600 | 4 => 4,            // Int64 / Double → treat as Int64
-        65568 | 131104 | 32 => 32, // Float32 variants
-        65552 | 16 => 16,          // Float16 variants
-        3 => 3,                    // Int32
-        1 => 1,                    // Int8
-        _ => code,
-    }
-}
-
-/// Convert a byte buffer from `actual_code` dtype to the `target` dtype.
-/// Used when CoreML promotes an output dtype (e.g. uint8 boolean result → float32).
-fn convert_multiarray_bytes(actual_bytes: Vec<u8>, actual_code: i32, target: DataType) -> Vec<u8> {
-    let canonical_code = normalize_dtype_code(actual_code);
-    let actual_elem = ml_dtype_code_element_size(canonical_code).unwrap_or(4);
-    let count = actual_bytes.len().checked_div(actual_elem).unwrap_or(0);
-
-    match canonical_code {
-        32 => {
-            // Source: Float32
-            let src =
-                unsafe { std::slice::from_raw_parts(actual_bytes.as_ptr() as *const f32, count) };
-            match target {
-                DataType::Uint8 => src.iter().map(|&v| v as u8).collect(),
-                // f32 -> int8: go through i8 so negatives keep their bit pattern
-                // (`v as u8` saturates a negative float to 0).
-                DataType::Int8 => src.iter().map(|&v| (v as i8) as u8).collect(),
-                DataType::Int32 | DataType::Uint32 => {
-                    let mut out = Vec::with_capacity(count * 4);
-                    for &v in src {
-                        out.extend_from_slice(&(v as i32).to_le_bytes());
-                    }
-                    out
-                }
-                DataType::Float16 => {
-                    let mut out = Vec::with_capacity(count * 2);
-                    for &v in src {
-                        out.extend_from_slice(&half::f16::from_f32(v).to_bits().to_le_bytes());
-                    }
-                    out
-                }
-                _ => actual_bytes,
-            }
-        }
-        16 => {
-            // Source: Float16
-            let src =
-                unsafe { std::slice::from_raw_parts(actual_bytes.as_ptr() as *const u16, count) };
-            match target {
-                DataType::Uint8 => src
-                    .iter()
-                    .map(|&bits| half::f16::from_bits(bits).to_f32() as u8)
-                    .collect(),
-                // f16 -> int8: go through i8 so negatives keep their bit pattern.
-                DataType::Int8 => src
-                    .iter()
-                    .map(|&bits| (half::f16::from_bits(bits).to_f32() as i8) as u8)
-                    .collect(),
-                DataType::Float32 => {
-                    let mut out = Vec::with_capacity(count * 4);
-                    for &bits in src {
-                        out.extend_from_slice(&half::f16::from_bits(bits).to_f32().to_le_bytes());
-                    }
-                    out
-                }
-                _ => actual_bytes,
-            }
-        }
-        3 => {
-            // Source: Int32
-            let src =
-                unsafe { std::slice::from_raw_parts(actual_bytes.as_ptr() as *const i32, count) };
-            match target {
-                DataType::Float32 => {
-                    let mut out = Vec::with_capacity(count * 4);
-                    for &v in src {
-                        out.extend_from_slice(&(v as f32).to_le_bytes());
-                    }
-                    out
-                }
-                DataType::Uint8 | DataType::Int8 => src.iter().map(|&v| v as u8).collect(),
-                _ => actual_bytes,
-            }
-        }
-        1 => {
-            // Source: Int8 — compatible byte layout with Uint8
-            actual_bytes
-        }
-        4 => {
-            // Source: Int64
-            let src =
-                unsafe { std::slice::from_raw_parts(actual_bytes.as_ptr() as *const i64, count) };
-            match target {
-                DataType::Int32 | DataType::Uint32 => {
-                    let mut out = Vec::with_capacity(count * 4);
-                    for &v in src {
-                        out.extend_from_slice(&(v as i32).to_le_bytes());
-                    }
-                    out
-                }
-                DataType::Float32 => {
-                    let mut out = Vec::with_capacity(count * 4);
-                    for &v in src {
-                        out.extend_from_slice(&(v as f32).to_le_bytes());
-                    }
-                    out
-                }
-                DataType::Uint8 | DataType::Int8 => src.iter().map(|&v| v as u8).collect(),
-                _ => actual_bytes,
-            }
-        }
-        _ => actual_bytes,
-    }
-}
-
-/// Whether `strides` (in elements) describe a C-contiguous layout for `shape`.
-fn is_contiguous(shape: &[i64], strides: &[i64]) -> bool {
-    if shape.len() != strides.len() {
-        return false;
-    }
-    let mut expected = 1i64;
-    for i in (0..shape.len()).rev() {
-        if strides[i] != expected {
-            return false;
-        }
-        expected *= shape[i].max(1);
-    }
-    true
-}
-
-/// Gather a strided `MLMultiArray` into a contiguous C-order byte buffer.
-unsafe fn gather_strided_bytes(
-    ptr: *const u8,
-    shape: &[i64],
-    strides: &[i64],
-    elem: usize,
-) -> Vec<u8> {
-    let count: i64 = shape.iter().copied().map(|d| d.max(1)).product();
-    let count = count.max(0) as usize;
-    let mut out = Vec::with_capacity(count * elem);
-    let mut idx = vec![0i64; shape.len()];
-    for _ in 0..count {
-        let mut offset_elems = 0i64;
-        for d in 0..shape.len() {
-            offset_elems += idx[d] * strides[d];
-        }
-        let byte_off = offset_elems as usize * elem;
-        let slice = unsafe { std::slice::from_raw_parts(ptr.add(byte_off), elem) };
-        out.extend_from_slice(slice);
-        for d in (0..shape.len()).rev() {
-            idx[d] += 1;
-            if idx[d] < shape[d] {
-                break;
-            }
-            idx[d] = 0;
-        }
-    }
-    out
+    from_native(&bytes, kind, descriptor.data_type, layout.count)
 }
 
 #[allow(dead_code)]
@@ -1169,14 +843,14 @@ fn run_impl_zeroed_with_weights(
                 let (shape, data_type_code) = if desc_obj.is_null() {
                     (
                         coerce_shape(&descriptor.shape),
-                        map_dtype(descriptor.data_type)?,
+                        map_dtype(descriptor.data_type),
                     )
                 } else {
                     let constraint_obj: *mut Object = msg_send![desc_obj, multiArrayConstraint];
                     if constraint_obj.is_null() {
                         (
                             coerce_shape(&descriptor.shape),
-                            map_dtype(descriptor.data_type)?,
+                            map_dtype(descriptor.data_type),
                         )
                     } else {
                         let shape_obj: *mut Object = msg_send![constraint_obj, shape];
@@ -1192,8 +866,7 @@ fn run_impl_zeroed_with_weights(
                         break;
                     }
                 };
-                let fill_kind = data_type_from_code(data_type_code).unwrap_or(descriptor.data_type);
-                if let Err(err) = fill_zero(array, fill_kind, &shape) {
+                if let Err(err) = fill_zero(array) {
                     feature_err = Some(err.to_string());
                     break;
                 }
@@ -1357,13 +1030,13 @@ fn run_impl_with_inputs_with_weights(
                 // Following Chromium's approach: match the model's expected type to avoid conversion errors
                 let desc_obj: *mut Object = msg_send![input_descs, objectForKey: key];
                 let data_type_code = if desc_obj.is_null() {
-                    // No model info - default to Float32
-                    32
+                    // No model info - default to canonical Float32.
+                    NativeType::Float32.code()
                 } else {
                     let constraint_obj: *mut Object = msg_send![desc_obj, multiArrayConstraint];
                     if constraint_obj.is_null() {
-                        // No constraint - default to Float32
-                        32
+                        // No constraint - default to canonical Float32.
+                        NativeType::Float32.code()
                     } else {
                         let ml_data_type: i64 = msg_send![constraint_obj, dataType];
                         ml_data_type as i32
@@ -1573,7 +1246,7 @@ unsafe fn collect_outputs(
         let shape = unsafe { nsarray_to_i64_vec(shape_nsarray)? };
 
         // Extract actual data from MLMultiArray
-        let data = unsafe { extract_mlmultiarray_data(array, data_type, &shape)? };
+        let data = unsafe { extract_mlmultiarray_data(array)? };
 
         Ok(CoremlOutput {
             name: name.to_string(),
@@ -1584,83 +1257,16 @@ unsafe fn collect_outputs(
     })
 }
 
-unsafe fn extract_mlmultiarray_data(
-    array: *mut Object,
-    data_type: i64,
-    _shape: &[i64],
-) -> Result<Vec<f32>, GraphError> {
-    let count_obj: isize = msg_send![array, count];
-    let count = usize::try_from(count_obj).map_err(|_| GraphError::CoremlRuntimeFailed {
-        reason: format!("invalid element count: {}", count_obj),
-    })?;
-
-    let ptr: *mut std::os::raw::c_void = msg_send![array, dataPointer];
-
-    // Convert to f32 regardless of source type
-    let data = match data_type as i32 {
-        32 | 65568 | 65552 => {
-            // Float32 - codes: 32 (standard), 65568 (0x10020), 65552 (0x10010)
-            // CoreML sometimes returns non-standard type codes for Float32
-            let slice = unsafe { std::slice::from_raw_parts(ptr as *const f32, count) };
-            slice.to_vec()
-        }
-        16 => {
-            // Float16 - Must handle 64-byte aligned non-contiguous data from ANE
-            // Following Chromium's approach: when Float16 executes on Apple Neural Engine,
-            // outputs are 64-byte aligned and may be non-contiguous
-            // Reference: chromium/src/+/5a3727be66 - Handle non-contiguous CoreML predictions
-
-            // Get strides to detect non-contiguous data
-            let strides_nsarray: *mut Object = msg_send![array, strides];
-            let stride_count: usize = msg_send![strides_nsarray, count];
-
-            if stride_count > 0 {
-                // Get first stride value (bytes between elements)
-                let stride_obj: *mut Object = msg_send![strides_nsarray, objectAtIndex: 0];
-                let stride_value: isize = msg_send![stride_obj, integerValue];
-                let stride_bytes = stride_value as usize;
-
-                // If stride != 2 (size of f16), data is non-contiguous
-                if stride_bytes != 2 {
-                    // Non-contiguous: iterate with stride
-                    let base_ptr = ptr as *const u8;
-                    let mut result = Vec::with_capacity(count);
-                    for i in 0..count {
-                        let offset = i * stride_bytes;
-                        let f16_ptr = unsafe { base_ptr.add(offset) as *const u16 };
-                        let bits = unsafe { *f16_ptr };
-                        result.push(half::f16::from_bits(bits).to_f32());
-                    }
-                    return Ok(result);
-                }
-            }
-
-            // Contiguous data: use simple slice
-            let slice = unsafe { std::slice::from_raw_parts(ptr as *const u16, count) };
-            slice
-                .iter()
-                .map(|&bits| half::f16::from_bits(bits).to_f32())
-                .collect()
-        }
-        3 => {
-            // Int32
-            let slice = unsafe { std::slice::from_raw_parts(ptr as *const i32, count) };
-            slice.iter().map(|&x| x as f32).collect()
-        }
-        1 => {
-            // Int8
-            let slice = unsafe { std::slice::from_raw_parts(ptr as *const i8, count) };
-            slice.iter().map(|&x| x as f32).collect()
-        }
-        _ => {
-            // Try treating unknown types as Float32 (most common output type)
-            // This is a fallback for non-standard CoreML type codes
-            let slice = unsafe { std::slice::from_raw_parts(ptr as *const f32, count) };
-            slice.to_vec()
-        }
-    };
-
-    Ok(data)
+unsafe fn extract_mlmultiarray_data(array: *mut Object) -> Result<Vec<f32>, GraphError> {
+    let (kind, layout, data) = unsafe { multiarray_storage(array)? };
+    let bytes = unsafe { read_array_storage(data, &layout, kind.element_size()) };
+    let floats = from_native(&bytes, kind, DataType::Float32, layout.count)?;
+    Ok(floats
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&bytes| f32::from_ne_bytes(bytes))
+        .collect())
 }
 
 #[allow(dead_code)]
@@ -1858,47 +1464,15 @@ fn coerce_shape(shape: &[Dimension]) -> Vec<i64> {
     }
 }
 
-fn element_count(shape: &[i64]) -> Option<usize> {
-    let mut count: i64 = 1;
-    for dim in shape {
-        count = count.checked_mul(*dim)?;
+fn map_dtype(data_type: DataType) -> i32 {
+    // Match the converter's feature-boundary promotion on every supported OS.
+    // In particular, do not allocate OS 26-only Int8 arrays on older devices.
+    match data_type {
+        DataType::Float16 => NativeType::Float16,
+        DataType::Int32 => NativeType::Int32,
+        _ => NativeType::Float32,
     }
-    usize::try_from(count).ok()
-}
-
-fn map_dtype(data_type: DataType) -> Result<i32, GraphError> {
-    // `MLMultiArrayDataType` enum values from Apple docs.
-    let code = match data_type {
-        DataType::Int4 | DataType::Uint4 => {
-            return Err(GraphError::ConversionFailed {
-                format: "coreml".to_string(),
-                reason: "int4/uint4 tensors are not supported by CoreML runtime".to_string(),
-            });
-        }
-        DataType::Float32 => 32, // MLMultiArrayDataTypeFloat32
-        DataType::Float16 => 16, // MLMultiArrayDataTypeFloat16
-        DataType::Int32 => 3,    // MLMultiArrayDataTypeInt32
-        DataType::Int64 => 4,    // Closest available type
-        DataType::Int8 => 1,     // MLMultiArrayDataTypeInt8
-        DataType::Uint8 => 1,    // closest available signed byte type
-        DataType::Uint32 => 3,   // closest available signed int type
-        DataType::Uint64 => 4,   // closest available signed int type
-    };
-    Ok(code)
-}
-
-/// Element size in bytes for an `MLMultiArrayDataType` raw code, if known.
-///
-/// Covers Apple's canonical `0x1_0000`/`0x2_0000`-flagged values as well as the
-/// legacy bare codes still used by [`map_dtype`].
-fn ml_dtype_code_element_size(code: i32) -> Option<usize> {
-    match code {
-        65600 | 4 => Some(8),               // Double / Int64
-        65568 | 131104 | 32 | 3 => Some(4), // Float32 / Int32
-        65552 | 16 => Some(2),              // Float16
-        1 => Some(1),                       // Int8
-        _ => None,
-    }
+    .code()
 }
 
 /// Query the model's declared `MLMultiArrayDataType` code for the input named `key`.
@@ -1917,16 +1491,6 @@ unsafe fn model_input_dtype_code(input_descs: *mut Object, key: *mut Object) -> 
     }
     let ml_data_type: i64 = msg_send![constraint_obj, dataType];
     Some(ml_data_type as i32)
-}
-
-fn data_type_from_code(code: i32) -> Option<DataType> {
-    match code {
-        32 => Some(DataType::Float32),
-        16 => Some(DataType::Float16),
-        3 => Some(DataType::Int32),
-        1 => Some(DataType::Int8),
-        _ => None,
-    }
 }
 
 unsafe fn nsstring_from_str(value: &str) -> Result<*mut Object, GraphError> {
@@ -1949,6 +1513,7 @@ unsafe fn nsurl_from_path(path: &Path) -> Result<*mut Object, GraphError> {
 }
 
 unsafe fn create_multi_array(shape: &[i64], data_type: i32) -> Result<*mut Object, GraphError> {
+    NativeType::from_code(i64::from(data_type))?;
     let numbers: Vec<*mut Object> = shape
         .iter()
         .map(|dim| {
@@ -1973,148 +1538,39 @@ unsafe fn create_multi_array(shape: &[i64], data_type: i32) -> Result<*mut Objec
     Ok(array)
 }
 
-unsafe fn fill_zero(
-    array: *mut Object,
-    data_type: DataType,
-    shape: &[i64],
-) -> Result<(), GraphError> {
-    // Prefer the runtime-reported element count to avoid mismatches with coerced shapes.
-    let count_obj: isize = msg_send![array, count];
-    let count_from_runtime: Option<usize> = usize::try_from(count_obj).ok();
-    let count_from_shape = element_count(shape);
-    let Some(count) = count_from_runtime.or(count_from_shape) else {
-        return Err(GraphError::CoremlRuntimeFailed {
-            reason: format!("shape {:?} overflows element count", shape),
-        });
-    };
-    let ptr: *mut c_void = msg_send![array, dataPointer];
-    match data_type {
-        DataType::Int4 | DataType::Uint4 => {
-            return Err(GraphError::CoremlRuntimeFailed {
-                reason: "int4/uint4 tensors are not supported by CoreML runtime".to_string(),
-            });
-        }
-        DataType::Float32 => {
-            let slice = unsafe { std::slice::from_raw_parts_mut(ptr as *mut f32, count) };
-            for v in slice.iter_mut() {
-                *v = 0.0;
-            }
-        }
-        DataType::Float16 => {
-            let slice = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u16, count) };
-            for v in slice.iter_mut() {
-                *v = 0;
-            }
-        }
-        DataType::Int32 | DataType::Uint32 => {
-            let slice = unsafe { std::slice::from_raw_parts_mut(ptr as *mut i32, count) };
-            for v in slice.iter_mut() {
-                *v = 0;
-            }
-        }
-        DataType::Int64 | DataType::Uint64 => {
-            let slice = unsafe { std::slice::from_raw_parts_mut(ptr as *mut i64, count) };
-            for v in slice.iter_mut() {
-                *v = 0;
-            }
-        }
-        DataType::Int8 | DataType::Uint8 => {
-            let slice = unsafe { std::slice::from_raw_parts_mut(ptr as *mut i8, count) };
-            for v in slice.iter_mut() {
-                *v = 0;
-            }
+unsafe fn fill_zero(array: *mut Object) -> Result<(), GraphError> {
+    let (kind, layout, data) = unsafe { multiarray_storage(array)? };
+    if layout.count == 0 {
+        return Ok(());
+    }
+    if layout.contiguous {
+        unsafe { ptr::write_bytes(data, 0, layout.byte_length) };
+    } else {
+        for index in 0..layout.count {
+            unsafe {
+                ptr::write_bytes(data.add(layout.byte_offset(index)), 0, kind.element_size())
+            };
         }
     }
     Ok(())
 }
 
-#[allow(dead_code)]
-unsafe fn fill_data(array: *mut Object, data: &[f32], _shape: &[i64]) -> Result<(), GraphError> {
-    let count_obj: isize = msg_send![array, count];
-    let count = usize::try_from(count_obj).map_err(|_| GraphError::CoremlRuntimeFailed {
-        reason: format!("invalid element count: {}", count_obj),
-    })?;
-
-    if data.len() != count {
-        return Err(GraphError::CoremlRuntimeFailed {
-            reason: format!(
-                "data size mismatch: expected {} elements but got {}",
-                count,
-                data.len()
-            ),
-        });
-    }
-
-    let ptr: *mut c_void = msg_send![array, dataPointer];
-    let slice = unsafe { std::slice::from_raw_parts_mut(ptr as *mut f32, count) };
-    slice.copy_from_slice(data);
-
-    Ok(())
-}
-
-/// Fill MLMultiArray with data, converting f32 input to target type if needed
-/// Following Chromium's approach: match the model's expected data type
+/// The convenience API accepts/returns f32 values, so large integer values may
+/// lose precision by design. Use typed MLTensor dispatch for exact integer I/O.
 unsafe fn fill_data_with_type_conversion(
     array: *mut Object,
     data: &[f32],
     _shape: &[i64],
     data_type_code: i32,
 ) -> Result<(), GraphError> {
-    let count_obj: isize = msg_send![array, count];
-    let count = usize::try_from(count_obj).map_err(|_| GraphError::CoremlRuntimeFailed {
-        reason: format!("invalid element count: {}", count_obj),
-    })?;
-
-    if data.len() != count {
-        return Err(GraphError::CoremlRuntimeFailed {
-            reason: format!(
-                "data size mismatch: expected {} elements but got {}",
-                count,
-                data.len()
-            ),
-        });
+    unsafe {
+        fill_multiarray_from_bytes(
+            array,
+            bytemuck::cast_slice(data),
+            DataType::Float32,
+            data_type_code,
+        )
     }
-
-    let ptr: *mut c_void = msg_send![array, dataPointer];
-
-    // Convert f32 data to target type based on data_type_code
-    match data_type_code {
-        32 | 65568 | 65552 => {
-            // Float32 - codes: 32 (standard), 65568 (0x10020), 65552 (0x10010)
-            // CoreML sometimes returns non-standard type codes for Float32
-            let slice = unsafe { std::slice::from_raw_parts_mut(ptr as *mut f32, count) };
-            slice.copy_from_slice(data);
-        }
-        16 => {
-            // Float16 - convert f32 to f16
-            let slice = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u16, count) };
-            for (i, &val) in data.iter().enumerate() {
-                slice[i] = half::f16::from_f32(val).to_bits();
-            }
-        }
-        3 => {
-            // Int32 - convert f32 to i32
-            let slice = unsafe { std::slice::from_raw_parts_mut(ptr as *mut i32, count) };
-            for (i, &val) in data.iter().enumerate() {
-                slice[i] = val as i32;
-            }
-        }
-        1 => {
-            // Int8 - convert f32 to i8
-            let slice = unsafe { std::slice::from_raw_parts_mut(ptr as *mut i8, count) };
-            for (i, &val) in data.iter().enumerate() {
-                slice[i] = val as i8;
-            }
-        }
-        _ => {
-            // Fallback: try treating unknown types as Float32 (most common output type)
-            // This is a fallback for non-standard CoreML type codes
-            let slice = unsafe { std::slice::from_raw_parts_mut(ptr as *mut f32, count) };
-            slice.copy_from_slice(data);
-        }
-    }
-
-    Ok(())
 }
 
 unsafe fn nsarray_to_i64_vec(array: *mut Object) -> Result<Vec<i64>, GraphError> {
@@ -2163,6 +1619,138 @@ fn copy_dir_recursively(src: &Path, dst: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod dtype_storage_tests {
+    use super::*;
+
+    unsafe fn strided_array(data: &mut [u8], dtype: NativeType) -> *mut Object {
+        let shape: Vec<*mut Object> = [2i64, 3]
+            .iter()
+            .map(|&value| {
+                let number: *mut Object = msg_send![class!(NSNumber), numberWithLongLong: value];
+                number
+            })
+            .collect();
+        let strides: Vec<*mut Object> = [8i64, 2]
+            .iter()
+            .map(|&value| {
+                let number: *mut Object = msg_send![class!(NSNumber), numberWithLongLong: value];
+                number
+            })
+            .collect();
+        let shape: *mut Object =
+            msg_send![class!(NSArray), arrayWithObjects: shape.as_ptr() count: shape.len()];
+        let strides: *mut Object =
+            msg_send![class!(NSArray), arrayWithObjects: strides.as_ptr() count: strides.len()];
+        let alloc: *mut Object = msg_send![class!(MLMultiArray), alloc];
+        let mut error: *mut Object = ptr::null_mut();
+        let array: *mut Object = msg_send![alloc,
+            initWithDataPointer: data.as_mut_ptr()
+            shape: shape
+            dataType: dtype.code()
+            strides: strides
+            deallocator: ptr::null_mut::<Object>()
+            error: &mut error];
+        assert!(!array.is_null(), "{}", unsafe {
+            ns_error_to_string(error, "strided allocation failed")
+        });
+        array
+    }
+
+    #[test]
+    fn coreml_dtypes_native_strides_conversion_and_zero_preserve_padding() {
+        autoreleasepool(|| unsafe {
+            let values = [-2f32, -1., 0., 1., 31., 123.];
+            for kind in [
+                NativeType::Float16,
+                NativeType::Float32,
+                NativeType::Double,
+                NativeType::Int32,
+            ] {
+                let width = kind.element_size();
+                // Six scalars in a padded [2, 3] layout, with an extra tail canary.
+                let mut backing = vec![0xa5; 13 * width + 16];
+                let array = strided_array(&mut backing, kind);
+                let _guard = ReleaseOnDrop(array);
+                fill_data_with_type_conversion(array, &values, &[2, 3], kind.code()).unwrap();
+                assert_eq!(extract_mlmultiarray_data(array).unwrap(), values);
+                let descriptor = OperandDescriptor {
+                    data_type: DataType::Float32,
+                    shape: crate::graph::to_dimension_vector(&[2, 3]),
+                    pending_permutation: vec![],
+                };
+                let bytes = extract_multiarray_bytes(array, &descriptor).unwrap();
+                assert_eq!(bytes, bytemuck::cast_slice::<f32, u8>(&values));
+                fill_zero(array).unwrap();
+                assert_eq!(extract_mlmultiarray_data(array).unwrap(), [0.; 6]);
+                for (index, &byte) in backing.iter().enumerate() {
+                    let active = [0, 2, 4, 8, 10, 12].contains(&(index / width));
+                    assert_eq!(
+                        byte,
+                        if active { 0 } else { 0xa5 },
+                        "{kind:?}, byte {index}"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn coreml_dtypes_native_exact_int32_and_rejected_lengths() {
+        autoreleasepool(|| unsafe {
+            let array = create_multi_array(&[2], NativeType::Int32.code()).unwrap();
+            let values = [16_777_217i32, i32::MIN + 1];
+            fill_multiarray_from_bytes(
+                array,
+                bytemuck::cast_slice(&values),
+                DataType::Int32,
+                NativeType::Int32.code(),
+            )
+            .unwrap();
+            let descriptor = OperandDescriptor {
+                data_type: DataType::Int32,
+                shape: crate::graph::to_dimension_vector(&[2]),
+                pending_permutation: vec![],
+            };
+            assert_eq!(
+                extract_multiarray_bytes(array, &descriptor).unwrap(),
+                bytemuck::cast_slice::<i32, u8>(&values)
+            );
+            assert!(
+                fill_multiarray_from_bytes(
+                    array,
+                    &[0; 4],
+                    DataType::Int32,
+                    NativeType::Int32.code()
+                )
+                .is_err()
+            );
+            assert!(
+                fill_data_with_type_conversion(array, &[1.], &[2], NativeType::Int32.code())
+                    .is_err()
+            );
+            assert!(create_multi_array(&[2], 16).is_err());
+        });
+    }
+
+    #[test]
+    fn coreml_dtypes_fallback_allocations_match_promoted_model_boundaries() {
+        for dtype in [
+            DataType::Int4,
+            DataType::Uint4,
+            DataType::Int8,
+            DataType::Uint8,
+            DataType::Uint32,
+            DataType::Int64,
+            DataType::Uint64,
+        ] {
+            assert_eq!(map_dtype(dtype), NativeType::Float32.code());
+        }
+        assert_eq!(map_dtype(DataType::Float16), NativeType::Float16.code());
+        assert_eq!(map_dtype(DataType::Int32), NativeType::Int32.code());
+    }
 }
 
 #[cfg(test)]

@@ -35,6 +35,7 @@ fn graph() -> GraphInfo {
 
 fn convolution_graph(gelu_filter: bool) -> GraphInfo {
     use rustnn::graph::{ConstantData, to_dimension_vector};
+    use rustnn::operator_enums::{MLConv2dFilterOperandLayout, MLInputOperandLayout};
     use rustnn::operator_options::MLConv2dOptions;
 
     let (input_shape, constant_shape, output_shape, values) = if gelu_filter {
@@ -92,8 +93,16 @@ fn convolution_graph(gelu_filter: bool) -> GraphInfo {
                 input: if gelu_filter { 2 } else { 1 },
                 filter: if gelu_filter { 1 } else { 2 },
                 options: Some(MLConv2dOptions {
-                    input_layout: if gelu_filter { "nchw" } else { "nhwc" }.into(),
-                    filter_layout: if gelu_filter { "hwio" } else { "oihw" }.into(),
+                    input_layout: if gelu_filter {
+                        MLInputOperandLayout::Nchw
+                    } else {
+                        MLInputOperandLayout::Nhwc
+                    },
+                    filter_layout: if gelu_filter {
+                        MLConv2dFilterOperandLayout::Hwio
+                    } else {
+                        MLConv2dFilterOperandLayout::Oihw
+                    },
                     ..Default::default()
                 }),
                 outputs: vec![3],

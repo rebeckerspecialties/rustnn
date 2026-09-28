@@ -118,6 +118,9 @@ Rules that hold for every converter:
   float16. Native float16 GELU can exceed WebNN's error bound under accelerator-enabled
   policies. This preserves the public dtype and shape without forcing CPU execution;
   float32 GELU is unchanged. Deferred layout transposes are emitted after the final cast.
+  Graphs containing float16 GELU use local file compilation: the in-memory compiler
+  still loses small values on A12/iOS 18 and A10X/tvOS 26 with GPU allowed. This
+  preserves the requested compute policy and does not widen stored weights or tensors.
 - The internal `shape` extension lowers to MIL `shape`, retaining its native int32 result
   inside CoreML and widening the public int64 result at readback. Imported shape tensors
   retain their type and rank through the shared `unsqueeze` inference path.
