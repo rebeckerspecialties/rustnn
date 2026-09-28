@@ -6099,6 +6099,84 @@ impl super::GraphConverter for CoremlMlProgramConverter {
         for op in &graph_info.operations {
             let op_type_lower = op.op_type().to_lowercase();
 
+            // CoreML's fp16 GELU can exceed WebNN's error bound even with
+            // mode=EXACT under accelerator-enabled policies. Evaluate in fp32
+            // and round once at the fp16 boundary. Leave device selection to
+            // CoreML; this changes precision, not the requested compute units.
+            if let Operation::Gelu { input, .. } = op
+                && graph_info
+                    .operand(*input)
+                    .is_some_and(|operand| operand.descriptor.data_type == DataType::Float16)
+            {
+                let output_id =
+                    op.output_operand()
+                        .ok_or_else(|| GraphError::ConversionFailed {
+                            format: "coreml_mlprogram".into(),
+                            reason: "gelu operation has no output operand".into(),
+                        })?;
+                let (output_name, output_type) =
+                    Self::create_output_value(graph_info, output_id, &operand_name_overrides)?;
+                let mut reserved_names: std::collections::HashSet<String> = graph_info
+                    .operands
+                    .iter()
+                    .enumerate()
+                    .map(|(id, _)| operand_name(graph_info, id as u32))
+                    .chain(operand_name_overrides.values().cloned())
+                    .chain(main_block.operations.iter().flat_map(|operation| {
+                        operation.outputs.iter().map(|output| output.name.clone())
+                    }))
+                    .collect();
+                let mut fresh_name = |base: String| {
+                    let mut candidate = base.clone();
+                    let mut suffix = 0usize;
+                    while !reserved_names.insert(candidate.clone()) {
+                        suffix += 1;
+                        candidate = format!("{base}_{suffix}");
+                    }
+                    candidate
+                };
+                let wide_input_name =
+                    fresh_name(format!("{output_name}_gelu_input_fp32_{output_id}"));
+                let wide_result_name =
+                    fresh_name(format!("{output_name}_gelu_result_fp32_{output_id}"));
+                let wide_input_type = Self::create_value_with_mil_type(
+                    graph_info,
+                    *input,
+                    wide_input_name.clone(),
+                    crate::protos::coreml::mil_spec::DataType::Float32 as i32,
+                )?;
+                main_block.operations.push(Self::create_cast_operation(
+                    Self::output_name_for_operand(graph_info, *input, &operand_name_overrides),
+                    wide_input_type,
+                    "fp32",
+                ));
+                let mut inputs = HashMap::new();
+                inputs.insert("x".into(), Self::create_name_argument(wide_input_name));
+                inputs.insert("mode".into(), Self::create_immediate_string("EXACT"));
+                let wide_result_type = Self::create_value_with_mil_type(
+                    graph_info,
+                    output_id,
+                    wide_result_name.clone(),
+                    crate::protos::coreml::mil_spec::DataType::Float32 as i32,
+                )?;
+                main_block.operations.push(Self::create_mil_operation(
+                    mil_ops::GELU,
+                    inputs,
+                    vec![wide_result_type],
+                ));
+                main_block.operations.push(Self::create_cast_operation(
+                    wide_result_name,
+                    output_type,
+                    "fp16",
+                ));
+                if let Some((pending_ops, transposed_name)) = deferred_transposes.remove(&output_id)
+                {
+                    main_block.operations.extend(pending_ops);
+                    operand_name_overrides.insert(output_id, transposed_name);
+                }
+                continue;
+            }
+
             if matches!(
                 op,
                 Operation::AveragePool2d { .. }
