@@ -691,8 +691,10 @@ impl CoremlMlProgramConverter {
                 // int64 has no MIL tensor type; emit as int32 values (narrowing).
                 let values: Vec<i32> = constant_data
                     .data
-                    .chunks_exact(8)
-                    .map(|chunk| i64::from_le_bytes(chunk.try_into().unwrap()) as i32)
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|&chunk| i64::from_le_bytes(chunk) as i32)
                     .collect();
                 TensorValue {
                     value: Some(tensor_value::Value::Ints(tensor_value::RepeatedInts {
@@ -704,8 +706,10 @@ impl CoremlMlProgramConverter {
                 // uint32 has no MIL tensor type; emit as int32 (bit-preserving).
                 let values: Vec<i32> = constant_data
                     .data
-                    .chunks_exact(4)
-                    .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()) as i32)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|&chunk| u32::from_le_bytes(chunk) as i32)
                     .collect();
                 TensorValue {
                     value: Some(tensor_value::Value::Ints(tensor_value::RepeatedInts {
@@ -717,8 +721,10 @@ impl CoremlMlProgramConverter {
                 // uint64 has no MIL tensor type; emit as int32 (narrowing).
                 let values: Vec<i32> = constant_data
                     .data
-                    .chunks_exact(8)
-                    .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()) as i32)
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|&chunk| u64::from_le_bytes(chunk) as i32)
                     .collect();
                 TensorValue {
                     value: Some(tensor_value::Value::Ints(tensor_value::RepeatedInts {
@@ -2441,8 +2447,10 @@ impl CoremlMlProgramConverter {
                     value: Some(tensor_value::Value::Floats(tensor_value::RepeatedFloats {
                         values: constant
                             .data
-                            .chunks_exact(4)
-                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|&chunk| f32::from_le_bytes(chunk))
                             .collect(),
                     })),
                 },
