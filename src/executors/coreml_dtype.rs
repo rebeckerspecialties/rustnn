@@ -1,7 +1,7 @@
 //! Checked numeric conversions at the MLMultiArray boundary.
 
 use crate::error::GraphError;
-use crate::graph::DataType;
+use crate::graph::{DataType, pack_int4, pack_uint4_from_i32};
 
 pub(super) fn boundary_error(reason: impl Into<String>) -> GraphError {
     GraphError::CoremlRuntimeFailed {
@@ -135,6 +135,7 @@ fn convert(
         return Ok(bytes.to_vec());
     }
     let mut output = Vec::with_capacity(byte_length(target, count)?);
+    let mut packed_values = Vec::new();
     for index in 0..count {
         macro_rules! write_value {
             ($value:expr) => {{
@@ -162,16 +163,10 @@ fn convert(
                     StorageType::Webnn(DataType::Int8) => output.push((value as i8) as u8),
                     StorageType::Webnn(DataType::Uint8) => output.push(value as u8),
                     StorageType::Webnn(DataType::Int4 | DataType::Uint4) => {
-                        let nibble = if target == StorageType::Webnn(DataType::Int4) {
-                            (value as i32).clamp(-8, 7) as u8 & 0xf
-                        } else {
-                            (value as u8).min(15)
-                        };
-                        if index % 2 == 0 {
-                            output.push(nibble);
-                        } else {
-                            output[index / 2] |= nibble << 4;
-                        }
+                        // Float-to-integer conversion saturates before the shared
+                        // packers clamp to four bits. Narrowing integers directly
+                        // would wrap (e.g. 256 -> 0) before that clamp.
+                        packed_values.push(value as f64 as i32);
                     }
                 }
             }};
@@ -208,7 +203,11 @@ fn convert(
             }
         }
     }
-    Ok(output)
+    Ok(match target {
+        StorageType::Webnn(DataType::Int4) => pack_int4(&packed_values),
+        StorageType::Webnn(DataType::Uint4) => pack_uint4_from_i32(&packed_values),
+        _ => output,
+    })
 }
 
 /// Validated positive element strides. The native array owns the storage; this
@@ -451,6 +450,65 @@ mod tests {
                 bytes
             );
         }
+    }
+
+    #[test]
+    fn coreml_dtypes_packed_outputs_saturate_before_narrowing() {
+        let values = [i64::MIN, -256, -9, -1, 7, 16, i64::MAX];
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        for (dtype, expected) in [
+            (DataType::Int4, vec![0x88, 0xf8, 0x77, 0x07]),
+            (DataType::Uint4, vec![0x00, 0x00, 0xf7, 0x0f]),
+        ] {
+            assert_eq!(
+                convert(
+                    &bytes,
+                    StorageType::Webnn(DataType::Int64),
+                    StorageType::Webnn(dtype),
+                    values.len()
+                )
+                .unwrap(),
+                expected
+            );
+        }
+        let values = [0u64, 15, 16, 255, 256, u64::MAX];
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        assert_eq!(
+            convert(
+                &bytes,
+                StorageType::Webnn(DataType::Uint64),
+                StorageType::Webnn(DataType::Uint4),
+                values.len()
+            )
+            .unwrap(),
+            [0xf0, 0xff, 0xff]
+        );
+        let values = [
+            f64::NEG_INFINITY,
+            -8.9,
+            -0.9,
+            f64::NAN,
+            7.9,
+            256.0,
+            f64::INFINITY,
+        ];
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        assert_eq!(
+            from_native(&bytes, NativeType::Double, DataType::Int4, values.len()).unwrap(),
+            [0x88, 0x00, 0x77, 0x07]
+        );
+        assert_eq!(
+            from_native(&bytes, NativeType::Double, DataType::Uint4, values.len()).unwrap(),
+            [0x00, 0x00, 0xf7, 0x0f]
+        );
+        let bytes: Vec<u8> = [-256i32, 256, i32::MAX]
+            .iter()
+            .flat_map(|v| v.to_ne_bytes())
+            .collect();
+        assert_eq!(
+            from_native(&bytes, NativeType::Int32, DataType::Uint4, 3).unwrap(),
+            [0xf0, 0x0f]
+        );
     }
 
     #[test]

@@ -175,6 +175,49 @@ fn coreml_dtypes_existing_wpt_cast_vector_exercises_both_apis() {
 }
 
 #[test]
+fn coreml_dtypes_dispatch_widens_int32_proxies_exactly_once() {
+    for (dtype, tensor_dtype) in [
+        (DataType::Int64, MLOperandDataType::Int64),
+        (DataType::Uint64, MLOperandDataType::Uint64),
+    ] {
+        let mut context = MLContext::create(
+            &MLContextOptions::new(MLPowerPreference::Default, false)
+                .with_rustnn_backend_hint(Backend::Coreml),
+        )
+        .unwrap();
+        let mut graph = context
+            .rustnn_build_graph(cast_graph(DataType::Int32, dtype, &[3]))
+            .unwrap();
+        assert_eq!(graph.output_descriptors["result"].data_type, dtype);
+        let input = context
+            .create_tensor(
+                &MLTensorDescriptor::new(MLOperandDataType::Int32, vec![3]).to_writable(),
+            )
+            .unwrap();
+        let output = context
+            .create_tensor(&MLTensorDescriptor::new(tensor_dtype, vec![3]).to_readable())
+            .unwrap();
+        context.write_tensor(&input, &[-1i32, 0, 123]).unwrap();
+        context
+            .dispatch(
+                &mut graph,
+                &MLNamedTensors::from([("input", &input)]),
+                &MLNamedTensors::from([("result", &output)]),
+            )
+            .unwrap();
+        if dtype == DataType::Int64 {
+            let mut actual = [0i64; 3];
+            context.read_tensor(&output, &mut actual).unwrap();
+            assert_eq!(actual, [-1, 0, 123]);
+        } else {
+            let mut actual = [0u64; 3];
+            context.read_tensor(&output, &mut actual).unwrap();
+            assert_eq!(actual, [u32::MAX as u64, 0, 123]);
+        }
+    }
+}
+
+#[test]
 fn coreml_dtypes_zeroed_inputs_use_native_allocation_width() {
     for dtype in [
         DataType::Float16,

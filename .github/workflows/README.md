@@ -18,7 +18,8 @@
 - `protoc` is installed in every job; `flatc` in jobs that build the `litert-runtime` feature.
 - TensorRT-RTX has no GPU runner. CI compiles the backend (`cargo check -F trtx-runtime
   --all-targets`); its WPT snapshots are regenerated locally with `make wpt-sync-trtx`.
-- macOS CI builds and tests CoreML with and without dynamic inputs using `make build-coreml`
+- macOS CI explicitly runs `make test-coreml-dtypes` with and without dynamic inputs.
+  It also builds and tests CoreML with and without dynamic inputs using `make build-coreml`
   and `make test-coreml`. `make test-coreml-gather` also runs the focused gather bounds and
   scalar-index shape regressions; numerical checks remain strict.
 - The documentation site combines three generated parts: MkDocs pages from `docs/`, rustdoc from
