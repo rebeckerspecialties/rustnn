@@ -198,6 +198,10 @@ test-wpt-coreml:
 test-coreml-gather:
 	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_dynamic_gather --test test_coreml_gather_bounds -- $(TEST_FILTER) --test-threads=1
 
+.PHONY: test-coreml-dtypes
+test-coreml-dtypes:
+	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_dtypes -- $(TEST_FILTER) --test-threads=1
+
 # Build every target, including examples and the separately run WPT harness.
 build-coreml:
 	$(CARGO) build --all-targets --no-default-features --features $(COREML_FEATURES)

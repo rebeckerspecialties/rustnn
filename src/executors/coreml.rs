@@ -635,7 +635,7 @@ pub(crate) fn run_coreml_bytes(
             // Prefer the model's own data type code; fall back to our mapping only when
             // the model exposes no constraint for this input.
             let code = model_input_dtype_code(input_descs, key)
-                .map_or_else(|| map_dtype(input.descriptor.data_type), Ok)?;
+                .unwrap_or_else(|| map_dtype(input.descriptor.data_type));
             let array = create_multi_array(&shape_i64, code)?;
             fill_multiarray_from_bytes(array, input.data, input.descriptor.data_type, code)?;
             let feature_value: *mut Object =
@@ -872,14 +872,14 @@ fn run_impl_zeroed_with_weights(
                 let (shape, data_type_code) = if desc_obj.is_null() {
                     (
                         coerce_shape(&descriptor.shape),
-                        map_dtype(descriptor.data_type)?,
+                        map_dtype(descriptor.data_type),
                     )
                 } else {
                     let constraint_obj: *mut Object = msg_send![desc_obj, multiArrayConstraint];
                     if constraint_obj.is_null() {
                         (
                             coerce_shape(&descriptor.shape),
-                            map_dtype(descriptor.data_type)?,
+                            map_dtype(descriptor.data_type),
                         )
                     } else {
                         let shape_obj: *mut Object = msg_send![constraint_obj, shape];
@@ -1275,7 +1275,7 @@ unsafe fn collect_outputs(
         let shape = unsafe { nsarray_to_i64_vec(shape_nsarray)? };
 
         // Extract actual data from MLMultiArray
-        let data = unsafe { extract_mlmultiarray_data(array, data_type, &shape)? };
+        let data = unsafe { extract_mlmultiarray_data(array)? };
 
         Ok(CoremlOutput {
             name: name.to_string(),
@@ -1286,11 +1286,7 @@ unsafe fn collect_outputs(
     })
 }
 
-unsafe fn extract_mlmultiarray_data(
-    array: *mut Object,
-    _data_type: i64,
-    _shape: &[i64],
-) -> Result<Vec<f32>, GraphError> {
+unsafe fn extract_mlmultiarray_data(array: *mut Object) -> Result<Vec<f32>, GraphError> {
     let (kind, layout, data) = unsafe { multiarray_storage(array)? };
     let bytes = unsafe { read_array_storage(data, &layout, kind.element_size()) };
     let floats = from_native(&bytes, kind, DataType::Float32, layout.count)?;
@@ -1497,15 +1493,15 @@ fn coerce_shape(shape: &[Dimension]) -> Vec<i64> {
     }
 }
 
-fn map_dtype(data_type: DataType) -> Result<i32, GraphError> {
+fn map_dtype(data_type: DataType) -> i32 {
     // Match the converter's feature-boundary promotion on every supported OS.
     // In particular, do not allocate OS 26-only Int8 arrays on older devices.
-    Ok(match data_type {
+    match data_type {
         DataType::Float16 => NativeType::Float16,
         DataType::Int32 => NativeType::Int32,
         _ => NativeType::Float32,
     }
-    .code())
+    .code()
 }
 
 /// Query the model's declared `MLMultiArrayDataType` code for the input named `key`.
@@ -1708,10 +1704,7 @@ mod dtype_storage_tests {
                 let array = strided_array(&mut backing, kind);
                 let _guard = ReleaseOnDrop(array);
                 fill_data_with_type_conversion(array, &values, &[2, 3], kind.code()).unwrap();
-                assert_eq!(
-                    extract_mlmultiarray_data(array, kind.code() as i64, &[2, 3]).unwrap(),
-                    values
-                );
+                assert_eq!(extract_mlmultiarray_data(array).unwrap(), values);
                 let descriptor = OperandDescriptor {
                     data_type: DataType::Float32,
                     shape: crate::graph::to_dimension_vector(&[2, 3]),
@@ -1720,10 +1713,7 @@ mod dtype_storage_tests {
                 let bytes = extract_multiarray_bytes(array, &descriptor).unwrap();
                 assert_eq!(bytes, bytemuck::cast_slice::<f32, u8>(&values));
                 fill_zero(array).unwrap();
-                assert_eq!(
-                    extract_mlmultiarray_data(array, kind.code() as i64, &[2, 3]).unwrap(),
-                    [0.; 6]
-                );
+                assert_eq!(extract_mlmultiarray_data(array).unwrap(), [0.; 6]);
                 for (index, &byte) in backing.iter().enumerate() {
                     let active = [0, 2, 4, 8, 10, 12].contains(&(index / width));
                     assert_eq!(
@@ -1785,16 +1775,10 @@ mod dtype_storage_tests {
             DataType::Int64,
             DataType::Uint64,
         ] {
-            assert_eq!(map_dtype(dtype).unwrap(), NativeType::Float32.code());
+            assert_eq!(map_dtype(dtype), NativeType::Float32.code());
         }
-        assert_eq!(
-            map_dtype(DataType::Float16).unwrap(),
-            NativeType::Float16.code()
-        );
-        assert_eq!(
-            map_dtype(DataType::Int32).unwrap(),
-            NativeType::Int32.code()
-        );
+        assert_eq!(map_dtype(DataType::Float16), NativeType::Float16.code());
+        assert_eq!(map_dtype(DataType::Int32), NativeType::Int32.code());
     }
 }
 
