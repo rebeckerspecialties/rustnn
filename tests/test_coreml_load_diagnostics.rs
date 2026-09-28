@@ -2,8 +2,8 @@
 #![cfg(all(target_os = "macos", feature = "coreml-runtime"))]
 
 use rustnn::mlcontext::{
-    Backend, MLContext, MLContextOptions, MLGraphBuilder, MLNamedOperands, MLNamedTensors,
-    MLOperandDescriptor, MLPowerPreference, MLTensorDescriptor,
+    Backend, LoadDiagnostics, MLContext, MLContextOptions, MLGraphBuilder, MLNamedOperands,
+    MLNamedTensors, MLOperandDescriptor, MLPowerPreference, MLTensorDescriptor,
 };
 use rustnn::operator_enums::MLOperandDataType;
 
@@ -25,7 +25,9 @@ fn cpu_graph_retains_load_diagnostics_and_predicts_exact_values() {
     let mut graph = builder
         .build(&MLNamedOperands::from([("output", output)]))
         .unwrap();
-    let diagnostic = graph.rustnn_coreml_load_diagnostics().unwrap().clone();
+    let Some(LoadDiagnostics::Coreml(diagnostic)) = graph.rustnn_load_diagnostics() else {
+        panic!("CoreML graph did not report CoreML load diagnostics");
+    };
     assert_eq!(diagnostic.requested_compute_units, "CPU_ONLY");
     assert_eq!(diagnostic.loaded_compute_units, "CPU_ONLY");
     assert!(diagnostic.failures.iter().all(|failure| {
@@ -47,5 +49,8 @@ fn cpu_graph_retains_load_diagnostics_and_predicts_exact_values() {
     let mut actual = [0f32; 2];
     context.read_tensor(&output, &mut actual).unwrap();
     assert_eq!(actual, [2., -4.]);
-    assert_eq!(graph.rustnn_coreml_load_diagnostics(), Some(&diagnostic));
+    assert_eq!(
+        graph.rustnn_load_diagnostics(),
+        Some(LoadDiagnostics::Coreml(diagnostic))
+    );
 }

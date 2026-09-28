@@ -27,8 +27,8 @@ dispatch. The Objective-C bridge lives in `src/executors/coreml.rs` and `src/exe
 CoreML decides at run time which units execute which layers; the hint is a ceiling, not a
 guarantee. The WPT harness pins `accelerated = false` (CPU) so that results are deterministic.
 
-For the unified `MLContext` path, inspect `graph.rustnn_coreml_load_diagnostics()` after
-building. It retains the requested policy, successful policy/route, and earlier errors even
+For the unified `MLContext` path, inspect `graph.rustnn_load_diagnostics()` after
+building and match `LoadDiagnostics::Coreml`. It retains the requested policy, successful policy/route, and earlier errors even
 when CPU-only or URL fallback succeeds. Route preparation errors have no compute-unit policy;
 a deliberately selected URL route is not reported as a failed in-memory attempt. The same
 summary is logged once at debug level under `rustnn::executors::coreml::load`, not per dispatch.

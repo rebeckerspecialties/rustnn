@@ -20,8 +20,9 @@ locally into `target/doc/rustnn/`).
   `operand.into()`.
 - Methods that are not part of the WebNN specification carry the `rustnn_` prefix.
 
-With `coreml-runtime`, `MLGraph::rustnn_coreml_load_diagnostics()` exposes the requested and
-loaded policies, loading route and earlier failures. It returns `None` for other backends.
+`MLGraph::rustnn_load_diagnostics()` returns a backend-specific `LoadDiagnostics` snapshot,
+or `None` when the backend does not provide diagnostics. With `coreml-runtime`, the
+`Coreml` variant exposes requested and loaded policies, loading route and earlier failures.
 These are load diagnostics, not accelerator-placement measurements; see the
 [CoreML backend](../integration/coreml.md#selection-and-devices).
 - The API is synchronous. `dispatch`, `read_tensor` and `write_tensor` return when the work is
