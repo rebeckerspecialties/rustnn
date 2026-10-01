@@ -2296,6 +2296,24 @@ impl CoremlMlProgramConverter {
             // native quantize/dequantize at all, so decompose them even when scalar.
             return matches!(quant_dt, DataType::Int4 | DataType::Uint4);
         }
+        // A constant per-channel scale covering a dynamic axis's maximum
+        // does not prove that it covers the next prediction's active extent.
+        // Let the decomposition validate that relationship instead of picking
+        // a native axis from static_or_max_shape().
+        if tensor_op.descriptor.has_dynamic_dimensions()
+            && (tensor_op.descriptor.shape.len() != scale_op.descriptor.shape.len()
+                || tensor_op
+                    .descriptor
+                    .shape
+                    .iter()
+                    .zip(&scale_op.descriptor.shape)
+                    .any(|(input, scale)| {
+                        matches!(input, GraphDimension::Dynamic(_))
+                            && !matches!(scale, GraphDimension::Static(1))
+                    }))
+        {
+            return true;
+        }
         let tensor_shape = tensor_op.descriptor.static_or_max_shape();
         let scale_shape = scale_op.descriptor.static_or_max_shape();
         !Self::qdq_native_supported(&quant_dt, &tensor_shape, &scale_shape)
@@ -3490,6 +3508,330 @@ impl CoremlMlProgramConverter {
         Ok(())
     }
 
+    /// Ordinary parameter broadcasting does not require a data reshape. Preserve
+    /// the logical descriptor here, including active dimensions, instead of
+    /// substituting a bounded dimension's maximum for the runtime extent.
+    fn emit_broadcast_qdq(
+        graph: &GraphInfo,
+        op: &Operation,
+        overrides: &HashMap<u32, String>,
+        block: &mut Block,
+    ) -> Result<bool, GraphError> {
+        let (input_id, scale_id, zero_point_id, quantize) = match op {
+            Operation::QuantizeLinear {
+                input,
+                scale,
+                zero_point,
+                ..
+            } => (*input, *scale, *zero_point, true),
+            Operation::DequantizeLinear {
+                input,
+                scale,
+                zero_point,
+                ..
+            } => (*input, *scale, *zero_point, false),
+            _ => return Ok(false),
+        };
+        let output_id = op
+            .output_operand()
+            .ok_or_else(|| GraphError::ConversionFailed {
+                format: "coreml_mlprogram".into(),
+                reason: "quantize/dequantize output is missing".into(),
+            })?;
+        let input = graph
+            .operand(input_id)
+            .ok_or_else(|| GraphError::ConversionFailed {
+                format: "coreml_mlprogram".into(),
+                reason: "quantize/dequantize input is missing".into(),
+            })?;
+        let scale = graph
+            .operand(scale_id)
+            .ok_or_else(|| GraphError::ConversionFailed {
+                format: "coreml_mlprogram".into(),
+                reason: "quantize/dequantize scale is missing".into(),
+            })?;
+        let dynamic_block_error = || {
+            GraphError::ConversionFailed {
+            format: "coreml_mlprogram".into(),
+            reason: "quantize/dequantize: dynamic blockwise shapes require a proven runtime block ratio; maximum extents cannot be used as reshape sizes".into(),
+        }
+        };
+        if input.descriptor.shape.len() != scale.descriptor.shape.len() {
+            if input.descriptor.has_dynamic_dimensions()
+                || scale.descriptor.has_dynamic_dimensions()
+            {
+                return Err(dynamic_block_error());
+            }
+            return Ok(false);
+        }
+        let mut blocks = vec![];
+        for (axis, (input, scale)) in input
+            .descriptor
+            .shape
+            .iter()
+            .zip(&scale.descriptor.shape)
+            .enumerate()
+        {
+            if matches!(scale, GraphDimension::Static(1)) || input == scale {
+                continue;
+            }
+            match (input, scale) {
+                (GraphDimension::Static(input), GraphDimension::Static(scale))
+                    if *scale > 0 && input.is_multiple_of(*scale) =>
+                {
+                    blocks.push((axis, input / scale));
+                }
+                (GraphDimension::Dynamic(_), _) | (_, GraphDimension::Dynamic(_)) => {
+                    return Err(dynamic_block_error());
+                }
+                _ => {
+                    return Err(GraphError::ConversionFailed {
+                        format: "coreml_mlprogram".into(),
+                        reason:
+                            "quantize/dequantize: parameter dimensions must divide input dimensions"
+                                .into(),
+                    });
+                }
+            }
+        }
+        if !blocks.is_empty() && scale.descriptor.has_dynamic_dimensions() {
+            return Err(dynamic_block_error());
+        }
+
+        let output = graph
+            .operand(output_id)
+            .ok_or_else(|| GraphError::ConversionFailed {
+                format: "coreml_mlprogram".into(),
+                reason: "quantize/dequantize output is missing".into(),
+            })?;
+        let dtype = if quantize {
+            crate::protos::coreml::mil_spec::DataType::Float32 as i32
+        } else {
+            Self::mil_data_type(&output.descriptor.data_type)?
+        };
+        let cast_type = Self::cast_dtype_string_for_mil_type(dtype)?;
+        let (output_name, output_type) = Self::create_output_value(graph, output_id, overrides)?;
+        let suffix = if quantize { "q" } else { "dq" };
+        let mut used: std::collections::HashSet<String> = graph
+            .operands
+            .iter()
+            .filter_map(|operand| operand.name.clone())
+            .chain(overrides.values().cloned())
+            .chain(
+                block
+                    .operations
+                    .iter()
+                    .flat_map(|operation| &operation.outputs)
+                    .map(|value| value.name.clone()),
+            )
+            .collect();
+        let mut fresh = |role: &str| {
+            let base = format!("{output_name}_{suffix}_{role}");
+            let mut name = base.clone();
+            let mut index = 0;
+            while !used.insert(name.clone()) {
+                index += 1;
+                name = format!("{base}_{index}");
+            }
+            name
+        };
+        let input_float = fresh("in_f");
+        block.operations.push(Self::create_cast_operation(
+            Self::output_name_for_operand(graph, input_id, overrides),
+            Self::create_value_with_mil_type(graph, input_id, input_float.clone(), dtype)?,
+            cast_type,
+        ));
+        let scale_name = Self::output_name_for_operand(graph, scale_id, overrides);
+        let scale_float = if quantize {
+            let name = fresh("scale_f");
+            block.operations.push(Self::create_cast_operation(
+                scale_name,
+                Self::create_value_with_mil_type(graph, scale_id, name.clone(), dtype)?,
+                cast_type,
+            ));
+            name
+        } else {
+            scale_name
+        };
+        let zero_point_float = if let Some(id) = zero_point_id {
+            let name = fresh("zp_f");
+            block.operations.push(Self::create_cast_operation(
+                Self::output_name_for_operand(graph, id, overrides),
+                Self::create_value_with_mil_type(graph, id, name.clone(), dtype)?,
+                cast_type,
+            ));
+            Some(name)
+        } else {
+            None
+        };
+        // Expand only the small parameters along statically proven block axes,
+        // as in Chromium's CoreML lowering. Dynamic activation extents are never
+        // reshaped, including a dynamic batch with fixed channel block sizes.
+        let expand = |block: &mut Block,
+                      mut name: String,
+                      role: &str,
+                      fresh: &mut dyn FnMut(&str) -> String|
+         -> Result<String, GraphError> {
+            if blocks.is_empty() {
+                return Ok(name);
+            }
+            let mut dimensions = scale
+                .descriptor
+                .static_shape()
+                .ok_or_else(dynamic_block_error)?;
+            for &(axis, repetitions) in &blocks {
+                if dimensions.len() >= 5 {
+                    return Err(GraphError::ConversionFailed {
+                        format: "coreml_mlprogram".into(),
+                        reason:
+                            "quantize/dequantize: block parameter expansion exceeds CoreML rank 5"
+                                .into(),
+                    });
+                }
+                let mut expanded = dimensions.clone();
+                expanded.insert(axis + 1, 1);
+                let reshape_name = fresh(&format!("{role}_block_{axis}_shape"));
+                block.operations.push(Self::create_mil_operation(
+                    mil_ops::RESHAPE,
+                    HashMap::from([
+                        ("x".into(), Self::create_name_argument(name)),
+                        ("shape".into(), Self::create_immediate_int_array(&expanded)),
+                    ]),
+                    vec![Self::value_type_for_static_shape(
+                        reshape_name.clone(),
+                        dtype,
+                        &expanded,
+                    )],
+                ));
+                let mut repeat_shape = vec![1; expanded.len()];
+                repeat_shape[axis + 1] = repetitions;
+                expanded[axis + 1] = repetitions;
+                let tile_name = fresh(&format!("{role}_block_{axis}_tile"));
+                block.operations.push(Self::create_mil_operation(
+                    mil_ops::TILE,
+                    HashMap::from([
+                        ("x".into(), Self::create_name_argument(reshape_name)),
+                        (
+                            "reps".into(),
+                            Self::create_immediate_int_array(&repeat_shape),
+                        ),
+                    ]),
+                    vec![Self::value_type_for_static_shape(
+                        tile_name.clone(),
+                        dtype,
+                        &expanded,
+                    )],
+                ));
+                dimensions[axis] *= repetitions;
+                name = fresh(&format!("{role}_block_{axis}_result"));
+                block.operations.push(Self::create_mil_operation(
+                    mil_ops::RESHAPE,
+                    HashMap::from([
+                        ("x".into(), Self::create_name_argument(tile_name)),
+                        (
+                            "shape".into(),
+                            Self::create_immediate_int_array(&dimensions),
+                        ),
+                    ]),
+                    vec![Self::value_type_for_static_shape(
+                        name.clone(),
+                        dtype,
+                        &dimensions,
+                    )],
+                ));
+            }
+            Ok(name)
+        };
+        let scale_float = expand(block, scale_float, "scale", &mut fresh)?;
+        let zero_point_float = zero_point_float
+            .map(|name| expand(block, name, "zp", &mut fresh))
+            .transpose()?;
+        let binary = |block: &mut Block,
+                      kind: &str,
+                      x: String,
+                      y: String,
+                      name: String|
+         -> Result<String, GraphError> {
+            let inputs = HashMap::from([
+                ("x".into(), Self::create_name_argument(x)),
+                ("y".into(), Self::create_name_argument(y)),
+            ]);
+            block.operations.push(Self::create_mil_operation(
+                kind,
+                inputs,
+                vec![Self::create_value_with_mil_type(
+                    graph,
+                    input_id,
+                    name.clone(),
+                    dtype,
+                )?],
+            ));
+            Ok(name)
+        };
+        if !quantize {
+            let centered = if let Some(zero_point) = zero_point_float {
+                binary(block, mil_ops::SUB, input_float, zero_point, fresh("sub"))?
+            } else {
+                input_float
+            };
+            block.operations.push(Self::create_mil_operation(
+                mil_ops::MUL,
+                HashMap::from([
+                    ("x".into(), Self::create_name_argument(centered)),
+                    ("y".into(), Self::create_name_argument(scale_float)),
+                ]),
+                vec![output_type],
+            ));
+            return Ok(true);
+        }
+        let divided = binary(block, mil_ops::DIV, input_float, scale_float, fresh("div"))?;
+        let rounded = fresh("round");
+        Self::emit_round_even(
+            graph,
+            block,
+            divided,
+            Self::create_value_with_mil_type(graph, input_id, rounded.clone(), dtype)?,
+        );
+        let biased = if let Some(zero_point) = zero_point_float {
+            binary(block, mil_ops::ADD, rounded, zero_point, fresh("add"))?
+        } else {
+            rounded
+        };
+        let limits = match output.descriptor.data_type {
+            DataType::Int8 => Some((-128.0, 127.0)),
+            DataType::Uint8 => Some((0.0, 255.0)),
+            DataType::Int4 => Some((-8.0, 7.0)),
+            DataType::Uint4 => Some((0.0, 15.0)),
+            _ => None,
+        };
+        let clamped = if let Some((minimum, maximum)) = limits {
+            let name = fresh("clip");
+            block.operations.push(Self::create_mil_operation(
+                mil_ops::CLIP,
+                HashMap::from([
+                    ("x".into(), Self::create_name_argument(biased)),
+                    ("alpha".into(), Self::create_immediate_float(minimum)),
+                    ("beta".into(), Self::create_immediate_float(maximum)),
+                ]),
+                vec![Self::create_value_with_mil_type(
+                    graph,
+                    input_id,
+                    name.clone(),
+                    dtype,
+                )?],
+            ));
+            name
+        } else {
+            biased
+        };
+        block.operations.push(Self::create_cast_operation(
+            clamped,
+            output_type,
+            Self::int_back_cast_dtype(&output.descriptor.data_type)?,
+        ));
+        Ok(true)
+    }
+
     /// Lower `dequantizeLinear` as `(input - zeroPoint) * scale` in elementwise form.
     ///
     /// Handles quantized types and scale shapes CoreML's native `dequantize` cannot:
@@ -3503,6 +3845,9 @@ impl CoremlMlProgramConverter {
         overrides: &HashMap<u32, String>,
         main_block: &mut Block,
     ) -> Result<(), GraphError> {
+        if Self::emit_broadcast_qdq(graph, op, overrides, main_block)? {
+            return Ok(());
+        }
         let (input_id, scale_id, zp_id) = match op {
             Operation::DequantizeLinear {
                 input,
@@ -3675,6 +4020,9 @@ impl CoremlMlProgramConverter {
         overrides: &HashMap<u32, String>,
         main_block: &mut Block,
     ) -> Result<(), GraphError> {
+        if Self::emit_broadcast_qdq(graph, op, overrides, main_block)? {
+            return Ok(());
+        }
         let (input_id, scale_id, zp_id) = match op {
             Operation::QuantizeLinear {
                 input,
