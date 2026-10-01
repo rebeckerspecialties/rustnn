@@ -37,7 +37,7 @@ use crate::operator_options::{
 use crate::shape_inference::{
     InputLayout, ReduceOptions, SplitSpec, infer_concat_shape_dimensions,
     infer_conv_transpose2d_shape, infer_conv2d_shape, infer_expand_shape_dimensions,
-    infer_gather_shape_dimensions, infer_gemm_shape_dimensions, infer_global_pool_shape,
+    infer_gather_shape_dimensions, infer_gemm_shape_dimensions, infer_global_pool_shape_dimensions,
     infer_matmul_shape_dimensions, infer_pad_shape, infer_pool2d_shape_dimensions,
     infer_prelu_shape, infer_reduce_shape_dimensions, infer_resample2d_shape,
     infer_scatter_elements_shape, infer_scatter_nd_shape, infer_slice_shape, infer_split_shapes,
@@ -702,8 +702,7 @@ fn global_pool_shape(
     let shape = infer_shape_err(
         "globalPool",
         operation,
-        infer_global_pool_shape(&shape_dims_u32(&operand.descriptor.shape), layout_enum)
-            .map(|v| to_dimension_vector(&v)),
+        infer_global_pool_shape_dimensions(&operand.descriptor.shape, layout_enum),
     )?;
     Ok(OperandDescriptor {
         data_type: operand.descriptor.data_type,
@@ -3334,6 +3333,95 @@ mod test {
         },
         operators::Operation,
     };
+
+    #[test]
+    fn global_pool_aliases_preserve_dynamic_batch_and_channel_dimensions() {
+        use crate::graph::{
+            DataType, Dimension, DynamicDimension, GraphInfo, Operand, OperandDescriptor,
+            OperandKind,
+        };
+        use crate::operator_options::MLPool2dOptions;
+
+        let dynamic = |name: &str, max_size| {
+            Dimension::Dynamic(DynamicDimension {
+                name: name.into(),
+                max_size,
+            })
+        };
+        let batch = dynamic("batch", 3);
+        let channels = dynamic("channels", 5);
+        for layout in ["nchw", "nhwc"] {
+            let shape = if layout == "nhwc" {
+                vec![
+                    batch.clone(),
+                    dynamic("height", 7),
+                    dynamic("width", 11),
+                    channels.clone(),
+                ]
+            } else {
+                vec![
+                    batch.clone(),
+                    channels.clone(),
+                    dynamic("height", 7),
+                    dynamic("width", 11),
+                ]
+            };
+            let expected = if layout == "nhwc" {
+                vec![
+                    batch.clone(),
+                    Dimension::Static(1),
+                    Dimension::Static(1),
+                    channels.clone(),
+                ]
+            } else {
+                vec![
+                    batch.clone(),
+                    channels.clone(),
+                    Dimension::Static(1),
+                    Dimension::Static(1),
+                ]
+            };
+            let graph = GraphInfo {
+                operands: vec![Operand {
+                    kind: OperandKind::Input,
+                    name: Some("input".into()),
+                    descriptor: OperandDescriptor {
+                        data_type: DataType::Float32,
+                        shape,
+                        pending_permutation: vec![],
+                    },
+                }],
+                ..Default::default()
+            };
+            for maximum in [false, true] {
+                let options = Some(MLPool2dOptions {
+                    layout: layout.into(),
+                    ..Default::default()
+                });
+                let operation = if maximum {
+                    Operation::GlobalMaxPool {
+                        input: 0,
+                        outputs: vec![1],
+                        options: options.clone(),
+                    }
+                } else {
+                    Operation::GlobalAveragePool {
+                        input: 0,
+                        outputs: vec![1],
+                        options: options.clone(),
+                    }
+                };
+                let actual = super::global_pool_shape(
+                    super::MLOperand { id: 0 },
+                    &operation,
+                    options.as_ref(),
+                    &graph,
+                )
+                .unwrap();
+                assert_eq!(actual.shape, expected, "layout={layout}, maximum={maximum}");
+            }
+        }
+    }
 
     #[test]
     fn conv2d_bias_through_options_uses_operand_index() {

@@ -104,7 +104,9 @@ follow the spec order; `a`, `b` stand for the two inputs of binary operations.
 | Recurrent | `gru_with_options`, `gru_cell_with_options`, `lstm_with_options`, `lstm_cell_with_options` (only the options forms exist). `gru_with_options` returns the hidden state plus the sequence when `return_sequence` is set; `lstm_with_options` returns hidden state, cell state and optionally the sequence; `lstm_cell_with_options` returns hidden and cell state, all as `Vec<MLOperand>` |
 
 `globalAveragePool`, `globalMaxPool`, `squeeze` and `unsqueeze` are kept from earlier
-specification drafts; `shape` is a rustnn extension emitted by onnx2webnn. The per-backend
+specification drafts. The global-pooling aliases reduce the spatial axes of the
+selected NCHW or NHWC layout and preserve batch/channel dimensions, including
+their dynamic bounds. `shape` is a rustnn extension emitted by onnx2webnn. The per-backend
 support matrix is generated into
 [Backend Operator Support](../development/backend-operator-support.md).
 
