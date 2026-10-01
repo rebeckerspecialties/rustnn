@@ -165,11 +165,19 @@ The selection order and the per-backend requirements are described in [Backends]
 
 `examples/coreml_kv_benchmark.rs` compares the byte-buffer reference path (`baseline`),
 persistent native arrays (`persistent`), and optional output backings (`backings`). It uses
-real `MLContext` dispatch and distinct ping-pong cache tensors. It is a fixture-specific
-TinyStories probe, not a general text-generation example or held-out language-quality test.
-The frozen dynamic TinyStories graphs also require the separate runtime reshape/expand
-lowerings under development in the fork. They are not supplied by tensor reuse; without
-those identical prerequisites on both sides, prefill fails before timing starts.
+real `MLContext` dispatch and distinct ping-pong cache tensors.
+
+Run `make benchmark-coreml-kv` on macOS without downloading a model or applying
+other patches. The default workload builds fixed-window FP32 attention using
+slice/concat, two matmuls and softmax. Each mode checks all 256 steps against an
+independent f64 attention oracle and exact cache contents, then measures a second
+pass without oracle computation or cache inspection. Its JSON includes per-mode
+timings and host/native copy counters. This is a storage benchmark, not language-model
+token throughput, model-quality qualification or an accelerator-placement measurement.
+`make test-coreml-kv-benchmark` runs the numerical gates as regressions in macOS CI.
+
+The optional external TinyStories fixture mode below requires currently unsupported
+dynamic reshape/expand lowerings; those graphs are not the default runnable benchmark.
 
 Supply the frozen fixture externally: `graphs/fp32_prefill.json`, `graphs/fp32_decode.json`,
 `Resources/streams.json`, `Resources/boundary.json`, per-step little-endian float32 logits in

@@ -215,10 +215,13 @@ build-coreml:
 test-coreml:
 	$(CARGO) test --lib --bins --test 'test_*' --no-default-features --features $(COREML_FEATURES) -- $(TEST_FILTER) --test-threads=1
 
-# Requires a frozen model/reference fixture; correctness gates run before timing.
+# Defaults to self-contained attention/cache chaining with an independent oracle.
 benchmark-coreml-kv:
-	@test -n "$(COREML_KV_CONFIG)" || (echo "Set COREML_KV_CONFIG to the benchmark JSON configuration"; exit 1)
-	CARGO_PROFILE_RELEASE_LTO=false $(CARGO) run --release --features coreml-runtime,dynamic-inputs --example coreml_kv_benchmark -- "$(COREML_KV_CONFIG)"
+	CARGO_PROFILE_RELEASE_LTO=false $(CARGO) run --release --features coreml-runtime,dynamic-inputs --example coreml_kv_benchmark -- $(if $(COREML_KV_CONFIG),"$(COREML_KV_CONFIG)",--self-contained)
+
+.PHONY: test-coreml-kv-benchmark
+test-coreml-kv-benchmark:
+	$(CARGO) test --example coreml_kv_benchmark --no-default-features --features $(COREML_FEATURES)
 
 test-wpt-coreml-report:
 	@mkdir -p reports

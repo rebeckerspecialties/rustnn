@@ -130,7 +130,7 @@ int rustnn_coreml_predict(void *model, void *features, void **out_provider, char
     }
 }
 
-// Retained shape view over a context-owned, page-aligned buffer. The context
+// Retained shape view over a context-owned buffer. The context
 // keeps the buffer alive longer than the view and every synchronous prediction.
 int rustnn_coreml_array_view(void *data, const int64_t *shape, const int64_t *strides,
                             size_t rank, int32_t dtype, void **out, char *err, size_t err_len) {

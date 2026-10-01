@@ -76,7 +76,7 @@ fn build_coreml_shim() {
     // cfg. In particular, watchOS cannot compile source models with this API.
     if !matches!(
         env::var("CARGO_CFG_TARGET_OS").as_deref(),
-        Ok("macos" | "ios" | "tvos")
+        Ok("macos" | "ios")
     ) {
         return;
     }

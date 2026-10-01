@@ -1,4 +1,4 @@
-//! Minimal CoreML execution bridge for macOS, iOS and tvOS.
+//! Minimal CoreML execution bridge for macOS and iOS.
 //! Loads a `.mlmodel`, compiles it if needed, and runs a zeroed inference
 //! using CoreML's Objective-C API.
 
@@ -38,16 +38,16 @@ use load::LoadTrace;
 pub use load::{CoremlLoadDiagnostics, CoremlLoadFailure, CoremlLoadRoute};
 
 // Link against the system frameworks we use.
-#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[link(name = "Foundation", kind = "framework")]
 unsafe extern "C" {}
-#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[link(name = "CoreML", kind = "framework")]
 unsafe extern "C" {}
 
 // Objective-C++ exception firewall (src/executors/coreml_shim.mm).
 // Return codes: 0 = success, 1 = NSError, 2 = NSException, 3 = C++ exception.
-#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 unsafe extern "C" {
     fn rustnn_coreml_compile(
         model_url: *mut Object,
@@ -77,7 +77,7 @@ unsafe extern "C" {
 /// # Safety
 /// This stand-in does not dereference its pointer arguments. Its unsafe signature
 /// mirrors the native shim; no output pointers are initialized on failure.
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 pub unsafe extern "C" fn rustnn_coreml_compile(
     _model_url: *mut Object,
     _out_url: *mut *mut Object,
@@ -91,7 +91,7 @@ pub unsafe extern "C" fn rustnn_coreml_compile(
 /// # Safety
 /// This stand-in does not dereference its pointer arguments. Its unsafe signature
 /// mirrors the native shim; no output pointers are initialized on failure.
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 pub unsafe extern "C" fn rustnn_coreml_load(
     _compiled_url: *mut Object,
     _configuration: *mut Object,
@@ -106,7 +106,7 @@ pub unsafe extern "C" fn rustnn_coreml_load(
 /// # Safety
 /// This stand-in does not dereference its pointer arguments. Its unsafe signature
 /// mirrors the native shim; no output pointers are initialized on failure.
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 pub unsafe extern "C" fn rustnn_coreml_predict(
     _model: *mut Object,
     _features: *mut Object,

@@ -49,7 +49,8 @@ Use the Makefile targets; they set feature flags and environment variables consi
 | `viz` | Export the sample graph as Graphviz DOT |
 | `onnx`, `onnx-validate` | Convert the sample graph to ONNX (`GRAPH_FILE=...` selects another graph); also execute it with ONNX Runtime |
 | `coreml`, `coreml-validate` | CoreML conversion and execution (macOS) |
-| `benchmark-coreml-kv COREML_KV_CONFIG=...` | Sustained CoreML tensor-reuse comparison with an external frozen model/reference fixture; see [Examples](../user-guide/examples.md#coreml-kv-cache-benchmark) |
+| `benchmark-coreml-kv` | Self-contained attention/cache comparison; optionally set `COREML_KV_CONFIG` for an external model/reference fixture; see [Examples](../user-guide/examples.md#coreml-kv-cache-benchmark) |
+| `test-coreml-kv-benchmark` | Oracle and cache-content regressions for all storage modes, without external fixtures; run in macOS CI |
 | `build-coreml`, `test-coreml` | Build all targets; run library and ordinary integration tests. `COREML_FEATURES=coreml-runtime` also checks the build without dynamic inputs |
 | `test-coreml-gather` | Focused active-dimension gather regressions, including scalar indices; `TEST_FILTER` selects a test |
 | `test-coreml-dtypes` | Focused numeric boundary regressions for typed dispatch and the convenience API; CI runs with and without dynamic inputs |

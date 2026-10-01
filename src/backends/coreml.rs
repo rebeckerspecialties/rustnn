@@ -510,11 +510,6 @@ impl<'context> MLBackendContext<'context> for CoremlContext {
             .ok_or_else(|| Error::GraphDispatchError {
                 source: "rustnn_set_tensor_capacity: byte length overflow".into(),
             })?;
-        if new_bytes < tensor_byte_len(tensor.descriptor()) {
-            return Err(Error::GraphDispatchError {
-                source: "tensor capacity is smaller than active shape".into(),
-            });
-        }
         let allocated = self.tensors[tensor.id]
             .storage
             .reserve(new_bytes.max(1), false)

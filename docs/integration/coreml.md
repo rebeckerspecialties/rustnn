@@ -9,9 +9,8 @@ dispatch. The Objective-C bridge lives in `src/executors/coreml.rs` and `src/exe
 
 - A CoreML version that accepts MLProgram models (macOS 13 or newer). The native Rust
   backend also supports iOS; mobile validation uses iOS 18 as its deployment target.
-- tvOS uses the same bridge, but the published `objc` 0.2.7 dependency incorrectly selects
-  its non-Apple message ABI there. tvOS applications need that dependency fixed before
-  linking. watchOS execution is not enabled by these target gates.
+- tvOS is not enabled: the published `objc` dependency selects the wrong message ABI
+  there. watchOS execution is not enabled by these target gates either.
 - The `coreml-runtime` Cargo feature. On Linux and Windows the feature compiles to shims whose
   calls always fail, so `cargo check --features coreml-runtime` works everywhere but the backend
   is never selected on those platforms.
@@ -60,11 +59,14 @@ establishes placement, energy savings or prediction-time fallback; use separate 
 ## Reusing tensor storage
 
 With `RustNNOptions::coreml.reuse_tensor_storage` enabled, CoreML contexts keep float32,
-float16 and int32 tensors in owned, page-aligned storage with
+float16 and int32 tensors in owned storage with
 retained `MLMultiArray` views. Dispatch binds compatible input arrays directly. An output can
 become the next graph's input without `read_tensor`/`write_tensor` or a temporary input array;
 for KV caches, alternate two distinct tensor sets. A dispatch cannot bind one tensor as both
 input and output.
+
+Buffers of at least 16 KiB are page-aligned for CoreML's output-backing performance
+recommendation; smaller scalar and index buffers use 16-byte alignment.
 
 When supported, `outputBackings` proposes the destination array to CoreML. Only a returned
 array with the same object identity counts as accepted. Backings require a fully static

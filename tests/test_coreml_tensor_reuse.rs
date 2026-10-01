@@ -413,11 +413,17 @@ fn reuse_resize_growth_preserves_prefix_and_reserve_resets_storage() {
             read(&mut context, &value),
             bytemuck::cast_slice::<f32, u8>(&[4f32, 9., 0., 0.])
         );
-        assert!(
-            context
-                .rustnn_set_tensor_capacity(&mut value, &[2])
-                .is_err()
-        );
+        let error = context
+            .rustnn_set_tensor_capacity(&mut value, &[2])
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::TensorCapacityError {
+                requested_bytes: 8,
+                required_bytes: 16,
+                ..
+            }
+        ));
         assert_eq!(
             read(&mut context, &value),
             bytemuck::cast_slice::<f32, u8>(&[4f32, 9., 0., 0.])

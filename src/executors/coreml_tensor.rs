@@ -70,9 +70,11 @@ impl Drop for NativeTensor {
 
 impl NativeTensor {
     fn new(dtype: DataType, capacity: usize) -> Result<Self, GraphError> {
-        // Supported Apple platforms have 4 or 16 KiB pages. This alignment also
-        // meets CoreML's outputBackings recommendation on both.
-        let layout = Layout::from_size_align(capacity.max(1), 16384)
+        // Keep scalar/index allocations small. Larger cache buffers retain page
+        // alignment for CoreML's outputBackings performance recommendation.
+        // 16 KiB accommodates both supported Apple page sizes (4 and 16 KiB).
+        let alignment = if capacity >= 16384 { 16384 } else { 16 };
+        let layout = Layout::from_size_align(capacity.max(1), alignment)
             .map_err(|e| failed(format!("native tensor allocation: {e}")))?;
         let data = NonNull::new(unsafe { alloc_zeroed(layout) })
             .ok_or_else(|| failed("native tensor allocation failed"))?;
@@ -497,7 +499,7 @@ unsafe fn copy_output(
     Ok(())
 }
 
-#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 unsafe extern "C" {
     fn rustnn_coreml_array_view(
         data: *mut c_void,
@@ -519,7 +521,7 @@ unsafe extern "C" {
     ) -> i32;
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 #[allow(clippy::too_many_arguments)] // Mirrors the native C ABI above.
 unsafe fn rustnn_coreml_array_view(
     _data: *mut c_void,
@@ -533,7 +535,7 @@ unsafe fn rustnn_coreml_array_view(
 ) -> i32 {
     1
 }
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 unsafe fn rustnn_coreml_predict_backed(
     _model: *mut Object,
     _features: *mut Object,
@@ -581,6 +583,45 @@ mod shape_tests {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_alignment_tracks_capacity_and_growth_preserves_contents() {
+        for capacity in [1, 2, 4, 64, 16383, 16384, 65536] {
+            let native = NativeTensor::new(DataType::Float32, capacity).unwrap();
+            let expected = if capacity >= 16384 { 16384 } else { 16 };
+            assert_eq!(native.layout.align(), expected);
+            assert_eq!(native.layout.size(), capacity);
+            assert_eq!(native.data.as_ptr() as usize % expected, 0);
+        }
+        let mut storage = CoremlTensorStorage::new(DataType::Float32, 4, true).unwrap();
+        let contents = 42f32.to_ne_bytes();
+        storage.write(&contents).unwrap();
+        let CoremlTensorStorage::Native(native) = &mut storage else {
+            panic!("native storage")
+        };
+        native.get_mut().unwrap().array(&descriptor(&[1])).unwrap();
+        assert!(storage.reserve(32768, true).unwrap());
+        let mut read = [0; 4];
+        storage.read(&mut read).unwrap();
+        assert_eq!(read, contents);
+        let CoremlTensorStorage::Native(native) = &mut storage else {
+            panic!("native storage")
+        };
+        let native = native.get_mut().unwrap();
+        assert_eq!(native.layout.align(), 16384);
+        native.array(&descriptor(&[8192])).unwrap();
+        assert_eq!(native.shape, [8192]);
+        assert!(storage.reserve(4, false).unwrap());
+        storage.read(&mut read).unwrap();
+        assert_eq!(read, [0; 4]);
+        let CoremlTensorStorage::Native(native) = &mut storage else {
+            panic!("native storage")
+        };
+        let native = native.get_mut().unwrap();
+        assert_eq!(native.layout.align(), 16);
+        native.array(&descriptor(&[1])).unwrap();
+        assert_eq!(native.shape, [1]);
+    }
 
     fn descriptor(shape: &[u32]) -> OperandDescriptor {
         OperandDescriptor {
@@ -826,7 +867,8 @@ mod tests {
             };
             {
                 let mut guard = native.lock().unwrap();
-                assert_eq!(guard.data.as_ptr().addr() % 16384, 0);
+                assert_eq!(guard.layout.align(), 16);
+                assert_eq!(guard.data.as_ptr().addr() % guard.layout.align(), 0);
                 let first = guard.array(&descriptor(&[2])).unwrap();
                 assert_eq!(first, guard.array(&descriptor(&[2])).unwrap());
             }

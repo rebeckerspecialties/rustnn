@@ -1,7 +1,8 @@
-//! Sustained TinyStories KV-cache probe through the real RustNN tensor API.
+//! CoreML attention and KV-cache probes through the real RustNN tensor API.
 //!
-//! Fixture graphs and typed reference outputs are supplied separately. This is
-//! not a tokenizer or a held-out language-quality benchmark.
+//! The default fixed-window attention benchmark needs no fixture. External model
+//! graphs and typed references can also be supplied; neither mode is a tokenizer
+//! or a held-out language-quality benchmark.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -22,6 +23,9 @@ use rustnn::operator_enums::MLOperandDataType;
 use rustnn::{ContextProperties, GraphValidator};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+#[path = "coreml_kv_benchmark/self_contained.rs"]
+mod self_contained;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BenchmarkConfig {
@@ -809,7 +813,11 @@ fn smollm_probe(config: &BenchmarkConfig, path: &Path, device_type: DeviceType) 
 fn main() -> Result<()> {
     let path = std::env::args()
         .nth(1)
-        .context("usage: coreml_kv_benchmark CONFIG.json")?;
+        .context("usage: coreml_kv_benchmark --self-contained | CONFIG.json")?;
+    if path == "--self-contained" {
+        println!("{}", serde_json::to_string_pretty(&self_contained::run()?)?);
+        return Ok(());
+    }
     let config: BenchmarkConfig = serde_json::from_slice(&fs::read(path)?)?;
     let result = run_configuration(&config);
     let report = match &result {
