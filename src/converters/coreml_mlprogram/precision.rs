@@ -1103,7 +1103,7 @@ impl CoremlMlProgramConverter {
         let Some(model::Type::MlProgram(program)) = &mut model.r#type else {
             return Ok(model);
         };
-        let (preparation, packed, protected_widenings) = {
+        let (preparation, packed, protected_widenings, byte_scale_widenings) = {
             let function = program.functions.get_mut("main").unwrap();
             let block = function
                 .block_specializations
@@ -1125,7 +1125,9 @@ impl CoremlMlProgramConverter {
                             | Operation::Triangular { .. }
                             | Operation::IsNaN { .. }
                             | Operation::IsInfinite { .. }
-                    )
+                    ) || matches!(operation, Operation::DequantizeLinear { input, .. }
+                        if graph.operand(*input).is_some_and(|operand|
+                            matches!(operand.descriptor.data_type, DataType::Int8 | DataType::Uint8)))
                 })
                 .flat_map(|operation| operation.all_input_operands())
                 .filter(|&id| {
@@ -1150,11 +1152,49 @@ impl CoremlMlProgramConverter {
                 })
                 .map(|output| output.name.clone())
                 .collect();
+            let byte_scales: HashSet<_> = graph
+                .operations
+                .iter()
+                .filter_map(|operation| {
+                    let Operation::DequantizeLinear { input, scale, .. } = operation else {
+                        return None;
+                    };
+                    (graph.operand(*input).is_some_and(|operand| {
+                        matches!(
+                            operand.descriptor.data_type,
+                            DataType::Int8 | DataType::Uint8
+                        )
+                    }) && graph
+                        .operand(*scale)
+                        .is_some_and(|operand| operand.descriptor.data_type == DataType::Float16))
+                    .then(|| operand_name(graph, *scale))
+                })
+                .collect();
+            let byte_scale_widenings: HashSet<_> = block
+                .operations
+                .iter()
+                .filter(|operation| {
+                    operation.r#type == "cast"
+                        && named_input(operation, "x")
+                            .is_some_and(|name| byte_scales.contains(name))
+                })
+                .flat_map(|operation| &operation.outputs)
+                .filter(|output| {
+                    tensor(output)
+                        .is_some_and(|value| value.data_type == MilDataType::Float32 as i32)
+                })
+                .map(|output| output.name.clone())
+                .collect();
             let packed = pack_half_widenings(graph, &function.inputs, block)?;
             function
                 .inputs
                 .extend(packed.input_views.iter().map(|(_, view)| view.clone()));
-            (preparation, packed, protected_widenings)
+            (
+                preparation,
+                packed,
+                protected_widenings,
+                byte_scale_widenings,
+            )
         };
         if !packed.input_views.is_empty() {
             let description = model.description.as_mut().unwrap();
@@ -1352,7 +1392,9 @@ impl CoremlMlProgramConverter {
                         | Operation::Prelu { .. }
                         | Operation::Gemm { .. }
                         | Operation::Triangular { .. }
-                )
+                ) || matches!(operation, Operation::DequantizeLinear { input, .. }
+                    if graph.operand(*input).is_some_and(|operand|
+                        matches!(operand.descriptor.data_type, DataType::Int8 | DataType::Uint8)))
             })
             .flat_map(|operation| operation.outputs())
             .filter(|&&id| {
@@ -1367,6 +1409,18 @@ impl CoremlMlProgramConverter {
             cuts.insert(producers[last] + 1);
         }
         for (index, operation) in block.operations.iter().enumerate() {
+            if !constant_operations.contains(&index)
+                && operation
+                    .outputs
+                    .iter()
+                    .any(|output| byte_scale_widenings.contains(&output.name))
+            {
+                // A mixed byte-cast program can flush a source Half scale
+                // even when its widened feature is Float32. Keep the actual
+                // source-proven widening pure before using it in the formula.
+                cuts.insert(index);
+                cuts.insert(index + 1);
+            }
             // Keep explicitly lowered LayerNorm affine work outside the
             // native normalization plan. A fused native gamma/beta plan can
             // omit or reorder nontrailing-axis affine parameters.
