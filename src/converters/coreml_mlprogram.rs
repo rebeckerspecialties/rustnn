@@ -1682,6 +1682,73 @@ impl CoremlMlProgramConverter {
     /// Widen transport and qualified kernels, then restore the public type.
     /// Running after lowering also covers helper and deferred layout operations
     /// without cloning graph constants or widening the stored weight blob.
+    fn fresh_precision_name(graph: &GraphInfo, block: &Block, base: String) -> String {
+        let reserved: std::collections::HashSet<String> = (0..graph.operands.len())
+            .map(|id| operand_name(graph, id as u32))
+            .chain(
+                block
+                    .operations
+                    .iter()
+                    .flat_map(|op| op.outputs.iter().map(|value| value.name.clone())),
+            )
+            .collect();
+        let mut name = base.clone();
+        let mut suffix = 0usize;
+        while reserved.contains(&name) {
+            suffix += 1;
+            name = format!("{base}_{suffix}");
+        }
+        name
+    }
+
+    fn float32_value(mut value: NamedValueType) -> NamedValueType {
+        if let Some(ValueType {
+            r#type: Some(crate::protos::coreml::mil_spec::value_type::Type::TensorType(tensor)),
+        }) = &mut value.r#type
+        {
+            tensor.data_type = crate::protos::coreml::mil_spec::DataType::Float32 as i32;
+        }
+        value
+    }
+
+    fn widen_half_operand(
+        graph: &GraphInfo,
+        id: u32,
+        overrides: &HashMap<u32, String>,
+        block: &mut Block,
+        label: &str,
+    ) -> Result<String, GraphError> {
+        let source = Self::output_name_for_operand(graph, id, overrides);
+        let operand = graph
+            .operand(id)
+            .ok_or_else(|| GraphError::ConversionFailed {
+                format: "coreml_mlprogram".into(),
+                reason: format!("missing precision input {id}"),
+            })?;
+        if operand.descriptor.data_type != DataType::Float16 {
+            return Ok(source);
+        }
+        let mut value = block
+            .operations
+            .iter()
+            .flat_map(|op| &op.outputs)
+            .find(|value| value.name == source)
+            .cloned()
+            .unwrap_or(Self::create_value_with_mil_type(
+                graph,
+                id,
+                source.clone(),
+                crate::protos::coreml::mil_spec::DataType::Float16 as i32,
+            )?);
+        value.name =
+            Self::fresh_precision_name(graph, block, format!("{source}_{label}_fp32_{id}"));
+        let value = Self::float32_value(value);
+        block
+            .operations
+            .push(Self::create_cast_operation(source, value.clone(), "fp32"));
+        Ok(value.name)
+    }
+
     fn preserve_float16_transport(
         function: &mut Function,
         block: &mut Block,
@@ -1779,6 +1846,7 @@ impl CoremlMlProgramConverter {
                     | "expand_dims"
                     | "scatter_along_axis"
                     | "scatter_nd"
+                    | "band_part"
                     // Half accumulation overflows before sqrt even when the
                     // final l2Pool2d result is representable in half.
                     | "l2_pool"
@@ -7505,16 +7573,43 @@ impl CoremlMlProgramConverter {
                 let is_float16 = *input_dtype == DataType::Float16;
                 // Use the graph proxy type (int32 for wide/int4 ints) so intermediate
                 // tensors and the zero comparand share a MIL-representable type.
-                let mil_dtype = Self::graph_value_mil_type(input_dtype)?;
+                let mil_dtype = if is_float16 {
+                    crate::protos::coreml::mil_spec::DataType::Float32 as i32
+                } else {
+                    Self::graph_value_mil_type(input_dtype)?
+                };
                 let (output_name, output_type) =
                     Self::create_output_value(graph_info, output_id, &operand_name_overrides)?;
-                let x_name =
-                    Self::output_name_for_operand(graph_info, x_id, &operand_name_overrides);
-                let alpha_name =
-                    Self::output_name_for_operand(graph_info, alpha_id, &operand_name_overrides);
+                let x_name = Self::widen_half_operand(
+                    graph_info,
+                    x_id,
+                    &operand_name_overrides,
+                    &mut main_block,
+                    "prelu",
+                )?;
+                let alpha_name = Self::widen_half_operand(
+                    graph_info,
+                    alpha_id,
+                    &operand_name_overrides,
+                    &mut main_block,
+                    "prelu",
+                )?;
+                let mut result_type = output_type.clone();
+                if is_float16 {
+                    result_type = Self::float32_value(result_type);
+                    result_type.name = Self::fresh_precision_name(
+                        graph_info,
+                        &main_block,
+                        format!("{output_name}_prelu_fp32_{output_id}"),
+                    );
+                }
 
                 // cond = greater_equal(x, 0): bool, same shape as x (not the broadcast output)
-                let cond_name = format!("{}_prelu_cond", output_name);
+                let cond_name = Self::fresh_precision_name(
+                    graph_info,
+                    &main_block,
+                    format!("{output_name}_prelu_cond"),
+                );
                 let cond_type = Self::create_value_with_mil_type(
                     graph_info,
                     x_id,
@@ -7530,7 +7625,6 @@ impl CoremlMlProgramConverter {
                 } else {
                     Self::create_immediate_int(0)
                 };
-                let _ = is_float16;
                 let mut cond_inputs = HashMap::new();
                 cond_inputs.insert("x".to_string(), Self::create_name_argument(x_name.clone()));
                 cond_inputs.insert("y".to_string(), zero_arg);
@@ -7540,8 +7634,13 @@ impl CoremlMlProgramConverter {
                     vec![cond_type],
                 ));
 
-                // neg_branch = mul(x, alpha): same dtype as x
-                let neg_name = format!("{}_prelu_neg", output_name);
+                // Half PReLU evaluates its complete multiplication/selection
+                // in FP32 rather than rounding the negative branch early.
+                let neg_name = Self::fresh_precision_name(
+                    graph_info,
+                    &main_block,
+                    format!("{output_name}_prelu_neg"),
+                );
                 let neg_type = Self::create_value_with_mil_type(
                     graph_info,
                     output_id,
@@ -7565,8 +7664,16 @@ impl CoremlMlProgramConverter {
                 main_block.operations.push(Self::create_mil_operation(
                     mil_ops::WHERE,
                     sel_inputs,
-                    vec![output_type],
+                    vec![result_type.clone()],
                 ));
+
+                if is_float16 {
+                    main_block.operations.push(Self::create_cast_operation(
+                        result_type.name,
+                        output_type,
+                        "fp16",
+                    ));
+                }
 
                 continue;
             }
@@ -8286,7 +8393,22 @@ impl CoremlMlProgramConverter {
                     }
                 })?;
 
-                let (output_name, output_type) = Self::create_value(graph_info, output_operand_id)?;
+                let (logical_output_name, logical_output_type) = Self::create_output_value(
+                    graph_info,
+                    output_operand_id,
+                    &operand_name_overrides,
+                )?;
+                let is_float16 = output_operand.descriptor.data_type == DataType::Float16;
+                let mut output_type = logical_output_type.clone();
+                if is_float16 {
+                    output_type = Self::float32_value(output_type);
+                    output_type.name = Self::fresh_precision_name(
+                        graph_info,
+                        &main_block,
+                        format!("{logical_output_name}_gemm_fp32_{output_operand_id}"),
+                    );
+                }
+                let output_name = output_type.name.clone();
 
                 let (alpha, beta) = match &op {
                     Operation::Gemm { options, .. } => (
@@ -8301,15 +8423,21 @@ impl CoremlMlProgramConverter {
                     _ => None,
                 };
                 let has_bias = c_operand_id_opt.is_some();
-                let needs_alpha_mul = (alpha - 1.0).abs() > f32::EPSILON;
-                let needs_beta_mul = has_bias && (beta - 1.0).abs() > f32::EPSILON;
+                // WebNN options are represented in the input dtype before
+                // the backend chooses its accumulation precision.
+                let (alpha, beta) = if is_float16 {
+                    (
+                        half::f16::from_f32(alpha).to_f32(),
+                        half::f16::from_f32(beta).to_f32(),
+                    )
+                } else {
+                    (alpha, beta)
+                };
+                let needs_alpha_mul = alpha != 1.0;
+                let needs_beta_mul = has_bias && beta != 1.0;
 
                 let (alpha_arg, beta_arg) = match output_operand.descriptor.data_type {
-                    DataType::Float16 => (
-                        Self::create_immediate_float16(alpha),
-                        Self::create_immediate_float16(beta),
-                    ),
-                    DataType::Float32 => (
+                    DataType::Float16 | DataType::Float32 => (
                         Self::create_immediate_float(alpha),
                         Self::create_immediate_float(beta),
                     ),
@@ -8326,7 +8454,11 @@ impl CoremlMlProgramConverter {
 
                 let mut current_name: String;
                 let matmul_output_name = if needs_alpha_mul || has_bias {
-                    format!("{}_gemm_matmul", output_name)
+                    Self::fresh_precision_name(
+                        graph_info,
+                        &main_block,
+                        format!("{output_name}_gemm_matmul"),
+                    )
                 } else {
                     output_name.clone()
                 };
@@ -8334,11 +8466,23 @@ impl CoremlMlProgramConverter {
                 let mut matmul_inputs: HashMap<String, Argument> = HashMap::new();
                 matmul_inputs.insert(
                     "x".to_string(),
-                    Self::create_name_argument(operand_name(graph_info, op.input_operands()[0])),
+                    Self::create_name_argument(Self::widen_half_operand(
+                        graph_info,
+                        op.input_operands()[0],
+                        &operand_name_overrides,
+                        &mut main_block,
+                        "gemm",
+                    )?),
                 );
                 matmul_inputs.insert(
                     "y".to_string(),
-                    Self::create_name_argument(operand_name(graph_info, op.input_operands()[1])),
+                    Self::create_name_argument(Self::widen_half_operand(
+                        graph_info,
+                        op.input_operands()[1],
+                        &operand_name_overrides,
+                        &mut main_block,
+                        "gemm",
+                    )?),
                 );
                 let (a_transpose, b_transpose) = match &op {
                     Operation::Gemm { options, .. } => (
@@ -8368,7 +8512,11 @@ impl CoremlMlProgramConverter {
 
                 if needs_alpha_mul {
                     let alpha_output_name = if has_bias {
-                        format!("{}_gemm_alpha", output_name)
+                        Self::fresh_precision_name(
+                            graph_info,
+                            &main_block,
+                            format!("{output_name}_gemm_alpha"),
+                        )
                     } else {
                         output_name.clone()
                     };
@@ -8392,9 +8540,29 @@ impl CoremlMlProgramConverter {
 
                 if has_bias {
                     let c_operand_id = c_operand_id_opt.unwrap();
-                    let (c_name, c_type) = Self::create_value(graph_info, c_operand_id)?;
+                    let c_name = Self::widen_half_operand(
+                        graph_info,
+                        c_operand_id,
+                        &operand_name_overrides,
+                        &mut main_block,
+                        "gemm",
+                    )?;
+                    let c_type = Self::create_value_with_mil_type(
+                        graph_info,
+                        c_operand_id,
+                        c_name.clone(),
+                        if is_float16 {
+                            crate::protos::coreml::mil_spec::DataType::Float32 as i32
+                        } else {
+                            Self::graph_value_mil_type(&output_operand.descriptor.data_type)?
+                        },
+                    )?;
                     let scaled_c_name = if needs_beta_mul {
-                        format!("{}_gemm_bias", output_name)
+                        Self::fresh_precision_name(
+                            graph_info,
+                            &main_block,
+                            format!("{output_name}_gemm_bias"),
+                        )
                     } else {
                         c_name.clone()
                     };
@@ -8422,9 +8590,17 @@ impl CoremlMlProgramConverter {
                         "add",
                         add_inputs,
                         vec![NamedValueType {
-                            name: output_name,
+                            name: output_name.clone(),
                             r#type: output_type.r#type,
                         }],
+                    ));
+                }
+
+                if is_float16 {
+                    main_block.operations.push(Self::create_cast_operation(
+                        output_name,
+                        logical_output_type,
+                        "fp16",
                     ));
                 }
 

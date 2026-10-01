@@ -50,6 +50,10 @@ establishes placement, energy savings or prediction-time fallback; use separate 
    Real precision boundaries are materialized as native Pipeline children where needed.
    The children expose live values only and reuse the original weight storage; the public
    WebNN graph, types and shapes are unchanged.
+   Float16 PReLU and GEMM evaluate their complete comparison/affine computation in
+   Float32 before the final Half conversion, avoiding flushed subnormals and
+   premature dot-product overflow. Floating triangular copies use the same
+   protected transport path; integer triangular remains unchanged.
 3. `MLGraphBuilder::build` compiles the model with `MLModel` and keeps the compiled model;
    `dispatch` binds `MLMultiArray`s over the tensor storage and runs a prediction.
 4. The legacy CLI path (`--convert coreml --run-coreml`) tries the compute-unit configurations in
