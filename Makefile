@@ -201,6 +201,14 @@ test-coreml-gather:
 test-coreml-dtypes:
 	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_dtypes -- $(TEST_FILTER) --test-threads=1
 
+.PHONY: test-coreml-gelu
+test-coreml-gelu:
+	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_gelu --test test_coreml_gelu_precision -- $(TEST_FILTER) --test-threads=1
+
+.PHONY: test-coreml-precision
+test-coreml-precision:
+	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_precision_pipeline -- $(TEST_FILTER) --test-threads=1
+
 # Build every target, including examples and the separately run WPT harness.
 build-coreml:
 	$(CARGO) build --all-targets --no-default-features --features $(COREML_FEATURES)
@@ -504,6 +512,7 @@ help:
 	@echo "  coreml-validate    - Convert and validate CoreML graph"
 	@echo "  build-coreml       - Build all targets with CoreML and dynamic inputs (macOS)"
 	@echo "  test-coreml        - Run CoreML unit/integration tests (optional TEST_FILTER=triangular)"
+	@echo "  test-coreml-precision - Test explicit FP16 rounding and native Pipeline stage interfaces"
 	@echo "                       Set COREML_FEATURES=coreml-runtime to disable dynamic inputs"
 	@echo ""
 	@echo "LiteRT Conversion:"

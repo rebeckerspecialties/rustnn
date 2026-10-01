@@ -20,13 +20,11 @@ use crate::error::Error;
 use crate::executors::coreml::{
     CompiledCoremlModel, CoremlByteInput, compile_model, run_coreml_bytes,
 };
-use crate::graph::DataType;
 use crate::mlcontext::RustNNOptions;
 use crate::mlcontext::{
     MLBackendBuilder, MLBackendContext, MLBackendGraph, MLGraph, MLNamedTensors, MLTensor,
     MLTensorDescriptor,
 };
-use crate::operators::Operation;
 
 /// Number of bytes required to store a tensor described by `descriptor`.
 fn tensor_byte_len(descriptor: &MLTensorDescriptor) -> usize {
@@ -101,7 +99,9 @@ impl<'context, 'builder> MLBackendBuilder<'context, 'builder> for CoremlBuilder 
             converted.data,
             converted.weights_data,
             self.device_type,
-            supports_in_memory_asset(&graph_info),
+            // Use one compilation path for all graphs. The asset compiler
+            // loses typed integer values as well as half precision boundaries.
+            false,
         )
         .map_err(|e| Error::GraphBuildError { source: e.into() })?;
         MLGraph::new(
@@ -109,42 +109,6 @@ impl<'context, 'builder> MLBackendBuilder<'context, 'builder> for CoremlBuilder 
             &graph_info,
         )
     }
-}
-
-/// CoreML's in-memory model compiler does not currently behave identically to
-/// URL compilation for every MIL program. Keep the memory path as the default,
-/// but use the established URL path for graphs with demonstrated correctness
-/// differences.
-fn supports_in_memory_asset(graph: &GraphInfo) -> bool {
-    !graph.operations.iter().any(|operation| match operation {
-        // MLModelAsset reports an invalid output feature shape when MIL gather
-        // consumes a rank-0 index, although the URL compiler accepts it.
-        Operation::Gather { indices, .. } => graph
-            .operand(*indices)
-            .is_some_and(|operand| operand.descriptor.shape.is_empty()),
-        // The in-memory execution path loses int32 precision around 2^31 when
-        // evaluating the typed `mul(x, -1)` used to lower WebNN neg.
-        Operation::Neg { input, .. } => graph
-            .operand(*input)
-            .is_some_and(|operand| operand.descriptor.data_type == DataType::Int32),
-        // Integer triangular subtraction is exact through URL compilation;
-        // the memory path loses low bits of retained int32 values beyond 2^24.
-        Operation::Triangular { input, options, .. } => {
-            let upper = options
-                .as_ref()
-                .and_then(|options| options.upper)
-                .unwrap_or(true);
-            let diagonal = options
-                .as_ref()
-                .map(|options| options.diagonal)
-                .unwrap_or(0);
-            ((upper && diagonal > 0) || (!upper && diagonal < 0))
-                && graph
-                    .operand(*input)
-                    .is_some_and(|operand| operand.descriptor.data_type == DataType::Int32)
-        }
-        _ => false,
-    })
 }
 
 #[derive(Debug)]
@@ -431,46 +395,29 @@ mod test {
     }
 
     #[test]
-    fn triangular_url_compilation_is_limited_to_excluded_main_int32() {
-        use crate::graph::{
-            DataType, GraphInfo, Operand, OperandDescriptor, OperandKind, to_dimension_vector,
-        };
-        use crate::operator_options::MLTriangularOptions;
-        use crate::operators::Operation;
-
-        for dtype in [DataType::Float16, DataType::Float32, DataType::Int32] {
-            for upper in [false, true] {
-                for diagonal in [-1, 0, 1] {
-                    let graph = GraphInfo {
-                        operands: vec![Operand {
-                            kind: OperandKind::Input,
-                            name: Some("input".into()),
-                            descriptor: OperandDescriptor {
-                                data_type: dtype,
-                                shape: to_dimension_vector(&[3, 3]),
-                                pending_permutation: vec![],
-                            },
-                        }],
-                        operations: vec![Operation::Triangular {
-                            input: 0,
-                            options: Some(MLTriangularOptions {
-                                upper: Some(upper),
-                                diagonal,
-                                ..Default::default()
-                            }),
-                            outputs: vec![1],
-                        }],
-                        ..Default::default()
-                    };
-                    let needs_url = dtype == DataType::Int32
-                        && ((upper && diagonal > 0) || (!upper && diagonal < 0));
-                    assert_eq!(
-                        super::supports_in_memory_asset(&graph),
-                        !needs_url,
-                        "{dtype:?}, upper={upper}, diagonal={diagonal}"
-                    );
-                }
-            }
+    fn typed_graphs_use_one_local_compilation_path() {
+        use crate::executors::coreml::CoremlLoadRoute;
+        use crate::mlcontext::LoadDiagnostics;
+        for dtype in [
+            MLOperandDataType::Float16,
+            MLOperandDataType::Float32,
+            MLOperandDataType::Int32,
+        ] {
+            let Some(mut context) = coreml_context() else {
+                return;
+            };
+            let mut builder = MLGraphBuilder::new(&mut context).unwrap();
+            let input = builder
+                .input("input", &MLOperandDescriptor::new(dtype, vec![11]))
+                .unwrap();
+            let output = builder.identity(input).unwrap();
+            let graph = builder
+                .build(&MLNamedOperands::from([("result", output)]))
+                .unwrap();
+            let Some(LoadDiagnostics::Coreml(diagnostic)) = graph.rustnn_load_diagnostics() else {
+                panic!("missing CoreML load diagnostics")
+            };
+            assert_eq!(diagnostic.route, CoremlLoadRoute::CompiledUrl);
         }
     }
 
