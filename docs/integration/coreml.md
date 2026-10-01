@@ -74,13 +74,29 @@ prediction, supplying independent output copies even if CoreML omits or changes 
 feature. Standalone consumers should honor these proven-copy bindings too; they must not
 infer an input/output alias from matching names or values.
 
+## Converter-private input views
+
+Precision lowerings can request a compact native Half input through creator-defined
+`rustnn.webnn.compact_input_views` metadata: a JSON array of `{source, view}` bindings
+between declared physical input features. These are backend details, not additional
+WebNN inputs; the original graph, logical dtype and shape remain unchanged.
+
+RustNN binds each private rank-one feature using the source's actual element count,
+including growing and shrinking bounded dimensions. Contiguous source arrays share
+their pointer with a native view whose deallocator retains the source owner. Padded
+or strided arrays instead receive an exact raw-Half copy, preserving subnormals,
+signed zero and NaN bits without a Float32 round trip. The original feature remains
+bound for actual-shape queries and other consumers. Metadata, native dtype, shape
+constraints and storage layout are checked before prediction; standalone consumers
+of these exports must supply the same private bindings.
+
 ## Testing
 
 ```bash
 make test-wpt-coreml              # full WPT suite, expected failures are non-fatal
 make test-wpt-coreml-report       # same, plus the JSON report
 make wpt-sync-coreml              # regenerate tests/wpt_conformance/coreml_expected_failures.txt
-cargo test --lib --features coreml-runtime
+make test-coreml                  # ordinary native unit and integration tests
 ```
 
 CoreML has no PASS snapshots; failing trials are listed in

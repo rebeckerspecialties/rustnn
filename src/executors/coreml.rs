@@ -28,16 +28,18 @@ use crate::error::GraphError;
 use crate::graph::{DataType, Dimension, OperandDescriptor, get_static_or_max_size};
 use crate::runtime_checks::{RuntimeShapeState, TensorKind, validate_shape_data_length};
 
+#[path = "coreml_input_views.rs"]
+pub(crate) mod input_views;
 #[path = "coreml_load.rs"]
 mod load;
 use load::LoadTrace;
 pub use load::{CoremlLoadDiagnostics, CoremlLoadFailure, CoremlLoadRoute};
 
 // Link against the system frameworks we use.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 #[link(name = "Foundation", kind = "framework")]
 unsafe extern "C" {}
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 #[link(name = "CoreML", kind = "framework")]
 unsafe extern "C" {
     static MLModelCreatorDefinedKey: *mut Object;
@@ -281,6 +283,7 @@ struct CoremlFeatureAliases {
     inputs: HashMap<String, String>,
     outputs: HashMap<String, String>,
     passthroughs: HashMap<String, CoremlPassthrough>,
+    compact_input_views: Vec<input_views::Binding>,
 }
 
 enum CoremlModelBacking {
@@ -655,6 +658,9 @@ pub(crate) fn run_coreml_bytes(
             let () = msg_send![dict, setObject: feature_value forKey: key];
         }
 
+        let _compact_input_owners =
+            input_views::bind(model.model, dict, &model.aliases.compact_input_views)?;
+
         let mut create_error: *mut Object = ptr::null_mut();
         let provider_alloc: *mut Object = msg_send![class!(MLDictionaryFeatureProvider), alloc];
         let provider: *mut Object =
@@ -990,6 +996,18 @@ fn run_impl_zeroed_with_weights(
                 continue;
             }
 
+            let compact_input_views = input_views::from_model(model)?;
+            let _compact_input_owners = match input_views::bind(model, dict, &compact_input_views) {
+                Ok(owners) => owners,
+                Err(error) => {
+                    attempts.push(CoremlRunAttempt {
+                        compute_unit: name,
+                        result: Err(error.to_string()),
+                    });
+                    continue;
+                }
+            };
+
             let mut create_error: *mut Object = ptr::null_mut();
             let provider_alloc: *mut Object = msg_send![class!(MLDictionaryFeatureProvider), alloc];
             let provider: *mut Object =
@@ -1184,6 +1202,18 @@ fn run_impl_with_inputs_with_weights(
                 continue;
             }
 
+            let compact_input_views = input_views::from_model(model)?;
+            let _compact_input_owners = match input_views::bind(model, dict, &compact_input_views) {
+                Ok(owners) => owners,
+                Err(error) => {
+                    attempts.push(CoremlRunAttempt {
+                        compute_unit: name,
+                        result: Err(error.to_string()),
+                    });
+                    continue;
+                }
+            };
+
             let mut create_error: *mut Object = ptr::null_mut();
             let provider_alloc: *mut Object = msg_send![class!(MLDictionaryFeatureProvider), alloc];
             let provider: *mut Object =
@@ -1366,10 +1396,12 @@ unsafe fn model_aliases(model: *mut Object) -> Result<CoremlFeatureAliases, Grap
     let inputs = unsafe { model_input_aliases(model)? };
     let outputs = unsafe { model_output_aliases(model)? };
     let passthroughs = unsafe { model_passthroughs(model, &inputs, &outputs)? };
+    let compact_input_views = unsafe { input_views::from_model(model)? };
     Ok(CoremlFeatureAliases {
         inputs,
         outputs,
         passthroughs,
+        compact_input_views,
     })
 }
 
@@ -1431,7 +1463,7 @@ unsafe fn model_passthroughs(
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 unsafe fn model_metadata_value(
     model: *mut Object,
     key: &str,
