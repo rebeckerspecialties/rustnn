@@ -1321,6 +1321,25 @@ impl CoremlMlProgramConverter {
         let constant_operations = constant_closure(&block.operations);
         let mut cuts = BTreeSet::new();
         let graph_outputs: HashSet<_> = block.outputs.iter().cloned().collect();
+        let float32_affine_layer_norm_inputs: HashSet<_> = graph
+            .operations
+            .iter()
+            .filter_map(|operation| {
+                let Operation::LayerNormalization {
+                    input,
+                    options: Some(options),
+                    ..
+                } = operation
+                else {
+                    return None;
+                };
+                ((options.scale.is_some() || options.bias.is_some())
+                    && graph
+                        .operand(*input)
+                        .is_some_and(|operand| operand.descriptor.data_type == DataType::Float32))
+                .then(|| operand_name(graph, *input))
+            })
+            .collect();
         let protected_half_results: HashSet<_> = graph
             .operations
             .iter()
@@ -1348,6 +1367,25 @@ impl CoremlMlProgramConverter {
             cuts.insert(producers[last] + 1);
         }
         for (index, operation) in block.operations.iter().enumerate() {
+            // Keep explicitly lowered LayerNorm affine work outside the
+            // native normalization plan. A fused native gamma/beta plan can
+            // omit or reorder nontrailing-axis affine parameters.
+            if operation.r#type == "layer_norm"
+                && named_input(operation, "x")
+                    .is_some_and(|name| float32_affine_layer_norm_inputs.contains(name))
+                && !operation.inputs.contains_key("gamma")
+                && !operation.inputs.contains_key("beta")
+                && operation.outputs.iter().any(|output| {
+                    tensor(output)
+                        .is_some_and(|value| value.data_type == MilDataType::Float32 as i32)
+                        && block.operations.iter().skip(index + 1).any(|consumer| {
+                            matches!(consumer.r#type.as_str(), "mul" | "add")
+                                && inputs(consumer).contains(&output.name)
+                        })
+                })
+            {
+                cuts.insert(index + 1);
+            }
             // A source FP32 result must exist before an explicit Half cast.
             // Otherwise the compiler can fuse the producer into a Half kernel
             // even though the WebNN operation preceding Cast is FP32-typed.

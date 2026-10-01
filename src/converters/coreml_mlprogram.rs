@@ -8938,12 +8938,15 @@ impl CoremlMlProgramConverter {
                 }
             }
 
-            // Layer/instance normalization with runtime scale/bias, and half
-            // layer normalization whose stored parameters must be widened:
+            // Layer normalization with any affine parameters, and instance
+            // normalization with runtime scale/bias:
             // CoreML's native layer_norm/instance_norm require const
             // gamma/beta ("Param 'gamma' must be const"), so run the native op
             // without them and apply `y = norm(x) * scale + bias` with explicit
             // mul/add, reshaping scale/bias to a broadcast-compatible shape.
+            // Some native layer_norm plans also omit constant gamma on
+            // nontrailing axes, so keep its affine work explicit for both
+            // constant and runtime parameters.
             // Both params are stripped together: the native op computes
             // `norm * gamma + beta`, so applying one after the fact while the
             // other stays inside would change the result.
@@ -8967,7 +8970,8 @@ impl CoremlMlProgramConverter {
                         .map(|o| o.kind != crate::graph::OperandKind::Constant)
                         .unwrap_or(false)
                 };
-                let half_layer_norm = matches!(op, Operation::LayerNormalization { .. })
+                let layer_norm = matches!(op, Operation::LayerNormalization { .. });
+                let half_layer_norm = layer_norm
                     && op
                         .input_operands()
                         .first()
@@ -8975,7 +8979,7 @@ impl CoremlMlProgramConverter {
                         .is_some_and(|operand| operand.descriptor.data_type == DataType::Float16);
                 if is_runtime(scale_id)
                     || is_runtime(bias_id)
-                    || (half_layer_norm && (scale_id.is_some() || bias_id.is_some()))
+                    || (layer_norm && (scale_id.is_some() || bias_id.is_some()))
                 {
                     let x_id = *op.input_operands().first().ok_or_else(|| {
                         GraphError::ConversionFailed {
