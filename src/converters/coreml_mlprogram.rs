@@ -702,6 +702,51 @@ impl CoremlMlProgramConverter {
         })
     }
 
+    fn signed_byte_constant_operands(graph: &GraphInfo) -> std::collections::HashSet<u32> {
+        graph
+            .operations
+            .iter()
+            .filter_map(|operation| match operation {
+                Operation::Identity { input, .. }
+                | Operation::Cast {
+                    input,
+                    data_type:
+                        MLOperandDataType::Int8
+                        | MLOperandDataType::Int32
+                        | MLOperandDataType::Float16
+                        | MLOperandDataType::Float32,
+                    ..
+                } => Some(vec![*input]),
+                Operation::DequantizeLinear {
+                    input, zero_point, ..
+                } if graph
+                    .operand(*input)
+                    .is_some_and(|operand| operand.descriptor.data_type == DataType::Int8)
+                    && operation
+                        .output_operand()
+                        .and_then(|id| graph.operand(id))
+                        .is_some_and(|operand| {
+                            operand.descriptor.data_type == DataType::Float16
+                        }) =>
+                {
+                    Some(
+                        std::iter::once(*input)
+                            .chain(zero_point.iter().copied())
+                            .collect(),
+                    )
+                }
+                _ => None,
+            })
+            .flatten()
+            .filter(|&id| {
+                graph.operand(id).is_some_and(|operand| {
+                    operand.kind == crate::graph::OperandKind::Constant
+                        && operand.descriptor.data_type == DataType::Int8
+                })
+            })
+            .collect()
+    }
+
     /// Create a const operation for a constant operand
     fn create_signed_byte_const_operations(
         graph: &GraphInfo,
@@ -2379,6 +2424,28 @@ impl CoremlMlProgramConverter {
             return true;
         }
         let quant_dt = quant_op.descriptor.data_type;
+        if matches!(op, Operation::DequantizeLinear { .. })
+            && matches!(quant_dt, DataType::Int8 | DataType::Uint8)
+            && op
+                .output_operand()
+                .and_then(|id| graph.operand(id))
+                .is_some_and(|output| output.descriptor.data_type == DataType::Float16)
+        {
+            return true;
+        }
+        if matches!(op, Operation::DequantizeLinear { .. }) && quant_dt == DataType::Int8 {
+            let reconstructed = Self::signed_byte_constant_operands(graph);
+            if std::iter::once(quant_id)
+                .chain(zero_point_id)
+                .any(|id| reconstructed.contains(&id))
+            {
+                // A shared signed source may be stored in a private Uint8 BLOB.
+                // Native constexpr parameters require a matching Int8 header;
+                // use the exact reconstructed values instead, without squeezing
+                // source parameters needed by another decomposed consumer.
+                return true;
+            }
+        }
         if tensor_op.descriptor.shape.is_empty() {
             // Scalars normally use the native rank-0 fast path, but int4/uint4 have no
             // native quantize/dequantize at all, so decompose them even when scalar.
@@ -3692,7 +3759,14 @@ impl CoremlMlProgramConverter {
                 format: "coreml_mlprogram".into(),
                 reason: "quantize/dequantize output is missing".into(),
             })?;
-        let dtype = if quantize {
+        let wide_byte_dequantize = !quantize
+            && output.descriptor.data_type == DataType::Float16
+            && matches!(input.descriptor.data_type, DataType::Int8 | DataType::Uint8);
+        // Byte inputs and their zero-point differences are exactly representable
+        // in Half. Evaluate the complete product wide, retaining scale's stored
+        // Half value and the declared result rounding. High-bit integer routes
+        // retain their existing typed computation.
+        let dtype = if quantize || wide_byte_dequantize {
             crate::protos::coreml::mil_spec::DataType::Float32 as i32
         } else {
             Self::mil_data_type(&output.descriptor.data_type)?
@@ -3730,7 +3804,7 @@ impl CoremlMlProgramConverter {
             cast_type,
         ));
         let scale_name = Self::output_name_for_operand(graph, scale_id, overrides);
-        let scale_float = if quantize {
+        let scale_float = if quantize || wide_byte_dequantize {
             let name = fresh("scale_f");
             block.operations.push(Self::create_cast_operation(
                 scale_name,
@@ -3862,14 +3936,26 @@ impl CoremlMlProgramConverter {
             } else {
                 input_float
             };
+            let result_type = if wide_byte_dequantize {
+                Self::create_value_with_mil_type(graph, output_id, fresh("product_f32"), dtype)?
+            } else {
+                output_type.clone()
+            };
             block.operations.push(Self::create_mil_operation(
                 mil_ops::MUL,
                 HashMap::from([
                     ("x".into(), Self::create_name_argument(centered)),
                     ("y".into(), Self::create_name_argument(scale_float)),
                 ]),
-                vec![output_type],
+                vec![result_type.clone()],
             ));
+            if wide_byte_dequantize {
+                block.operations.push(Self::create_cast_operation(
+                    result_type.name,
+                    output_type,
+                    "fp16",
+                ));
+            }
             return Ok(true);
         }
         let divided = binary(block, mil_ops::DIV, input_float, scale_float, fresh("div"))?;
@@ -6869,28 +6955,27 @@ impl CoremlMlProgramConverter {
             }
         }
 
-        let signed_copy_constants: std::collections::HashSet<_> = graph_info
+        let signed_copy_constants = Self::signed_byte_constant_operands(graph_info);
+        let signed_dequant_constants: std::collections::HashSet<_> = graph_info
             .operations
             .iter()
             .filter_map(|operation| match operation {
-                Operation::Identity { input, .. } => Some(*input),
-                Operation::Cast {
-                    input,
-                    data_type:
-                        MLOperandDataType::Int8
-                        | MLOperandDataType::Int32
-                        | MLOperandDataType::Float16
-                        | MLOperandDataType::Float32,
-                    ..
-                } => Some(*input),
+                Operation::DequantizeLinear {
+                    input, zero_point, ..
+                } if graph_info
+                    .operand(*input)
+                    .is_some_and(|operand| operand.descriptor.data_type == DataType::Int8) =>
+                {
+                    Some(
+                        std::iter::once(*input)
+                            .chain(zero_point.iter().copied())
+                            .collect::<Vec<_>>(),
+                    )
+                }
                 _ => None,
             })
-            .filter(|&id| {
-                graph_info.operand(id).is_some_and(|operand| {
-                    operand.kind == crate::graph::OperandKind::Constant
-                        && operand.descriptor.data_type == DataType::Int8
-                })
-            })
+            .flatten()
+            .filter(|&id| signed_copy_constants.contains(&id))
             .collect();
         let mut constant_names: std::collections::HashSet<_> = (0..graph_info.operands.len())
             .map(|id| operand_name(graph_info, id as u32))
@@ -6902,6 +6987,7 @@ impl CoremlMlProgramConverter {
                     .flat_map(|operation| operation.outputs.iter().map(|value| value.name.clone())),
             )
             .collect();
+        let mut signed_dequant_i32 = HashMap::new();
 
         // Add constant operands as const operations
         for (operand_id, constant_data) in &graph_info.constant_operand_ids_to_handles {
@@ -6925,17 +7011,41 @@ impl CoremlMlProgramConverter {
 
             if !needs_squeeze
                 && needs_type_coerce.is_none()
-                && signed_copy_constants.contains(operand_id)
+                && (signed_copy_constants.contains(operand_id)
+                    || signed_dequant_constants.contains(operand_id))
             {
-                main_block
-                    .operations
-                    .extend(Self::create_signed_byte_const_operations(
-                        graph_info,
-                        *operand_id,
-                        constant_data,
-                        weight_builder,
-                        &mut constant_names,
-                    )?);
+                let signed_operations = Self::create_signed_byte_const_operations(
+                    graph_info,
+                    *operand_id,
+                    constant_data,
+                    weight_builder,
+                    &mut constant_names,
+                )?;
+                if signed_dequant_constants.contains(operand_id) {
+                    let signed_name = signed_operations
+                        .last()
+                        .filter(|operation| operation.r#type == "cast")
+                        .and_then(|operation| operation.inputs.get("x"))
+                        .and_then(|argument| argument.arguments.first())
+                        .and_then(|argument| match &argument.binding {
+                            Some(
+                                crate::protos::coreml::mil_spec::argument::binding::Binding::Name(
+                                    name,
+                                ),
+                            ) => Some(name.clone()),
+                            _ => None,
+                        })
+                        .ok_or_else(|| GraphError::ConversionFailed {
+                            format: "coreml_mlprogram".into(),
+                            reason:
+                                "signed constant reconstruction is missing its exact Int32 endpoint"
+                                    .into(),
+                        })?;
+                    signed_dequant_i32.insert(*operand_id, signed_name);
+                }
+                // Retain the original Int8 materializer for other consumers;
+                // only the byte Dequantize formula uses the proven Int32 SSA.
+                main_block.operations.extend(signed_operations);
             } else if needs_squeeze || needs_type_coerce.is_some() {
                 use crate::graph::OperandDescriptor;
 
@@ -10469,10 +10579,23 @@ impl CoremlMlProgramConverter {
             // int4/uint4 tensors can't be materialized at all, so leave those to the native
             // path (which errors) rather than decomposing.
             if op_type_lower == "dequantizelinear" && Self::qdq_should_decompose(graph_info, op) {
+                let mut dequant_overrides = operand_name_overrides.clone();
+                if op
+                    .input_operands()
+                    .first()
+                    .and_then(|&id| graph_info.operand(id))
+                    .is_some_and(|operand| operand.descriptor.data_type == DataType::Int8)
+                {
+                    for id in op.all_input_operands() {
+                        if let Some(signed) = signed_dequant_i32.get(&id) {
+                            dequant_overrides.insert(id, signed.clone());
+                        }
+                    }
+                }
                 Self::emit_dequantize_decomposition(
                     graph_info,
                     op,
-                    &operand_name_overrides,
+                    &dequant_overrides,
                     &mut main_block,
                 )?;
                 if let Some(output_id) = op.output_operand()
