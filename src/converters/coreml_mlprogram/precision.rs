@@ -1117,6 +1117,8 @@ impl CoremlMlProgramConverter {
                     matches!(
                         operation,
                         Operation::Reciprocal { .. }
+                            | Operation::Linear { .. }
+                            | Operation::Clamp { .. }
                             | Operation::Neg { .. }
                             | Operation::RoundEven { .. }
                             | Operation::Sub { .. }
@@ -1347,6 +1349,8 @@ impl CoremlMlProgramConverter {
                 matches!(
                     operation,
                     Operation::RoundEven { .. }
+                        | Operation::Linear { .. }
+                        | Operation::Clamp { .. }
                         | Operation::Sub { .. }
                         | Operation::Neg { .. }
                         | Operation::Prelu { .. }
