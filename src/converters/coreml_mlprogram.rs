@@ -1810,6 +1810,7 @@ impl CoremlMlProgramConverter {
                     // Native Half clip changes represented values under A12
                     // accelerator-enabled policies, including an exact zero.
                     | "clip"
+                    | "instance_norm"
             );
             let half = operation.outputs.iter().any(|value| {
                 tensor(value).is_some_and(|t| t.data_type == MilDataType::Float16 as i32)
@@ -9006,8 +9007,8 @@ impl CoremlMlProgramConverter {
                 }
             }
 
-            // Layer normalization with any affine parameters, and instance
-            // normalization with runtime scale/bias:
+            // Layer normalization with affine parameters, and spatial instance
+            // normalization with optional affine parameters:
             // CoreML's native layer_norm/instance_norm require const
             // gamma/beta ("Param 'gamma' must be const"), so run the native op
             // without them and apply `y = norm(x) * scale + bias` with explicit
@@ -9033,22 +9034,13 @@ impl CoremlMlProgramConverter {
                     ),
                     _ => (None, None),
                 };
-                let is_runtime = |id: Option<u32>| {
-                    id.and_then(|id| graph_info.operand(id))
-                        .map(|o| o.kind != crate::graph::OperandKind::Constant)
-                        .unwrap_or(false)
-                };
                 let layer_norm = matches!(op, Operation::LayerNormalization { .. });
-                let half_layer_norm = layer_norm
-                    && op
-                        .input_operands()
-                        .first()
-                        .and_then(|&id| graph_info.operand(id))
-                        .is_some_and(|operand| operand.descriptor.data_type == DataType::Float16);
-                if is_runtime(scale_id)
-                    || is_runtime(bias_id)
-                    || (layer_norm && (scale_id.is_some() || bias_id.is_some()))
-                {
+                let half_normalization = op
+                    .input_operands()
+                    .first()
+                    .and_then(|&id| graph_info.operand(id))
+                    .is_some_and(|operand| operand.descriptor.data_type == DataType::Float16);
+                if !layer_norm || scale_id.is_some() || bias_id.is_some() {
                     let x_id = *op.input_operands().first().ok_or_else(|| {
                         GraphError::ConversionFailed {
                             format: "coreml_mlprogram".to_string(),
@@ -9064,7 +9056,7 @@ impl CoremlMlProgramConverter {
                             })?;
                     let x_shape = x_op.descriptor.static_or_max_shape();
                     let rank = x_shape.len();
-                    let mil_dtype = if half_layer_norm {
+                    let mil_dtype = if half_normalization {
                         crate::protos::coreml::mil_spec::DataType::Float32 as i32
                     } else {
                         Self::graph_value_mil_type(&x_op.descriptor.data_type)?
@@ -9155,7 +9147,12 @@ impl CoremlMlProgramConverter {
                         }
                         _ => {}
                     }
-                    let norm_name = fresh("nogb");
+                    let norm_name =
+                        if !half_normalization && scale_id.is_none() && bias_id.is_none() {
+                            out_name.clone()
+                        } else {
+                            fresh("nogb")
+                        };
                     let mut norm_overrides = operand_name_overrides.clone();
                     norm_overrides.insert(out_id, norm_name.clone());
                     let mut mil = self.convert_operation_with_overrides(
@@ -9163,7 +9160,7 @@ impl CoremlMlProgramConverter {
                         &stripped,
                         &norm_overrides,
                     )?;
-                    if half_layer_norm {
+                    if half_normalization {
                         let wide_name = fresh("normalization_fp32_input");
                         main_block.operations.push(Self::create_cast_operation(
                             Self::output_name_for_operand(
@@ -9185,6 +9182,9 @@ impl CoremlMlProgramConverter {
                             Operation::LayerNormalization { options, .. } => {
                                 options.as_ref().map_or(1e-5, |o| o.epsilon)
                             }
+                            Operation::InstanceNormalization { options, .. } => {
+                                options.as_ref().map_or(1e-5, |o| o.epsilon)
+                            }
                             _ => unreachable!(),
                         };
                         mil.inputs.insert(
@@ -9198,10 +9198,27 @@ impl CoremlMlProgramConverter {
                             mil_dtype,
                         )?];
                     }
+                    if let Operation::InstanceNormalization { options, .. } = op {
+                        // Native instance_norm can substitute a default-sized
+                        // epsilon, including for source Float32 inputs. Use
+                        // LayerNorm over exactly the source spatial axes and
+                        // apply channel affine parameters explicitly below.
+                        mil.r#type = mil_ops::LAYER_NORM.into();
+                        let axes = if options
+                            .as_ref()
+                            .is_some_and(|options| options.layout.eq_ignore_ascii_case("nhwc"))
+                        {
+                            [1, 2]
+                        } else {
+                            [2, 3]
+                        };
+                        mil.inputs
+                            .insert("axes".into(), Self::create_immediate_int_array(&axes));
+                    }
                     main_block.operations.push(mil);
 
                     let mut cur = norm_name;
-                    if half_layer_norm && scale_id.is_none() && bias_id.is_some() {
+                    if half_normalization && scale_id.is_none() && bias_id.is_some() {
                         // A fused normalization-plus-bias plan can apply the
                         // broadcast bias only to its first batch. Explicit unit
                         // scale retains the complete affine composition.
@@ -9233,7 +9250,7 @@ impl CoremlMlProgramConverter {
                             param_id,
                             &operand_name_overrides,
                         );
-                        if half_layer_norm {
+                        if half_normalization {
                             let wide_name = fresh(&format!("{tag}_fp32"));
                             main_block.operations.push(Self::create_cast_operation(
                                 param_name,
@@ -9279,7 +9296,7 @@ impl CoremlMlProgramConverter {
                             fresh(&format!("{tag}_bcast")),
                             mil_dtype,
                         );
-                        let (step_name, step_type) = if i == last && !half_layer_norm {
+                        let (step_name, step_type) = if i == last && !half_normalization {
                             (out_name.clone(), out_type.clone())
                         } else {
                             let name = fresh(&format!("{tag}_applied"));
@@ -9301,7 +9318,7 @@ impl CoremlMlProgramConverter {
                         ));
                         cur = step_name;
                     }
-                    if half_layer_norm {
+                    if half_normalization {
                         main_block
                             .operations
                             .push(Self::create_cast_operation(cur, out_type, "fp16"));
