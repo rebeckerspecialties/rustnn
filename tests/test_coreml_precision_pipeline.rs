@@ -1715,13 +1715,15 @@ fn precision_pipeline_retains_direct_input_and_constant_outputs() {
 fn precision_pipeline_adapts_mask_values_and_retains_original_input_fanout() {
     let stages = pipeline(&masked());
     let stage0 = stages[0].description.as_ref().unwrap();
+    // Carry the native Boolean producer, rather than its public uint8 cast,
+    // through the exact int32 inter-program mask representation.
     assert_eq!(
         stage0
             .output
             .iter()
             .map(|f| f.name.as_str())
             .collect::<Vec<_>>(),
-        ["mask_precision_io", "rounded"]
+        ["mask_bool_precision_io", "rounded"]
     );
     let Some(specification::feature_type::Type::MultiArrayType(mask)) =
         stage0.output[0].r#type.as_ref().unwrap().r#type.as_ref()
@@ -1743,7 +1745,7 @@ fn precision_pipeline_adapts_mask_values_and_retains_original_input_fanout() {
             .iter()
             .map(|f| f.name.as_str())
             .collect::<Vec<_>>(),
-        ["input", "mask_precision_io", "widened"]
+        ["input", "mask_bool_precision_io", "widened"]
     );
 }
 

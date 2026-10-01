@@ -6179,12 +6179,14 @@ impl CoremlMlProgramConverter {
         graph: &GraphInfo,
         weights: &mut super::WeightFileBuilder,
     ) -> Result<Model, GraphError> {
+        let mut materialized_boolean_results = std::collections::HashSet::new();
         let mut model = self.convert_program(
             graph,
             &graph.input_operands,
             &graph.output_operands,
             &graph.operations,
             weights,
+            &mut materialized_boolean_results,
         )?;
         Self::fold_constant_half_casts(graph, &mut model, weights)?;
         let promoted =
@@ -6204,7 +6206,12 @@ impl CoremlMlProgramConverter {
             } else {
                 std::collections::HashSet::new()
             };
-        self.materialize_precision_boundaries(graph, model, &promoted)
+        self.materialize_precision_boundaries(
+            graph,
+            model,
+            &promoted,
+            &materialized_boolean_results,
+        )
     }
 
     fn convert_program(
@@ -6214,6 +6221,7 @@ impl CoremlMlProgramConverter {
         output_operands: &[u32],
         operations: &[Operation],
         weight_builder: &mut super::WeightFileBuilder,
+        materialized_boolean_results: &mut std::collections::HashSet<String>,
     ) -> Result<Model, GraphError> {
         if !crate::graph::dynamic_inputs_enabled() && graph_info.has_dynamic_dimensions() {
             return Err(GraphError::DynamicInputsFeatureDisabled);
@@ -6745,6 +6753,12 @@ impl CoremlMlProgramConverter {
             .collect();
         let mut pad_unfused: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
+        // A logical producer has both a native Bool SSA value and the uint8
+        // value required by WebNN. Reuse the former only while its encoded
+        // operand binding remains unchanged; explicit casts/layout transforms
+        // still consume their own typed outputs.
+        let mut logical_bool_values: HashMap<u32, (String, String)> = HashMap::new();
+
         // Convert all operations to MIL operations
         for op in operations {
             let op_type_lower = op.op_type().to_lowercase();
@@ -7243,42 +7257,56 @@ impl CoremlMlProgramConverter {
                 let mut input_names =
                     Self::input_names_for_operation(graph_info, op, &operand_name_overrides);
 
-                // Inspect represented Half NaN/infinity values in FP32, using
-                // the source operand's shape rather than the uint8 result.
-                if matches!(op_type_lower.as_str(), "isnan" | "isinfinite")
-                    && let Some(&input_id) = op.input_operands().first()
-                    && graph_info
-                        .operand(input_id)
-                        .is_some_and(|operand| operand.descriptor.data_type == DataType::Float16)
-                {
-                    let reserved: std::collections::HashSet<String> = graph_info
-                        .operands
-                        .iter()
-                        .enumerate()
-                        .map(|(id, _)| operand_name(graph_info, id as u32))
-                        .chain(main_block.operations.iter().flat_map(|operation| {
-                            operation.outputs.iter().map(|output| output.name.clone())
-                        }))
-                        .collect();
-                    let base = format!("{}_class_fp32_{output_id}", input_names[0]);
-                    let mut wide_name = base.clone();
-                    let mut suffix = 0usize;
-                    while reserved.contains(&wide_name) {
-                        suffix += 1;
-                        wide_name = format!("{base}_{suffix}");
+                // Preserve represented Half subnormals in comparisons and
+                // classifications. Use each source shape, not the broadcast
+                // uint8 result, and keep the source graph/constant storage Half.
+                if matches!(
+                    op_type_lower.as_str(),
+                    "isnan"
+                        | "isinfinite"
+                        | "equal"
+                        | "notequal"
+                        | "greater"
+                        | "greaterorequal"
+                        | "lesser"
+                        | "lesserorequal"
+                ) {
+                    for (index, &input_id) in op.input_operands().iter().enumerate() {
+                        if !graph_info.operand(input_id).is_some_and(|operand| {
+                            operand.descriptor.data_type == DataType::Float16
+                        }) {
+                            continue;
+                        }
+                        let reserved: std::collections::HashSet<String> = graph_info
+                            .operands
+                            .iter()
+                            .enumerate()
+                            .map(|(id, _)| operand_name(graph_info, id as u32))
+                            .chain(main_block.operations.iter().flat_map(|operation| {
+                                operation.outputs.iter().map(|output| output.name.clone())
+                            }))
+                            .collect();
+                        let base =
+                            format!("{}_comparison_fp32_{output_id}_{index}", input_names[index]);
+                        let mut wide_name = base.clone();
+                        let mut suffix = 0usize;
+                        while reserved.contains(&wide_name) {
+                            suffix += 1;
+                            wide_name = format!("{base}_{suffix}");
+                        }
+                        let wide_type = Self::create_value_with_mil_type(
+                            graph_info,
+                            input_id,
+                            wide_name.clone(),
+                            MilDataType::Float32 as i32,
+                        )?;
+                        main_block.operations.push(Self::create_cast_operation(
+                            input_names[index].clone(),
+                            wide_type,
+                            "fp32",
+                        ));
+                        input_names[index] = wide_name;
                     }
-                    let wide_type = Self::create_value_with_mil_type(
-                        graph_info,
-                        input_id,
-                        wide_name.clone(),
-                        MilDataType::Float32 as i32,
-                    )?;
-                    main_block.operations.push(Self::create_cast_operation(
-                        input_names[0].clone(),
-                        wide_type,
-                        "fp32",
-                    ));
-                    input_names[0] = wide_name;
                 }
 
                 // WebNN allows every operand data type for comparisons, but only requires
@@ -7336,6 +7364,12 @@ impl CoremlMlProgramConverter {
                             }
                         })?;
                         if input_operand.descriptor.data_type == DataType::Uint8 {
+                            if let Some((encoded, boolean)) = logical_bool_values.get(&input_id)
+                                && input_names[index] == *encoded
+                            {
+                                input_names[index] = boolean.clone();
+                                continue;
+                            }
                             // Suffix with the consuming op's output id: a bare
                             // `{input}_bool` collides with the producer's own
                             // `{output}_bool` raw result when the input comes
@@ -7382,6 +7416,20 @@ impl CoremlMlProgramConverter {
                         equal_inputs,
                         vec![equal_output_type],
                     ));
+
+                    // A native fused Equal/Not plan can treat unordered NaN
+                    // comparisons as ordered inequality. Preserve the exact
+                    // Bool result through the planner's Int32 feature seam.
+                    if op.input_operands().iter().any(|&id| {
+                        graph_info.operand(id).is_some_and(|operand| {
+                            matches!(
+                                operand.descriptor.data_type,
+                                DataType::Float16 | DataType::Float32
+                            )
+                        })
+                    }) {
+                        materialized_boolean_results.insert(equal_output_name.clone());
+                    }
 
                     let mut not_inputs = HashMap::new();
                     not_inputs.insert(
@@ -7477,6 +7525,7 @@ impl CoremlMlProgramConverter {
                     main_block.operations.push(mil_op);
                 }
 
+                logical_bool_values.insert(output_id, (output_name, bool_output_name.clone()));
                 main_block.operations.push(Self::create_cast_operation(
                     bool_output_name,
                     output_type,
@@ -9605,18 +9654,26 @@ impl CoremlMlProgramConverter {
                 // Suffix with this op's output id so this cast cannot redefine a
                 // comparison's raw `{output}_bool` value.
                 let where_out = op.output_operand().unwrap_or(cond_id);
-                let bool_cond_name = format!("{cond_name}_bool_{where_out}");
-                let bool_cond_type = Self::create_value_with_mil_type(
-                    graph_info,
-                    cond_id,
-                    bool_cond_name.clone(),
-                    crate::protos::coreml::mil_spec::DataType::Bool as i32,
-                )?;
-                main_block.operations.push(Self::create_cast_operation(
-                    cond_name,
-                    bool_cond_type,
-                    "bool",
-                ));
+                let bool_cond_name = if let Some((encoded, boolean)) =
+                    logical_bool_values.get(&cond_id)
+                    && *encoded == cond_name
+                {
+                    boolean.clone()
+                } else {
+                    let name = format!("{cond_name}_bool_{where_out}");
+                    let bool_cond_type = Self::create_value_with_mil_type(
+                        graph_info,
+                        cond_id,
+                        name.clone(),
+                        crate::protos::coreml::mil_spec::DataType::Bool as i32,
+                    )?;
+                    main_block.operations.push(Self::create_cast_operation(
+                        cond_name,
+                        bool_cond_type,
+                        "bool",
+                    ));
+                    name
+                };
 
                 let mut overrides = operand_name_overrides.clone();
                 overrides.insert(cond_id, bool_cond_name);
@@ -10289,7 +10346,8 @@ impl CoremlMlProgramConverter {
                     .map(|inp| {
                         matches!(
                             inp.descriptor.data_type,
-                            DataType::Int8
+                            DataType::Float16
+                                | DataType::Int8
                                 | DataType::Uint8
                                 | DataType::Int32
                                 | DataType::Uint32
@@ -10349,40 +10407,19 @@ impl CoremlMlProgramConverter {
                         // Track the INTERFACE output name (without _graph suffix) for the
                         // final cast loop, which uses int32 instead of the default float32.
                         int32_proxy_output_names.insert(operand_name(graph_info, output_id));
-                        // Emit argmax/argmin directly with int32 output (no cast needed).
-                        let mil_op_type = self.get_mil_op_type(op.op_type())?;
-                        let arg_op = self.convert_operation_with_input_names_and_outputs(
-                            graph_info,
-                            op,
-                            &input_names,
-                            vec![final_output_type],
-                            mil_op_type,
-                        )?;
-                        main_block.operations.push(arg_op);
-                    } else {
-                        // Apply argmax/argmin (CoreML always produces int32), then cast to int32.
-                        let int32_name = format!("{}_int32", output_name);
-                        let int32_type = Self::create_value_with_mil_type(
-                            graph_info,
-                            output_id,
-                            int32_name.clone(),
-                            MilDataType::Int32 as i32,
-                        )?;
-                        let mil_op_type = self.get_mil_op_type(op.op_type())?;
-                        let arg_op = self.convert_operation_with_input_names_and_outputs(
-                            graph_info,
-                            op,
-                            &input_names,
-                            vec![int32_type],
-                            mil_op_type,
-                        )?;
-                        main_block.operations.push(arg_op);
-                        main_block.operations.push(Self::create_cast_operation(
-                            int32_name,
-                            output_type,
-                            "int32",
-                        ));
                     }
+                    // The kernel already produces Int32. A redundant terminal
+                    // same-type Cast can make constant-only models omit the
+                    // declared output feature on older CoreML runtimes.
+                    let mil_op_type = self.get_mil_op_type(op.op_type())?;
+                    let arg_op = self.convert_operation_with_input_names_and_outputs(
+                        graph_info,
+                        op,
+                        &input_names,
+                        vec![final_output_type],
+                        mil_op_type,
+                    )?;
+                    main_block.operations.push(arg_op);
                     continue;
                 }
             }
@@ -12129,6 +12166,7 @@ mod tests {
                         &graph.output_operands,
                         &graph.operations,
                         &mut super::super::WeightFileBuilder::new(),
+                        &mut std::collections::HashSet::new(),
                     )
                     .unwrap();
                 let Some(crate::protos::coreml::specification::model::Type::MlProgram(program)) =
