@@ -1700,6 +1700,73 @@ impl CoremlMlProgramConverter {
     /// Widen transport and qualified kernels, then restore the public type.
     /// Running after lowering also covers helper and deferred layout operations
     /// without cloning graph constants or widening the stored weight blob.
+    fn fresh_precision_name(graph: &GraphInfo, block: &Block, base: String) -> String {
+        let reserved: std::collections::HashSet<String> = (0..graph.operands.len())
+            .map(|id| operand_name(graph, id as u32))
+            .chain(
+                block
+                    .operations
+                    .iter()
+                    .flat_map(|op| op.outputs.iter().map(|value| value.name.clone())),
+            )
+            .collect();
+        let mut name = base.clone();
+        let mut suffix = 0usize;
+        while reserved.contains(&name) {
+            suffix += 1;
+            name = format!("{base}_{suffix}");
+        }
+        name
+    }
+
+    fn float32_value(mut value: NamedValueType) -> NamedValueType {
+        if let Some(ValueType {
+            r#type: Some(crate::protos::coreml::mil_spec::value_type::Type::TensorType(tensor)),
+        }) = &mut value.r#type
+        {
+            tensor.data_type = crate::protos::coreml::mil_spec::DataType::Float32 as i32;
+        }
+        value
+    }
+
+    fn widen_half_operand(
+        graph: &GraphInfo,
+        id: u32,
+        overrides: &HashMap<u32, String>,
+        block: &mut Block,
+        label: &str,
+    ) -> Result<String, GraphError> {
+        let source = Self::output_name_for_operand(graph, id, overrides);
+        let operand = graph
+            .operand(id)
+            .ok_or_else(|| GraphError::ConversionFailed {
+                format: "coreml_mlprogram".into(),
+                reason: format!("missing precision input {id}"),
+            })?;
+        if operand.descriptor.data_type != DataType::Float16 {
+            return Ok(source);
+        }
+        let mut value = block
+            .operations
+            .iter()
+            .flat_map(|op| &op.outputs)
+            .find(|value| value.name == source)
+            .cloned()
+            .unwrap_or(Self::create_value_with_mil_type(
+                graph,
+                id,
+                source.clone(),
+                crate::protos::coreml::mil_spec::DataType::Float16 as i32,
+            )?);
+        value.name =
+            Self::fresh_precision_name(graph, block, format!("{source}_{label}_fp32_{id}"));
+        let value = Self::float32_value(value);
+        block
+            .operations
+            .push(Self::create_cast_operation(source, value.clone(), "fp32"));
+        Ok(value.name)
+    }
+
     fn preserve_float16_transport(
         function: &mut Function,
         block: &mut Block,
@@ -1810,6 +1877,16 @@ impl CoremlMlProgramConverter {
                     // Native Half clip changes represented values under A12
                     // accelerator-enabled policies, including an exact zero.
                     | "clip"
+                    // These native Half kernels lose represented subnormal
+                    // terms or overflow before a finite contraction completes.
+                    // Keep their source storage/output Half, but compute the
+                    // complete operation in Float32 before one result cast.
+                    | "cumsum"
+                    | "reduce_min"
+                    | "reduce_sum_square"
+                    | "conv"
+                    | "avg_pool"
+                    | "batch_norm"
             );
             let half = operation.outputs.iter().any(|value| {
                 tensor(value).is_some_and(|t| t.data_type == MilDataType::Float16 as i32)
@@ -10133,7 +10210,10 @@ impl CoremlMlProgramConverter {
                     || nonconst_param(op.input_operands().get(2).copied())
                     || nonconst_param(bn_scale_id)
                     || nonconst_param(bn_bias_id);
-                if input_rank < 3 && !any_param_nonconstant {
+                if input_rank < 3
+                    && !any_param_nonconstant
+                    && input_op.descriptor.data_type != DataType::Float16
+                {
                     let axis = match op {
                         Operation::BatchNormalization { options, .. } => {
                             options.as_ref().map(|o| o.axis as usize).unwrap_or(1)
@@ -10744,7 +10824,14 @@ impl CoremlMlProgramConverter {
                     || is_runtime_param(variance_id)
                     || is_runtime_param(scale_id)
                     || is_runtime_param(bias_id)
-                    || (axis != 1 && input_rank >= 2);
+                    || (axis != 1 && input_rank >= 2)
+                    // Half parameters remain stored Half, and their exact
+                    // widening can cross a native precision boundary. The
+                    // resulting live gamma/beta values are not native const
+                    // features, even when their WebNN sources are constants.
+                    || input_operand.is_some_and(|operand| {
+                        operand.descriptor.data_type == DataType::Float16
+                    });
 
                 if use_decomposition
                     && let (Some(input_id), Some(mean_id_v), Some(variance_id_v)) =
@@ -10758,30 +10845,56 @@ impl CoremlMlProgramConverter {
                             })?;
                     let (output_name, output_type) =
                         Self::create_output_value(graph_info, output_id, &operand_name_overrides)?;
-                    let input_name = Self::output_name_for_operand(
-                        graph_info,
-                        input_id,
-                        &operand_name_overrides,
-                    );
-                    let mean_name = Self::output_name_for_operand(
-                        graph_info,
-                        mean_id_v,
-                        &operand_name_overrides,
-                    );
-                    let var_name = Self::output_name_for_operand(
-                        graph_info,
-                        variance_id_v,
-                        &operand_name_overrides,
-                    );
-
                     let inp_op = graph_info.operand(input_id).ok_or_else(|| {
                         GraphError::ConversionFailed {
                             format: "coreml_mlprogram".to_string(),
                             reason: format!("batchNorm input {} not found", input_id),
                         }
                     })?;
-                    let dtype = Self::mil_data_type(&inp_op.descriptor.data_type)?;
                     let is_f16 = inp_op.descriptor.data_type == DataType::Float16;
+                    let dtype = if is_f16 {
+                        crate::protos::coreml::mil_spec::DataType::Float32 as i32
+                    } else {
+                        Self::mil_data_type(&inp_op.descriptor.data_type)?
+                    };
+                    // BatchNorm is one WebNN operation. Its decomposition
+                    // must not round the centering, variance or affine stages
+                    // independently to Half. Storage and logical interfaces
+                    // remain Half; only the complete operation is widened.
+                    let declared_output = output_type.clone();
+                    let mut output_type = output_type;
+                    let output_name = if is_f16 {
+                        output_type = Self::float32_value(output_type);
+                        output_type.name = Self::fresh_precision_name(
+                            graph_info,
+                            &main_block,
+                            format!("{output_name}_batch_norm_fp32"),
+                        );
+                        output_type.name.clone()
+                    } else {
+                        output_name
+                    };
+                    let input_name = Self::widen_half_operand(
+                        graph_info,
+                        input_id,
+                        &operand_name_overrides,
+                        &mut main_block,
+                        "batch_norm",
+                    )?;
+                    let mean_name = Self::widen_half_operand(
+                        graph_info,
+                        mean_id_v,
+                        &operand_name_overrides,
+                        &mut main_block,
+                        "batch_norm",
+                    )?;
+                    let var_name = Self::widen_half_operand(
+                        graph_info,
+                        variance_id_v,
+                        &operand_name_overrides,
+                        &mut main_block,
+                        "batch_norm",
+                    )?;
 
                     // When axis is not the last dimension, [C]-shaped params
                     // (mean/variance/gamma/beta) need an explicit reshape to
@@ -10944,7 +11057,7 @@ impl CoremlMlProgramConverter {
                     };
                     let var_eps_name = format!("{}_bn_veps", output_name);
                     let eps_arg = if is_f16 {
-                        Self::create_immediate_float16_from_f64(epsilon)
+                        Self::create_immediate_float(half::f16::from_f64(epsilon).to_f32())
                     } else {
                         Self::create_immediate_float(epsilon as f32)
                     };
@@ -11015,11 +11128,13 @@ impl CoremlMlProgramConverter {
 
                     // Apply scale (gamma) and bias (beta) if present
                     let after_scale = if let Some(sc_id) = scale_id {
-                        let sc_name = Self::output_name_for_operand(
+                        let sc_name = Self::widen_half_operand(
                             graph_info,
                             sc_id,
                             &operand_name_overrides,
-                        );
+                            &mut main_block,
+                            "batch_norm",
+                        )?;
                         let sc_name = bcast_param(sc_name, "gamma", &mut main_block.operations);
                         let scaled_name = format!("{}_bn_scaled", output_name);
                         let mut mul_in: HashMap<String, Argument> = HashMap::new();
@@ -11036,11 +11151,13 @@ impl CoremlMlProgramConverter {
                     };
 
                     let final_name = if let Some(bi_id) = bias_id {
-                        let bi_name = Self::output_name_for_operand(
+                        let bi_name = Self::widen_half_operand(
                             graph_info,
                             bi_id,
                             &operand_name_overrides,
-                        );
+                            &mut main_block,
+                            "batch_norm",
+                        )?;
                         let bi_name = bcast_param(bi_name, "beta", &mut main_block.operations);
                         let biased_name = output_name.clone();
                         let mut add_in: HashMap<String, Argument> = HashMap::new();
@@ -11064,6 +11181,13 @@ impl CoremlMlProgramConverter {
                         output_name.clone()
                     };
                     let _ = final_name;
+                    if is_f16 {
+                        main_block.operations.push(Self::create_cast_operation(
+                            output_name,
+                            declared_output,
+                            "fp16",
+                        ));
+                    }
                     continue;
                 }
             }
