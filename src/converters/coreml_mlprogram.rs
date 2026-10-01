@@ -5781,8 +5781,11 @@ impl super::GraphConverter for CoremlMlProgramConverter {
             }
         }
 
-        // Add constant operands as const operations
-        for (operand_id, constant_data) in &graph_info.constant_operand_ids_to_handles {
+        // Stable operand order keeps weight bytes and BLOB offsets independent
+        // of HashMap seeds or insertion order without changing the graph.
+        let mut constants: Vec<_> = graph_info.constant_operand_ids_to_handles.iter().collect();
+        constants.sort_unstable_by_key(|(operand_id, _)| **operand_id);
+        for (operand_id, constant_data) in constants {
             let operand =
                 graph_info
                     .operand(*operand_id)
