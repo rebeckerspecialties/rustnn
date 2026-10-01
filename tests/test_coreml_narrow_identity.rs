@@ -109,6 +109,7 @@ fn signed_constant_copy_and_cast_retain_byte_storage_with_exact_reconstruction()
             Some(DataType::Int8),
             Some(DataType::Int32),
             Some(DataType::Float32),
+            Some(DataType::Float16),
         ] {
             let mut graph = identity_graph(
                 DataType::Int8,
@@ -129,6 +130,7 @@ fn signed_constant_copy_and_cast_retain_byte_storage_with_exact_reconstruction()
                         DataType::Int8 => MLOperandDataType::Int8,
                         DataType::Int32 => MLOperandDataType::Int32,
                         DataType::Float32 => MLOperandDataType::Float32,
+                        DataType::Float16 => MLOperandDataType::Float16,
                         _ => unreachable!(),
                     },
                 };
@@ -335,6 +337,53 @@ fn narrow_constant_identity_and_same_cast_keep_every_encoding_and_scalar() {
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "coreml-runtime"))]
+#[test]
+fn signed_constant_half_cast_loads_all_policy_and_keeps_exact_values() {
+    use rustnn::executors::coreml::run_coreml_with_inputs_with_weights;
+    use rustnn::operator_enums::MLOperandDataType;
+
+    for scalar in [false, true] {
+        let shape = if scalar {
+            vec![]
+        } else {
+            vec![Dimension::Static(256)]
+        };
+        let mut graph = identity_graph(DataType::Int8, shape, true);
+        graph.operands[1].descriptor.data_type = DataType::Float16;
+        graph.operations[0] = Operation::Cast {
+            input: 0,
+            outputs: vec![1],
+            data_type: MLOperandDataType::Float16,
+            options: None,
+        };
+        let expected: Vec<f32> = graph.constant_operand_ids_to_handles[&0]
+            .data
+            .iter()
+            .map(|&byte| f32::from(byte as i8))
+            .collect();
+        let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+        let attempts = run_coreml_with_inputs_with_weights(
+            &converted.data,
+            converted.weights_data.as_deref(),
+            vec![],
+        )
+        .unwrap();
+        for policy in ["ALL", "CPU_ONLY"] {
+            let attempt = attempts
+                .iter()
+                .find(|attempt| attempt.compute_unit == policy)
+                .unwrap();
+            let outputs = attempt
+                .result
+                .as_ref()
+                .unwrap_or_else(|error| panic!("{policy}, scalar={scalar}: {error}"));
+            assert_eq!(outputs.len(), 1);
+            assert_eq!(outputs[0].data, expected, "{policy}, scalar={scalar}");
         }
     }
 }

@@ -6869,29 +6869,29 @@ impl CoremlMlProgramConverter {
             }
         }
 
-        let signed_copy_constants: std::collections::HashSet<_> =
-            graph_info
-                .operations
-                .iter()
-                .filter_map(|operation| match operation {
-                    Operation::Identity { input, .. } => Some(*input),
-                    Operation::Cast {
-                        input,
-                        data_type:
-                            MLOperandDataType::Int8
-                            | MLOperandDataType::Int32
-                            | MLOperandDataType::Float32,
-                        ..
-                    } => Some(*input),
-                    _ => None,
+        let signed_copy_constants: std::collections::HashSet<_> = graph_info
+            .operations
+            .iter()
+            .filter_map(|operation| match operation {
+                Operation::Identity { input, .. } => Some(*input),
+                Operation::Cast {
+                    input,
+                    data_type:
+                        MLOperandDataType::Int8
+                        | MLOperandDataType::Int32
+                        | MLOperandDataType::Float16
+                        | MLOperandDataType::Float32,
+                    ..
+                } => Some(*input),
+                _ => None,
+            })
+            .filter(|&id| {
+                graph_info.operand(id).is_some_and(|operand| {
+                    operand.kind == crate::graph::OperandKind::Constant
+                        && operand.descriptor.data_type == DataType::Int8
                 })
-                .filter(|&id| {
-                    graph_info.operand(id).is_some_and(|operand| {
-                        operand.kind == crate::graph::OperandKind::Constant
-                            && operand.descriptor.data_type == DataType::Int8
-                    })
-                })
-                .collect();
+            })
+            .collect();
         let mut constant_names: std::collections::HashSet<_> = (0..graph_info.operands.len())
             .map(|id| operand_name(graph_info, id as u32))
             .chain(main_function.inputs.iter().map(|value| value.name.clone()))
