@@ -15,6 +15,7 @@ use crate::error::GraphError;
 use crate::graph::GraphInfo;
 
 mod coreml_mlprogram;
+pub(crate) mod coreml_names;
 #[cfg(feature = "litert-runtime")]
 pub mod litert;
 pub mod onnx;
@@ -34,6 +35,12 @@ pub mod webnn;
 mod weight_file_builder;
 
 pub use coreml_mlprogram::CoremlMlProgramConverter;
+#[cfg(feature = "coreml-runtime")]
+pub(crate) use coreml_mlprogram::CoremlPassthrough;
+#[cfg(all(feature = "coreml-runtime", target_os = "macos"))]
+pub(crate) use coreml_mlprogram::{
+    INPUT_ALIASES_METADATA_KEY, OUTPUT_ALIASES_METADATA_KEY, OUTPUT_PASSTHROUGHS_METADATA_KEY,
+};
 #[cfg(feature = "litert-runtime")]
 pub use litert::LiteRtConverter;
 pub use onnx::OnnxConverter;

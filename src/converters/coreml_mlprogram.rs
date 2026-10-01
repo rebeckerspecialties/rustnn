@@ -25,7 +25,7 @@
 /// - Better optimization
 ///
 /// This replaces the legacy NeuralNetwork format.
-use crate::converters::operand_name;
+use crate::converters::{coreml_names, operand_name as logical_operand_name};
 use crate::error::GraphError;
 use crate::graph::{DataType, Dimension as GraphDimension, GraphInfo, OperandKind};
 use crate::operator_enums::MLOperandDataType;
@@ -36,6 +36,134 @@ use crate::protos::coreml::mil_spec::{
     TensorType, ValueType, argument::binding::Binding, dimension,
 };
 use crate::protos::coreml::specification::Model;
+
+pub(crate) const OUTPUT_ALIASES_METADATA_KEY: &str = "rustnn.webnn.output_aliases";
+pub(crate) const INPUT_ALIASES_METADATA_KEY: &str = "rustnn.webnn.input_aliases";
+pub(crate) const OUTPUT_PASSTHROUGHS_METADATA_KEY: &str = "rustnn.webnn.output_passthroughs";
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct CoremlPassthrough {
+    pub(crate) input: String,
+    pub(crate) descriptor: crate::graph::OperandDescriptor,
+}
+
+/// Proven copies of a graph input can be fulfilled from its original binding.
+/// This avoids CoreML eliminating no-op outputs or changing their precision
+/// when another consumer narrows the same input. No runtime value comparison
+/// or output-name heuristic is involved.
+fn input_passthroughs(graph: &GraphInfo) -> std::collections::BTreeMap<String, CoremlPassthrough> {
+    let mut origins = vec![None; graph.operands.len()];
+    for &input in &graph.input_operands {
+        origins[input as usize] = Some(input);
+    }
+    for operation in &graph.operations {
+        let input = match operation {
+            Operation::Identity { input, .. } | Operation::Cast { input, .. } => *input,
+            _ => continue,
+        };
+        for &output in operation.output_operands() {
+            if let (Some(source), Some(destination)) = (graph.operand(input), graph.operand(output))
+                && source.descriptor.data_type == destination.descriptor.data_type
+                && source.descriptor.shape == destination.descriptor.shape
+                && source.descriptor.pending_permutation
+                    == destination.descriptor.pending_permutation
+            {
+                origins[output as usize] = origins[input as usize];
+            }
+        }
+    }
+    graph
+        .output_operands
+        .iter()
+        .filter_map(|&output| {
+            let operand = graph.operand(output)?;
+            // WebNN build() rejects an original input or constant as an output.
+            if operand.kind != OperandKind::Output {
+                return None;
+            }
+            let input = origins[output as usize]?;
+            Some((
+                logical_operand_name(graph, output),
+                CoremlPassthrough {
+                    input: logical_operand_name(graph, input),
+                    descriptor: operand.descriptor.clone(),
+                },
+            ))
+        })
+        .collect()
+}
+
+// Public WebNN names need not be MIL identifiers. Keep logical names outside
+// the converter and serialize their physical feature bindings in metadata.
+fn operand_name(graph: &GraphInfo, id: u32) -> String {
+    let logical = logical_operand_name(graph, id);
+    let repeated = (0..id).any(|other| logical_operand_name(graph, other) == logical);
+    if !repeated {
+        return coreml_names::encode(&logical).into_owned();
+    }
+    let base = format!("__rustnn_operand_{id}");
+    let mut name = base.clone();
+    let mut suffix = 0usize;
+    while (0..graph.operands.len())
+        .any(|other| coreml_names::encode(&logical_operand_name(graph, other as u32)) == name)
+    {
+        suffix += 1;
+        name = format!("{base}_{suffix}");
+    }
+    name
+}
+
+/// Coalesce public copies only when the source graph proves identical values,
+/// shape and dtype. CoreML may elide duplicate copy outputs at prediction time.
+fn equivalent_output_names(graph: &GraphInfo) -> HashMap<String, String> {
+    fn root(parents: &[usize], mut id: usize) -> usize {
+        while parents[id] != id {
+            id = parents[id];
+        }
+        id
+    }
+    let mut parents: Vec<_> = (0..graph.operands.len()).collect();
+    let mut producers = HashMap::new();
+    for (order, operation) in graph.operations.iter().enumerate() {
+        let source = match operation {
+            Operation::Identity { input, .. } | Operation::Cast { input, .. } => Some(*input),
+            _ => None,
+        };
+        for &output in operation.output_operands() {
+            producers.insert(output, order);
+            if let Some(input) = source
+                && let (Some(input_operand), Some(output_operand)) =
+                    (graph.operand(input), graph.operand(output))
+                && input_operand.descriptor.data_type == output_operand.descriptor.data_type
+                && input_operand.descriptor.shape == output_operand.descriptor.shape
+                && input_operand.descriptor.pending_permutation
+                    == output_operand.descriptor.pending_permutation
+            {
+                parents[output as usize] = root(&parents, input as usize);
+            }
+        }
+    }
+    let mut canonical = HashMap::<usize, u32>::new();
+    for &id in &graph.output_operands {
+        let group = root(&parents, id as usize);
+        canonical
+            .entry(group)
+            .and_modify(|chosen| {
+                if producers.get(&id) < producers.get(chosen) {
+                    *chosen = id;
+                }
+            })
+            .or_insert(id);
+    }
+    graph
+        .output_operands
+        .iter()
+        .filter_map(|&id| {
+            let chosen = canonical[&root(&parents, id as usize)];
+            (id != chosen).then(|| (operand_name(graph, id), operand_name(graph, chosen)))
+        })
+        .collect()
+}
 use prost::Message;
 use std::collections::HashMap;
 
@@ -10470,7 +10598,66 @@ impl super::GraphConverter for CoremlMlProgramConverter {
             main_block.outputs.push(output_name);
         }
 
-        // CoreML rejects, at MLModel load time ("Error in declaring input X with
+        let value_types: HashMap<_, _> = main_function
+            .inputs
+            .iter()
+            .chain(
+                main_block
+                    .operations
+                    .iter()
+                    .flat_map(|operation| &operation.outputs),
+            )
+            .map(|value| (value.name.clone(), value.r#type.clone()))
+            .collect();
+        for operation in &mut main_block.operations {
+            let source = operation
+                .inputs
+                .get("x")
+                .and_then(|argument| argument.arguments.first())
+                .and_then(|binding| match &binding.binding {
+                    Some(Binding::Name(name)) => value_types.get(name),
+                    _ => None,
+                });
+            if operation.r#type == "cast"
+                && source.is_some_and(|value| matches!(value,
+                    Some(ValueType { r#type: Some(crate::protos::coreml::mil_spec::value_type::Type::TensorType(tensor)) })
+                    if tensor.data_type == crate::protos::coreml::mil_spec::DataType::Float32 as i32))
+                && operation.outputs.iter().all(|output| source == Some(&output.r#type))
+            {
+                operation.r#type = "identity".into();
+                operation.inputs.remove("dtype");
+            }
+        }
+
+        let equivalent_outputs = equivalent_output_names(graph_info);
+        if !equivalent_outputs.is_empty() {
+            main_block.operations.retain(|operation| {
+                !operation
+                    .outputs
+                    .iter()
+                    .any(|output| equivalent_outputs.contains_key(&output.name))
+            });
+            for operation in &mut main_block.operations {
+                for argument in operation.inputs.values_mut() {
+                    for binding in &mut argument.arguments {
+                        if let Some(Binding::Name(name)) = &mut binding.binding
+                            && let Some(canonical) = equivalent_outputs.get(name)
+                        {
+                            *name = canonical.clone();
+                        }
+                    }
+                }
+            }
+            for name in &mut main_block.outputs {
+                if let Some(canonical) = equivalent_outputs.get(name) {
+                    *name = canonical.clone();
+                }
+            }
+            let mut retained = std::collections::HashSet::new();
+            main_block
+                .outputs
+                .retain(|name| retained.insert(name.clone()));
+        }
         // error -1."), a function input that no operation consumes — e.g.
         // castLike's target_type (only its dtype matters, never its values) or
         // an input whose sole consumer was constant-folded away. Drop such
@@ -10525,7 +10712,9 @@ impl super::GraphConverter for CoremlMlProgramConverter {
         // Single-function MLProgram models must use model-level I/O (not the
         // `functions` field), otherwise CoreML rejects them with
         // "multi-function description syntax" at load time.
-        use crate::protos::coreml::specification::{FeatureDescription, ModelDescription};
+        use crate::protos::coreml::specification::{
+            FeatureDescription, Metadata, ModelDescription,
+        };
 
         let mut input_descriptions = Vec::new();
         for &input_id in &graph_info.input_operands {
@@ -10548,6 +10737,16 @@ impl super::GraphConverter for CoremlMlProgramConverter {
         for &output_id in &graph_info.output_operands {
             if let Some(operand) = graph_info.operand(output_id) {
                 let output_name = operand_name(graph_info, output_id);
+                let output_name = equivalent_outputs
+                    .get(&output_name)
+                    .cloned()
+                    .unwrap_or(output_name);
+                if output_descriptions
+                    .iter()
+                    .any(|description: &FeatureDescription| description.name == output_name)
+                {
+                    continue;
+                }
                 // For int32 proxy outputs (argmin/argmax, or any wide int64/uint32/uint64
                 // output) use Int32 at the model interface to match the function emit type.
                 let feature_type = if int32_proxy_output_names.contains(&output_name)
@@ -10567,9 +10766,69 @@ impl super::GraphConverter for CoremlMlProgramConverter {
             }
         }
 
+        let aliases: std::collections::BTreeMap<_, _> = graph_info
+            .output_operands
+            .iter()
+            .map(|&id| {
+                let logical = logical_operand_name(graph_info, id);
+                let physical = operand_name(graph_info, id);
+                let physical = equivalent_outputs
+                    .get(&physical)
+                    .cloned()
+                    .unwrap_or(physical);
+                (logical, physical)
+            })
+            .collect();
+        let inputs: std::collections::BTreeMap<_, _> = graph_info
+            .input_operands
+            .iter()
+            .map(|&id| {
+                (
+                    logical_operand_name(graph_info, id),
+                    operand_name(graph_info, id),
+                )
+            })
+            .filter(|(_, physical)| declared_input_names.contains(physical))
+            .collect();
+        let outputs_changed = aliases
+            .iter()
+            .any(|(logical, physical)| logical != physical);
+        let inputs_changed = inputs.iter().any(|(logical, physical)| logical != physical);
+        let passthroughs = input_passthroughs(graph_info);
+        let metadata = Some(Metadata {
+            user_defined: [
+                (OUTPUT_ALIASES_METADATA_KEY, &aliases, outputs_changed),
+                (INPUT_ALIASES_METADATA_KEY, &inputs, inputs_changed),
+            ]
+            .into_iter()
+            .filter(|(_, _, changed)| *changed)
+            .map(|(key, bindings, _)| {
+                serde_json::to_string(bindings)
+                    .map(|value| (key.into(), value))
+                    .map_err(|error| GraphError::ConversionFailed {
+                        format: "coreml_mlprogram".into(),
+                        reason: format!("cannot serialize feature aliases: {error}"),
+                    })
+            })
+            .chain((!passthroughs.is_empty()).then(|| {
+                serde_json::to_string(&passthroughs)
+                    .map(|value| (OUTPUT_PASSTHROUGHS_METADATA_KEY.into(), value))
+                    .map_err(|error| GraphError::ConversionFailed {
+                        format: "coreml_mlprogram".into(),
+                        reason: format!("cannot serialize proven input copies: {error}"),
+                    })
+            }))
+            .chain(std::iter::once(Ok((
+                coreml_names::METADATA_KEY.into(),
+                coreml_names::METADATA_VALUE.into(),
+            ))))
+            .collect::<Result<_, _>>()?,
+            ..Default::default()
+        });
         model.description = Some(ModelDescription {
             input: input_descriptions,
             output: output_descriptions,
+            metadata,
             ..Default::default()
         });
 
