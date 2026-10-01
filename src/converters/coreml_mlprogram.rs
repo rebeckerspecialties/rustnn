@@ -705,6 +705,94 @@ impl CoremlMlProgramConverter {
     }
 
     /// Create a const operation for a constant operand
+    fn create_signed_byte_const_operations(
+        graph: &GraphInfo,
+        operand_id: u32,
+        constant_data: &crate::graph::ConstantData,
+        weight_builder: &mut super::WeightFileBuilder,
+        occupied: &mut std::collections::HashSet<String>,
+    ) -> Result<Vec<MilOperation>, GraphError> {
+        use crate::protos::coreml::mil_spec::DataType as MilType;
+
+        let operand = graph
+            .operand(operand_id)
+            .ok_or_else(|| GraphError::ConversionFailed {
+                format: "coreml_mlprogram".into(),
+                reason: format!("Signed constant operand {operand_id} not found"),
+            })?;
+        let source_name = operand_name(graph, operand_id);
+        let mut fresh = |suffix: &str| {
+            let base = format!("{source_name}_signed_constant_{suffix}");
+            let mut candidate = base.clone();
+            let mut index = 0;
+            while !occupied.insert(candidate.clone()) {
+                index += 1;
+                candidate = format!("{base}_{index}");
+            }
+            candidate
+        };
+        let shape = &operand.descriptor.shape;
+        let stored = fresh("storage");
+        let unsigned =
+            Self::create_named_value_type(fresh("unsigned"), MilType::Int32 as i32, shape, false);
+        let high = Self::create_named_value_type(fresh("high"), MilType::Bool as i32, shape, false);
+        let negative =
+            Self::create_named_value_type(fresh("negative"), MilType::Int32 as i32, shape, false);
+        let signed =
+            Self::create_named_value_type(fresh("value"), MilType::Int32 as i32, shape, false);
+        let original =
+            Self::create_named_value_type(source_name, MilType::Int8 as i32, shape, false);
+        // A signed-byte BLOB cast cannot build an accelerator-enabled plan on
+        // some stacks. Keep the byte payload intact and interpret it privately
+        // as unsigned storage, then reconstruct its signed numeric value.
+        let mut storage_operand = operand.clone();
+        storage_operand.descriptor.data_type = DataType::Uint8;
+        let mut constant = Self::create_const_operation(
+            graph,
+            operand_id,
+            &storage_operand,
+            constant_data,
+            weight_builder,
+        )?;
+        constant.outputs[0].name = stored.clone();
+        Ok(vec![
+            constant,
+            Self::create_cast_operation(stored, unsigned.clone(), "int32"),
+            Self::create_mil_operation(
+                mil_ops::GREATER_EQUAL,
+                HashMap::from([
+                    (
+                        "x".into(),
+                        Self::create_name_argument(unsigned.name.clone()),
+                    ),
+                    ("y".into(), Self::create_immediate_int(128)),
+                ]),
+                vec![high.clone()],
+            ),
+            Self::create_mil_operation(
+                mil_ops::SUB,
+                HashMap::from([
+                    (
+                        "x".into(),
+                        Self::create_name_argument(unsigned.name.clone()),
+                    ),
+                    ("y".into(), Self::create_immediate_int(256)),
+                ]),
+                vec![negative.clone()],
+            ),
+            Self::create_mil_operation(
+                "select",
+                HashMap::from([
+                    ("cond".into(), Self::create_name_argument(high.name)),
+                    ("a".into(), Self::create_name_argument(negative.name)),
+                    ("b".into(), Self::create_name_argument(unsigned.name)),
+                ]),
+                vec![signed.clone()],
+            ),
+            Self::create_cast_operation(signed.name, original, "int8"),
+        ])
+    }
+
     fn create_const_operation(
         graph: &GraphInfo,
         operand_id: u32,
@@ -5909,6 +5997,40 @@ impl super::GraphConverter for CoremlMlProgramConverter {
             }
         }
 
+        let signed_copy_constants: std::collections::HashSet<_> =
+            graph_info
+                .operations
+                .iter()
+                .filter_map(|operation| match operation {
+                    Operation::Identity { input, .. } => Some(*input),
+                    Operation::Cast {
+                        input,
+                        data_type:
+                            MLOperandDataType::Int8
+                            | MLOperandDataType::Int32
+                            | MLOperandDataType::Float32,
+                        ..
+                    } => Some(*input),
+                    _ => None,
+                })
+                .filter(|&id| {
+                    graph_info.operand(id).is_some_and(|operand| {
+                        operand.kind == crate::graph::OperandKind::Constant
+                            && operand.descriptor.data_type == DataType::Int8
+                    })
+                })
+                .collect();
+        let mut constant_names: std::collections::HashSet<_> = (0..graph_info.operands.len())
+            .map(|id| operand_name(graph_info, id as u32))
+            .chain(main_function.inputs.iter().map(|value| value.name.clone()))
+            .chain(
+                main_block
+                    .operations
+                    .iter()
+                    .flat_map(|operation| operation.outputs.iter().map(|value| value.name.clone())),
+            )
+            .collect();
+
         // Add constant operands as const operations
         for (operand_id, constant_data) in &graph_info.constant_operand_ids_to_handles {
             let operand =
@@ -5929,7 +6051,20 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                 .filter(|expected| **expected != operand.descriptor.data_type)
                 .cloned();
 
-            if needs_squeeze || needs_type_coerce.is_some() {
+            if !needs_squeeze
+                && needs_type_coerce.is_none()
+                && signed_copy_constants.contains(operand_id)
+            {
+                main_block
+                    .operations
+                    .extend(Self::create_signed_byte_const_operations(
+                        graph_info,
+                        *operand_id,
+                        constant_data,
+                        &mut weight_builder,
+                        &mut constant_names,
+                    )?);
+            } else if needs_squeeze || needs_type_coerce.is_some() {
                 use crate::graph::OperandDescriptor;
 
                 // Compute the squeezed shape (or keep original if no squeezing needed).
@@ -8211,6 +8346,91 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                     "floor_div",
                     div_in_args,
                     vec![out_type],
+                ));
+                continue;
+            }
+
+            // MIL identity accepts int32, but not int8/uint8. A same-type
+            // Cast over a constant can also be elided without declaring its
+            // output. Materialize both copy forms through supported int32.
+            let narrow_copy = match op {
+                Operation::Identity { input, outputs, .. } => Some((input, outputs)),
+                Operation::Cast { input, outputs, .. }
+                    if graph_info.operand(*input).is_some_and(|operand| {
+                        outputs.first().is_some_and(|&output| {
+                            graph_info.operand(output).is_some_and(|result| {
+                                operand.descriptor.data_type == result.descriptor.data_type
+                            })
+                        })
+                    }) =>
+                {
+                    Some((input, outputs))
+                }
+                _ => None,
+            };
+            if let Some((input, outputs)) = narrow_copy
+                && let Some(operand) = graph_info.operand(*input)
+                && matches!(
+                    operand.descriptor.data_type,
+                    DataType::Int8 | DataType::Uint8
+                )
+                && let Some(&out_id) = outputs.first()
+            {
+                let (out_name, out_type) =
+                    Self::create_output_value(graph_info, out_id, &operand_name_overrides)?;
+                let int32 = crate::protos::coreml::mil_spec::DataType::Int32 as i32;
+                let mut occupied: std::collections::HashSet<String> =
+                    (0..graph_info.operands.len())
+                        .map(|id| {
+                            Self::output_name_for_operand(
+                                graph_info,
+                                id as u32,
+                                &operand_name_overrides,
+                            )
+                        })
+                        .chain(main_function.inputs.iter().map(|value| value.name.clone()))
+                        .chain(main_block.operations.iter().flat_map(|operation| {
+                            operation.outputs.iter().map(|value| value.name.clone())
+                        }))
+                        .collect();
+                let mut fresh = |suffix: &str| {
+                    let base = format!("{out_name}_{suffix}");
+                    let mut name = base.clone();
+                    let mut index = 0;
+                    while !occupied.insert(name.clone()) {
+                        index += 1;
+                        name = format!("{base}_{index}");
+                    }
+                    name
+                };
+                let int_input = Self::create_value_with_mil_type(
+                    graph_info,
+                    *input,
+                    fresh("narrow_identity_int_input"),
+                    int32,
+                )?;
+                let int_result = Self::create_value_with_mil_type(
+                    graph_info,
+                    out_id,
+                    fresh("narrow_identity_int_result"),
+                    int32,
+                )?;
+                let source =
+                    Self::output_name_for_operand(graph_info, *input, &operand_name_overrides);
+                main_block.operations.push(Self::create_cast_operation(
+                    source,
+                    int_input.clone(),
+                    "int32",
+                ));
+                main_block.operations.push(Self::create_mil_operation(
+                    mil_ops::IDENTITY,
+                    HashMap::from([("x".into(), Self::create_name_argument(int_input.name))]),
+                    vec![int_result.clone()],
+                ));
+                main_block.operations.push(Self::create_cast_operation(
+                    int_result.name,
+                    out_type,
+                    Self::cast_dtype_string_for_graph_type(&operand.descriptor.data_type)?,
                 ));
                 continue;
             }
