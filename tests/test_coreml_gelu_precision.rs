@@ -56,6 +56,65 @@ fn tensor_type(value: &mil_spec::NamedValueType) -> &mil_spec::TensorType {
     tensor
 }
 
+// Keep the erf oracle independent of hardware half conversion. The dependency's
+// binary64 software fallback drops sticky bits before rounding on older CPUs.
+fn reference_half_bits(value: f64) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 48) & 0x8000) as u16;
+    let exponent = ((bits >> 52) & 0x7ff) as i32;
+    let fraction = bits & ((1u64 << 52) - 1);
+    if exponent == 0x7ff {
+        return sign | if fraction == 0 { 0x7c00 } else { 0x7e00 };
+    }
+    if exponent == 0 {
+        return sign;
+    }
+    let exponent = exponent - 1023;
+    if exponent > 15 {
+        return sign | 0x7c00;
+    }
+    let significand = fraction | (1u64 << 52);
+    let round = |shift: u32| {
+        let retained = significand >> shift;
+        let discarded = significand & ((1u64 << shift) - 1);
+        let midpoint = 1u64 << (shift - 1);
+        retained + u64::from(discarded > midpoint || (discarded == midpoint && retained & 1 != 0))
+    };
+    if exponent >= -14 {
+        return sign | ((((exponent + 15) as u16) << 10) + (round(42) as u16 - 1024));
+    }
+    if exponent < -25 {
+        return sign;
+    }
+    sign | round((28 - exponent) as u32) as u16
+}
+
+#[test]
+fn gelu_reference_rounds_half_midpoint_neighbors_without_hardware_intrinsics() {
+    for lower in 0u16..0x7bff {
+        let a = half::f16::from_bits(lower).to_f64();
+        let b = half::f16::from_bits(lower + 1).to_f64();
+        let midpoint = (a + b) / 2.;
+        for (value, want) in [
+            (f64::from_bits(midpoint.to_bits() - 1), lower),
+            (midpoint, lower + (lower & 1)),
+            (f64::from_bits(midpoint.to_bits() + 1), lower + 1),
+        ] {
+            assert_eq!(reference_half_bits(value), want, "input={value:?}");
+            assert_eq!(reference_half_bits(-value), want | 0x8000);
+        }
+    }
+    assert_eq!(
+        reference_half_bits(1. + 2f64.powi(-11) + 2f64.powi(-25)),
+        0x3c01
+    );
+    assert_eq!(reference_half_bits(-0.), 0x8000);
+    assert_eq!(reference_half_bits(65520.), 0x7c00);
+    assert_eq!(reference_half_bits(f64::INFINITY), 0x7c00);
+    assert_eq!(reference_half_bits(f64::NEG_INFINITY), 0xfc00);
+    assert!(half::f16::from_bits(reference_half_bits(f64::NAN)).is_nan());
+}
+
 #[test]
 fn gelu_float32_keeps_native_evaluation_without_boundary_casts() {
     let block = block(&graph(DataType::Float32, vec![Dimension::Static(11)]));
@@ -131,7 +190,7 @@ mod runtime {
         let value = f16::from_bits(input).to_f64();
         // SAFETY: erf accepts every f64, including infinities and NaNs.
         let erf_value = unsafe { erf(value / std::f64::consts::SQRT_2) };
-        f16::from_f64(0.5 * value * (1.0 + erf_value)).to_bits()
+        reference_half_bits(0.5 * value * (1.0 + erf_value))
     }
 
     fn check_output(input: u16, actual: u16, expected: u16, policy: DeviceType) {
