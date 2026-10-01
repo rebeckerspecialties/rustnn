@@ -328,7 +328,7 @@ fn check_kernel(graph: GraphInfo, kernel: &str) -> Vec<mil_spec::Operation> {
     operations
 }
 
-fn check_batch_norm(graph: GraphInfo, epsilon: f32) {
+fn check_batch_norm(graph: GraphInfo, epsilon: f64) {
     use mil_spec::{argument::binding::Binding, tensor_value, value};
     let operations = check_kernel(graph, "real_div");
     assert!(operations.iter().all(|op| op.r#type != "batch_norm"));
@@ -354,7 +354,7 @@ fn check_batch_norm(graph: GraphInfo, epsilon: f32) {
             let Some(tensor_value::Value::Floats(values)) = tensor.value.as_ref() else {
                 return false;
             };
-            values.values == [half::f16::from_f32(epsilon).to_f32()]
+            values.values == [half::f16::from_f64(epsilon).to_f32()]
         }),
         "the complete formula uses source-Half-rounded epsilon"
     );
@@ -370,6 +370,40 @@ fn check_batch_norm(graph: GraphInfo, epsilon: f32) {
                 .iter()
                 .all(|value| tensor_dtype(value) == mil_spec::DataType::Float32 as i32)
         );
+    }
+}
+
+#[test]
+fn half_batch_norm_rounds_epsilon_directly_from_binary64() {
+    for epsilon in [
+        2f64.powi(-25) + 2f64.powi(-55),
+        1.00048828125 - 2f64.powi(-40),
+        1.00048828125 + 2f64.powi(-40),
+    ] {
+        let graph = GraphInfo {
+            operands: vec![
+                operand("input", &[1, 1, 1, 2], OperandKind::Input),
+                operand("mean", &[1], OperandKind::Constant),
+                operand("variance", &[1], OperandKind::Constant),
+                operand("result", &[1, 1, 1, 2], OperandKind::Output),
+            ],
+            input_operands: vec![0],
+            output_operands: vec![3],
+            operations: vec![
+                Operation::from_json_attributes(
+                    "batchNormalization",
+                    &[0, 1, 2],
+                    &[3],
+                    &json!({"epsilon":epsilon}),
+                )
+                .unwrap(),
+            ],
+            constant_operand_ids_to_handles: [(1, constant(&[0.])), (2, constant(&[0.]))]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        check_batch_norm(graph, epsilon);
     }
 }
 
