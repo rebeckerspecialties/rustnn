@@ -267,6 +267,22 @@ fn absent_instance_norm_options_round_the_default_epsilon_to_source_half() {
 }
 
 #[test]
+fn half_instance_norm_rounds_epsilon_directly_from_binary64() {
+    for layout in ["nchw", "nhwc"] {
+        for epsilon in [
+            2f64.powi(-25) + 2f64.powi(-55),
+            1.00048828125 - 2f64.powi(-40),
+            1.00048828125 + 2f64.powi(-40),
+        ] {
+            check(
+                &graph(layout, Some(epsilon)),
+                half::f16::from_f64(epsilon).to_f32(),
+            );
+        }
+    }
+}
+
+#[test]
 #[cfg(feature = "dynamic-inputs")]
 fn half_instance_norm_keeps_dynamic_batch_bounds_for_each_layout() {
     for layout in ["nchw", "nhwc"] {

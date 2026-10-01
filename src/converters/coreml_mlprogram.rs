@@ -9045,10 +9045,10 @@ impl CoremlMlProgramConverter {
                     .first()
                     .and_then(|&id| graph_info.operand(id))
                     .is_some_and(|operand| operand.descriptor.data_type == DataType::Float16);
-                let half_layer_norm = layer_norm && half_normalization;
                 if is_runtime(scale_id)
                     || is_runtime(bias_id)
-                    || ((layer_norm || half_normalization) && (scale_id.is_some() || bias_id.is_some()))
+                    || ((layer_norm || half_normalization)
+                        && (scale_id.is_some() || bias_id.is_some()))
                 {
                     let x_id = *op.input_operands().first().ok_or_else(|| {
                         GraphError::ConversionFailed {
