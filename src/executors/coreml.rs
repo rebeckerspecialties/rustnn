@@ -19,6 +19,11 @@ use objc::runtime::{Class, Object};
 use objc::{class, msg_send, sel, sel_impl};
 
 use super::coreml_dtype::{ArrayLayout, NativeType, boundary_error, from_native, to_native};
+use crate::converters::{CoremlPassthrough, coreml_names};
+#[cfg(target_os = "macos")]
+use crate::converters::{
+    INPUT_ALIASES_METADATA_KEY, OUTPUT_ALIASES_METADATA_KEY, OUTPUT_PASSTHROUGHS_METADATA_KEY,
+};
 use crate::error::GraphError;
 use crate::graph::{DataType, Dimension, OperandDescriptor, get_static_or_max_size};
 use crate::runtime_checks::{RuntimeShapeState, TensorKind, validate_shape_data_length};
@@ -34,7 +39,9 @@ pub use load::{CoremlLoadDiagnostics, CoremlLoadFailure, CoremlLoadRoute};
 unsafe extern "C" {}
 #[cfg(target_os = "macos")]
 #[link(name = "CoreML", kind = "framework")]
-unsafe extern "C" {}
+unsafe extern "C" {
+    static MLModelCreatorDefinedKey: *mut Object;
+}
 
 // Objective-C++ exception firewall (src/executors/coreml_shim.mm).
 // Return codes: 0 = success, 1 = NSError, 2 = NSException, 3 = C++ exception.
@@ -266,7 +273,14 @@ pub(crate) struct CompiledCoremlModel {
     /// Compute unit the model was successfully loaded with (diagnostic only).
     compute_unit: &'static str,
     diagnostics: CoremlLoadDiagnostics,
+    aliases: Box<CoremlFeatureAliases>,
     backing: CoremlModelBacking,
+}
+
+struct CoremlFeatureAliases {
+    inputs: HashMap<String, String>,
+    outputs: HashMap<String, String>,
+    passthroughs: HashMap<String, CoremlPassthrough>,
 }
 
 enum CoremlModelBacking {
@@ -379,10 +393,23 @@ fn compile_model_from_asset(
             load_model_asset(asset, config)
         });
         if let Ok((model, name)) = loaded {
+            let aliases = match model_aliases(model) {
+                Ok(aliases) => aliases,
+                Err(error) => {
+                    let _: () = msg_send![model, release];
+                    let _: () = msg_send![asset, release];
+                    let _: () = msg_send![specification_data, release];
+                    if let Some(weights_data) = retained_weights_data {
+                        let _: () = msg_send![weights_data, release];
+                    }
+                    return Err(error);
+                }
+            };
             return Ok(CompiledCoremlModel {
                 model,
                 compute_unit: name,
                 diagnostics: trace.finish(route, name),
+                aliases: Box::new(aliases),
                 backing: CoremlModelBacking::InMemory {
                     asset,
                     specification_data,
@@ -436,10 +463,19 @@ fn compile_model_from_url(
         if let Ok((model, name)) = loaded {
             // The shim returns an owned (+1) model; `CompiledCoremlModel`'s
             // Drop releases it.
+            let aliases = match model_aliases(model) {
+                Ok(aliases) => aliases,
+                Err(error) => {
+                    let _: () = msg_send![model, release];
+                    let _ = std::fs::remove_dir_all(&compiled_dir);
+                    return Err(error);
+                }
+            };
             return Ok(CompiledCoremlModel {
                 model,
                 compute_unit: name,
                 diagnostics: trace.finish(route, name),
+                aliases: Box::new(aliases),
                 backing: CoremlModelBacking::OnDisk {
                     compiled_dir,
                     temp_model,
@@ -579,6 +615,10 @@ pub(crate) fn run_coreml_bytes(
     inputs: &HashMap<String, CoremlByteInput<'_>>,
     output_descriptors: &HashMap<String, OperandDescriptor>,
 ) -> Result<HashMap<String, Vec<u8>>, GraphError> {
+    // Snapshot proven copies before CoreML sees an input. Every logical output
+    // owns its own bytes; this is not a mutable alias of input tensor storage.
+    let passthroughs =
+        snapshot_byte_passthroughs(&model.aliases.passthroughs, inputs, output_descriptors)?;
     autoreleasepool(|| unsafe {
         let dict: *mut Object = msg_send![class!(NSMutableDictionary), dictionary];
 
@@ -591,7 +631,8 @@ pub(crate) fn run_coreml_bytes(
         let input_descs: *mut Object = msg_send![model_description, inputDescriptionsByName];
 
         for (name, input) in inputs {
-            let key = nsstring_from_str(name)?;
+            let physical = model.aliases.inputs.get(name).unwrap_or(name);
+            let key = nsstring_from_str(physical)?;
             let mut shape_i64: Vec<i64> = input
                 .descriptor
                 .static_or_max_shape()
@@ -644,9 +685,14 @@ pub(crate) fn run_coreml_bytes(
         // must release it once we're done extracting outputs.
         let _output_provider_guard = ReleaseOnDrop(output_provider);
 
-        let mut result = HashMap::with_capacity(output_descriptors.len());
+        let mut result = passthroughs;
+        result.reserve(output_descriptors.len().saturating_sub(result.len()));
         for (name, descriptor) in output_descriptors {
-            let key = nsstring_from_str(name)?;
+            if result.contains_key(name) {
+                continue;
+            }
+            let physical = model.aliases.outputs.get(name).unwrap_or(name);
+            let key = nsstring_from_str(physical)?;
             let value: *mut Object = msg_send![output_provider, featureValueForName: key];
             if value.is_null() {
                 return Err(GraphError::CoremlRuntimeFailed {
@@ -664,6 +710,65 @@ pub(crate) fn run_coreml_bytes(
         }
         Ok(result)
     })
+}
+
+fn snapshot_byte_passthroughs(
+    passthroughs: &HashMap<String, CoremlPassthrough>,
+    inputs: &HashMap<String, CoremlByteInput<'_>>,
+    outputs: &HashMap<String, OperandDescriptor>,
+) -> Result<HashMap<String, Vec<u8>>, GraphError> {
+    let mut result = HashMap::new();
+    let mut shapes = RuntimeShapeState::new();
+    for (name, proof) in passthroughs {
+        let input = inputs.get(&proof.input).ok_or_else(|| {
+            boundary_error(format!(
+                "proven output `{name}` requires input `{}`",
+                proof.input
+            ))
+        })?;
+        let output = outputs.get(name).ok_or_else(|| {
+            boundary_error(format!(
+                "proven output `{name}` is not a requested graph output"
+            ))
+        })?;
+        if input.descriptor.data_type != proof.descriptor.data_type
+            || output.data_type != proof.descriptor.data_type
+            || output.shape != proof.descriptor.shape
+            || output.pending_permutation != proof.descriptor.pending_permutation
+            || input.descriptor.pending_permutation != proof.descriptor.pending_permutation
+        {
+            return Err(boundary_error(format!(
+                "proven output `{name}` has inconsistent descriptors"
+            )));
+        }
+        let actual = input.descriptor.static_shape().ok_or_else(|| {
+            boundary_error(format!(
+                "proven input `{}` requires an actual bound shape",
+                proof.input
+            ))
+        })?;
+        let actual: Vec<_> = actual
+            .into_iter()
+            .map(|dimension| dimension as usize)
+            .collect();
+        shapes.validate_shape(&proof.input, &actual, &proof.descriptor, TensorKind::Input)?;
+        shapes.validate_shape(name, &actual, output, TensorKind::Output)?;
+        let expected = input.descriptor.byte_length().ok_or_else(|| {
+            boundary_error(format!(
+                "proven input `{}` byte length overflow",
+                proof.input
+            ))
+        })?;
+        if input.data.len() != expected {
+            return Err(boundary_error(format!(
+                "proven input `{}` byte length mismatch: expected {expected}, got {}",
+                proof.input,
+                input.data.len()
+            )));
+        }
+        result.insert(name.clone(), input.data.to_vec());
+    }
+    Ok(result)
 }
 
 /// Read the actual allocation type and validate layout metadata before touching
@@ -834,11 +939,13 @@ fn run_impl_zeroed_with_weights(
             let _model_guard = ReleaseOnDrop(model);
             let model_description: *mut Object = msg_send![model, modelDescription];
             let input_descs: *mut Object = msg_send![model_description, inputDescriptionsByName];
+            let input_aliases = model_input_aliases(model)?;
 
             let dict: *mut Object = msg_send![class!(NSMutableDictionary), dictionary];
             let mut feature_err: Option<String> = None;
             for (name, descriptor) in inputs {
-                let key = nsstring_from_str(name)?;
+                let physical = input_aliases.get(name).unwrap_or(name);
+                let key = nsstring_from_str(physical)?;
                 let desc_obj: *mut Object = msg_send![input_descs, objectForKey: key];
                 let (shape, data_type_code) = if desc_obj.is_null() {
                     (
@@ -899,6 +1006,8 @@ fn run_impl_zeroed_with_weights(
             }
             let _provider_guard = ReleaseOnDrop(provider);
 
+            let passthroughs = snapshot_provider_passthroughs(provider, model, None)?;
+
             let mut output_provider: *mut Object = ptr::null_mut();
             let mut error = [0u8; 1024];
             let status = rustnn_coreml_predict(
@@ -921,7 +1030,7 @@ fn run_impl_zeroed_with_weights(
             // The shim returns a retained provider; release it after collecting.
             let _output_provider_guard = ReleaseOnDrop(output_provider);
 
-            match collect_outputs(output_provider, model, None) {
+            match collect_outputs(output_provider, model, None, &passthroughs) {
                 Ok(outputs) => attempts.push(CoremlRunAttempt {
                     compute_unit: name,
                     result: Ok(outputs),
@@ -1017,13 +1126,15 @@ fn run_impl_with_inputs_with_weights(
             // Get model input descriptions to query expected data types
             let model_description: *mut Object = msg_send![model, modelDescription];
             let input_descs: *mut Object = msg_send![model_description, inputDescriptionsByName];
+            let input_aliases = model_input_aliases(model)?;
 
             let dict: *mut Object = msg_send![class!(NSMutableDictionary), dictionary];
             let mut feature_err: Option<String> = None;
 
             // Create input features with actual data
             for input in &inputs {
-                let key = nsstring_from_str(&input.name)?;
+                let physical = input_aliases.get(&input.name).unwrap_or(&input.name);
+                let key = nsstring_from_str(physical)?;
                 let shape_i64: Vec<i64> = input.shape.iter().map(|&s| s as i64).collect();
 
                 // Query model's expected data type for this input
@@ -1089,6 +1200,8 @@ fn run_impl_with_inputs_with_weights(
             }
             let _provider_guard = ReleaseOnDrop(provider);
 
+            let passthroughs = snapshot_provider_passthroughs(provider, model, output_descriptors)?;
+
             let mut output_provider: *mut Object = ptr::null_mut();
             let mut error = [0u8; 1024];
             let status = rustnn_coreml_predict(
@@ -1111,7 +1224,7 @@ fn run_impl_with_inputs_with_weights(
             // The shim returns a retained provider; release it after collecting.
             let _output_provider_guard = ReleaseOnDrop(output_provider);
 
-            match collect_outputs(output_provider, model, output_descriptors) {
+            match collect_outputs(output_provider, model, output_descriptors, &passthroughs) {
                 Ok(outputs) => attempts.push(CoremlRunAttempt {
                     compute_unit: name,
                     result: Ok(outputs),
@@ -1204,14 +1317,220 @@ unsafe fn nsarray_to_strings(array: *mut Object) -> Vec<String> {
         .collect()
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn parse_output_aliases(
+    json: &str,
+    declared_outputs: &[String],
+) -> Result<HashMap<String, String>, GraphError> {
+    parse_feature_aliases(json, declared_outputs, "output", true)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_feature_aliases(
+    json: &str,
+    declared: &[String],
+    kind: &str,
+    shared: bool,
+) -> Result<HashMap<String, String>, GraphError> {
+    let aliases: HashMap<String, String> =
+        serde_json::from_str(json).map_err(|error| GraphError::CoremlRuntimeFailed {
+            reason: format!("invalid CoreML {kind} alias metadata: {error}"),
+        })?;
+    let mut physical_names = std::collections::HashSet::new();
+    for (logical, physical) in &aliases {
+        if logical.is_empty()
+            || physical.is_empty()
+            || !declared.contains(physical)
+            || (!shared && !physical_names.insert(physical))
+            || (logical != physical
+                && declared.contains(logical)
+                && !aliases.values().any(|binding| binding == logical))
+        {
+            return Err(GraphError::CoremlRuntimeFailed {
+                reason: format!("invalid CoreML {kind} alias `{logical}` -> `{physical}`"),
+            });
+        }
+    }
+    Ok(aliases)
+}
+
+unsafe fn model_output_aliases(model: *mut Object) -> Result<HashMap<String, String>, GraphError> {
+    unsafe { model_feature_aliases(model, false) }
+}
+
+unsafe fn model_input_aliases(model: *mut Object) -> Result<HashMap<String, String>, GraphError> {
+    unsafe { model_feature_aliases(model, true) }
+}
+
+unsafe fn model_aliases(model: *mut Object) -> Result<CoremlFeatureAliases, GraphError> {
+    let inputs = unsafe { model_input_aliases(model)? };
+    let outputs = unsafe { model_output_aliases(model)? };
+    let passthroughs = unsafe { model_passthroughs(model, &inputs, &outputs)? };
+    Ok(CoremlFeatureAliases {
+        inputs,
+        outputs,
+        passthroughs,
+    })
+}
+
+fn parse_passthroughs(
+    json: &str,
+    inputs: &HashMap<String, String>,
+    outputs: &HashMap<String, String>,
+    declared_inputs: &[String],
+    declared_outputs: &[String],
+) -> Result<HashMap<String, CoremlPassthrough>, GraphError> {
+    let proofs: HashMap<String, CoremlPassthrough> = serde_json::from_str(json)
+        .map_err(|error| boundary_error(format!("invalid CoreML input-copy metadata: {error}")))?;
+    for (output, proof) in &proofs {
+        let input_feature = inputs.get(&proof.input).unwrap_or(&proof.input);
+        let output_feature = outputs.get(output).unwrap_or(output);
+        if output.is_empty()
+            || proof.input.is_empty()
+            || !declared_inputs.contains(input_feature)
+            || !declared_outputs.contains(output_feature)
+        {
+            return Err(boundary_error(format!(
+                "invalid proven output `{output}` from input `{}`",
+                proof.input
+            )));
+        }
+    }
+    Ok(proofs)
+}
+
+unsafe fn model_passthroughs(
+    model: *mut Object,
+    inputs: &HashMap<String, String>,
+    outputs: &HashMap<String, String>,
+) -> Result<HashMap<String, CoremlPassthrough>, GraphError> {
+    #[cfg(target_os = "macos")]
+    {
+        let description: *mut Object = msg_send![model, modelDescription];
+        let Some(json) =
+            (unsafe { model_metadata_value(model, OUTPUT_PASSTHROUGHS_METADATA_KEY)? })
+        else {
+            return Ok(HashMap::new());
+        };
+        let input_features: *mut Object = msg_send![description, inputDescriptionsByName];
+        let output_features: *mut Object = msg_send![description, outputDescriptionsByName];
+        let input_keys: *mut Object = msg_send![input_features, allKeys];
+        let output_keys: *mut Object = msg_send![output_features, allKeys];
+        parse_passthroughs(
+            &json,
+            inputs,
+            outputs,
+            &unsafe { nsarray_to_strings(input_keys) },
+            &unsafe { nsarray_to_strings(output_keys) },
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (model, inputs, outputs);
+        Ok(HashMap::new())
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn model_metadata_value(
+    model: *mut Object,
+    key: &str,
+) -> Result<Option<String>, GraphError> {
+    let description: *mut Object = msg_send![model, modelDescription];
+    if description.is_null() {
+        return Err(boundary_error("CoreML model has no description"));
+    }
+    let metadata: *mut Object = msg_send![description, metadata];
+    if metadata.is_null() {
+        return Ok(None);
+    }
+    let creator_key = unsafe { MLModelCreatorDefinedKey };
+    let user_defined: *mut Object = msg_send![metadata, objectForKey: creator_key];
+    if user_defined.is_null() {
+        return Ok(None);
+    }
+    let key = unsafe { nsstring_from_str(key)? };
+    let value: *mut Object = msg_send![user_defined, objectForKey: key];
+    Ok((!value.is_null()).then(|| unsafe { nsstring_to_string(value) }))
+}
+
+unsafe fn model_feature_aliases(
+    model: *mut Object,
+    input: bool,
+) -> Result<HashMap<String, String>, GraphError> {
+    #[cfg(target_os = "macos")]
+    {
+        let description: *mut Object = msg_send![model, modelDescription];
+        let json = unsafe {
+            model_metadata_value(
+                model,
+                if input {
+                    INPUT_ALIASES_METADATA_KEY
+                } else {
+                    OUTPUT_ALIASES_METADATA_KEY
+                },
+            )?
+        };
+        let legacy = unsafe { model_metadata_value(model, coreml_names::METADATA_KEY)? }.as_deref()
+            == Some(coreml_names::METADATA_VALUE);
+        if json.is_none() && !legacy {
+            return Ok(HashMap::new());
+        }
+        let features: *mut Object = if input {
+            msg_send![description, inputDescriptionsByName]
+        } else {
+            msg_send![description, outputDescriptionsByName]
+        };
+        let keys: *mut Object = msg_send![features, allKeys];
+        let declared = unsafe { nsarray_to_strings(keys) };
+        let Some(json) = json else {
+            // Older exports carry only the reversible-name marker. Decode
+            // declared features only when that model explicitly opts in.
+            return Ok(declared
+                .into_iter()
+                .filter_map(|physical| {
+                    let logical = coreml_names::decode(&physical).into_owned();
+                    (logical != physical).then_some((logical, physical))
+                })
+                .collect());
+        };
+        if input {
+            parse_feature_aliases(&json, &declared, "input", false)
+        } else {
+            parse_output_aliases(&json, &declared)
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (model, input);
+        Ok(HashMap::new())
+    }
+}
+
 unsafe fn collect_outputs(
     provider: *mut Object,
     model: *mut Object,
     expected: Option<&HashMap<String, OperandDescriptor>>,
+    passthroughs: &HashMap<String, CoremlOutput>,
 ) -> Result<Vec<CoremlOutput>, GraphError> {
     let feature_names: *mut Object = msg_send![provider, featureNames];
     let names_array: *mut Object = msg_send![feature_names, allObjects];
-    let advertised_names = unsafe { nsarray_to_strings(names_array) };
+    let aliases = unsafe { model_output_aliases(model)? };
+    let mut advertised_names: Vec<_> = unsafe { nsarray_to_strings(names_array) }
+        .into_iter()
+        .flat_map(|name| {
+            let logical: Vec<_> = aliases
+                .iter()
+                .filter_map(|(logical, physical)| (physical == &name).then_some(logical.clone()))
+                .collect();
+            if logical.is_empty() {
+                vec![name]
+            } else {
+                logical
+            }
+        })
+        .collect();
+    advertised_names.extend(passthroughs.keys().cloned());
 
     let lookup_error = |name: &str, detail: &str| {
         let model_description: *mut Object = msg_send![model, modelDescription];
@@ -1228,7 +1547,11 @@ unsafe fn collect_outputs(
     };
 
     collect_named_outputs(advertised_names.clone(), expected, |name| {
-        let name_obj = unsafe { nsstring_from_str(name)? };
+        if let Some(output) = passthroughs.get(name) {
+            return Ok(output.clone());
+        }
+        let physical = aliases.get(name).map_or(name, String::as_str);
+        let name_obj = unsafe { nsstring_from_str(physical)? };
         let value: *mut Object = msg_send![provider, featureValueForName: name_obj];
         if value.is_null() {
             return Err(lookup_error(name, "direct lookup returned nil"));
@@ -1255,6 +1578,84 @@ unsafe fn collect_outputs(
             data,
         })
     })
+}
+
+/// Snapshot the already-converted input provider, before prediction can reuse
+/// or mutate native storage. The legacy f32 convenience API keeps its existing
+/// numeric conversion; typed dispatch uses the exact-byte snapshot above.
+unsafe fn snapshot_provider_passthroughs(
+    provider: *mut Object,
+    model: *mut Object,
+    expected: Option<&HashMap<String, OperandDescriptor>>,
+) -> Result<HashMap<String, CoremlOutput>, GraphError> {
+    let aliases = unsafe { model_aliases(model)? };
+    let mut result = HashMap::new();
+    let mut shapes = RuntimeShapeState::new();
+    for (output, proof) in aliases.passthroughs {
+        if let Some(expected) = expected {
+            let descriptor = expected.get(&output).ok_or_else(|| {
+                boundary_error(format!(
+                    "proven output `{output}` is not a requested graph output"
+                ))
+            })?;
+            if descriptor.data_type != proof.descriptor.data_type
+                || descriptor.shape != proof.descriptor.shape
+                || descriptor.pending_permutation != proof.descriptor.pending_permutation
+            {
+                return Err(boundary_error(format!(
+                    "proven output `{output}` has inconsistent descriptors"
+                )));
+            }
+        }
+        let input = aliases.inputs.get(&proof.input).unwrap_or(&proof.input);
+        let key = unsafe { nsstring_from_str(input)? };
+        let value: *mut Object = msg_send![provider, featureValueForName: key];
+        if value.is_null() {
+            return Err(boundary_error(format!(
+                "proven output `{output}` requires input `{}`",
+                proof.input
+            )));
+        }
+        let array: *mut Object = msg_send![value, multiArrayValue];
+        if array.is_null() {
+            return Err(boundary_error(format!(
+                "proven input `{}` is not a MLMultiArray",
+                proof.input
+            )));
+        }
+        let dtype: i64 = msg_send![array, dataType];
+        if dtype != i64::from(map_dtype(proof.descriptor.data_type)) {
+            return Err(boundary_error(format!(
+                "proven input `{}` has unexpected native dtype {dtype}",
+                proof.input
+            )));
+        }
+        let array_shape: *mut Object = msg_send![array, shape];
+        let mut shape = unsafe { nsarray_to_i64_vec(array_shape)? };
+        if proof.descriptor.shape.is_empty() && shape == [1] {
+            shape.clear();
+        }
+        let actual: Vec<_> = shape
+            .iter()
+            .map(|&dimension| {
+                usize::try_from(dimension)
+                    .map_err(|_| boundary_error("proven input has a negative dimension"))
+            })
+            .collect::<Result<_, _>>()?;
+        shapes.validate_shape(&proof.input, &actual, &proof.descriptor, TensorKind::Input)?;
+        let data = unsafe { extract_mlmultiarray_data(array)? };
+        validate_shape_data_length(&proof.input, &actual, data.len())?;
+        result.insert(
+            output.clone(),
+            CoremlOutput {
+                name: output,
+                shape,
+                data_type_code: dtype,
+                data,
+            },
+        );
+    }
+    Ok(result)
 }
 
 unsafe fn extract_mlmultiarray_data(array: *mut Object) -> Result<Vec<f32>, GraphError> {
@@ -1757,6 +2158,171 @@ mod dtype_storage_tests {
 mod checked_attempt_tests {
     use super::*;
     use crate::graph::DynamicDimension;
+
+    #[test]
+    fn proven_input_copy_metadata_rejects_missing_and_undeclared_bindings() {
+        let proof = CoremlPassthrough {
+            input: "source".into(),
+            descriptor: descriptor(vec![Dimension::Static(2)]),
+        };
+        let json = serde_json::to_string(&HashMap::from([("copy", proof.clone())])).unwrap();
+        let inputs = HashMap::from([("source".into(), "physical_input".into())]);
+        let outputs = HashMap::from([("copy".into(), "physical_output".into())]);
+        assert!(
+            parse_passthroughs(
+                &json,
+                &inputs,
+                &outputs,
+                &["physical_input".into()],
+                &["physical_output".into()]
+            )
+            .is_ok()
+        );
+        assert!(
+            parse_passthroughs(&json, &inputs, &outputs, &[], &["physical_output".into()]).is_err()
+        );
+        assert!(
+            parse_passthroughs(&json, &inputs, &outputs, &["physical_input".into()], &[]).is_err()
+        );
+        assert!(parse_passthroughs("not JSON", &inputs, &outputs, &[], &[]).is_err());
+    }
+
+    #[test]
+    fn proven_input_copies_validate_type_bounds_and_length_and_own_their_bytes() {
+        for dtype in [DataType::Float32, DataType::Float16, DataType::Int32] {
+            let descriptor = OperandDescriptor {
+                data_type: dtype,
+                shape: vec![dynamic("length")],
+                pending_permutation: vec![],
+            };
+            let proofs = HashMap::from([
+                (
+                    "first".into(),
+                    CoremlPassthrough {
+                        input: "source".into(),
+                        descriptor: descriptor.clone(),
+                    },
+                ),
+                (
+                    "second".into(),
+                    CoremlPassthrough {
+                        input: "source".into(),
+                        descriptor: descriptor.clone(),
+                    },
+                ),
+            ]);
+            let outputs = HashMap::from([
+                ("first".into(), descriptor.clone()),
+                ("second".into(), descriptor.clone()),
+            ]);
+            let actual = OperandDescriptor {
+                shape: vec![Dimension::Static(2)],
+                ..descriptor.clone()
+            };
+            let bytes = match dtype {
+                DataType::Float32 => [1.0003f32.to_bits(), 0x80000000]
+                    .into_iter()
+                    .flat_map(u32::to_le_bytes)
+                    .collect::<Vec<_>>(),
+                DataType::Float16 => [1u16, 0x8000]
+                    .into_iter()
+                    .flat_map(u16::to_le_bytes)
+                    .collect(),
+                DataType::Int32 => [16777217i32, i32::MAX]
+                    .into_iter()
+                    .flat_map(i32::to_le_bytes)
+                    .collect(),
+                _ => unreachable!(),
+            };
+            let inputs = HashMap::from([(
+                "source".into(),
+                CoremlByteInput {
+                    data: &bytes,
+                    descriptor: &actual,
+                },
+            )]);
+            let mut copies = snapshot_byte_passthroughs(&proofs, &inputs, &outputs).unwrap();
+            assert_eq!(copies["first"], bytes);
+            assert_eq!(copies["second"], bytes);
+            copies.get_mut("first").unwrap()[0] ^= 0xff;
+            assert_eq!(copies["second"], bytes);
+            assert!(snapshot_byte_passthroughs(&proofs, &HashMap::new(), &outputs).is_err());
+            let short = HashMap::from([(
+                "source".into(),
+                CoremlByteInput {
+                    data: &bytes[..1],
+                    descriptor: &actual,
+                },
+            )]);
+            assert!(snapshot_byte_passthroughs(&proofs, &short, &outputs).is_err());
+            let too_large = OperandDescriptor {
+                shape: vec![Dimension::Static(9)],
+                ..actual.clone()
+            };
+            let wrong_shape = HashMap::from([(
+                "source".into(),
+                CoremlByteInput {
+                    data: &bytes,
+                    descriptor: &too_large,
+                },
+            )]);
+            assert!(snapshot_byte_passthroughs(&proofs, &wrong_shape, &outputs).is_err());
+            let wrong_type = OperandDescriptor {
+                data_type: DataType::Uint8,
+                ..actual.clone()
+            };
+            let wrong_type = HashMap::from([(
+                "source".into(),
+                CoremlByteInput {
+                    data: &bytes,
+                    descriptor: &wrong_type,
+                },
+            )]);
+            assert!(snapshot_byte_passthroughs(&proofs, &wrong_type, &outputs).is_err());
+            let wrong_output = HashMap::from([
+                ("first".into(), actual.clone()),
+                ("second".into(), descriptor),
+            ]);
+            assert!(snapshot_byte_passthroughs(&proofs, &inputs, &wrong_output).is_err());
+        }
+    }
+
+    #[test]
+    fn feature_alias_metadata_validates_declared_bindings_and_shared_outputs() {
+        let declared = ["physical".into(), "other".into()];
+        assert_eq!(
+            parse_output_aliases(r#"{"logical":"physical"}"#, &declared).unwrap(),
+            HashMap::from([("logical".into(), "physical".into())])
+        );
+        assert!(parse_output_aliases("{}", &declared).unwrap().is_empty());
+        let shared = r#"{"logical":"physical","second":"physical"}"#;
+        assert_eq!(parse_output_aliases(shared, &declared).unwrap().len(), 2);
+        assert!(parse_feature_aliases(shared, &declared, "input", false).is_err());
+        assert_eq!(
+            parse_feature_aliases(r#"{"入口 1":"physical"}"#, &declared, "input", false).unwrap(),
+            HashMap::from([("入口 1".into(), "physical".into())])
+        );
+        let explicit_namespace = r#"{"other":"physical","renamed":"other"}"#;
+        assert_eq!(
+            parse_feature_aliases(explicit_namespace, &declared, "input", false)
+                .unwrap()
+                .len(),
+            2
+        );
+        for invalid in [
+            r#"{"logical":"missing"}"#,
+            r#"{"other":"physical"}"#,
+            r#"{"":"physical"}"#,
+            r#"{"logical":""}"#,
+            r#"{"logical":3}"#,
+            "not JSON",
+        ] {
+            assert!(
+                parse_output_aliases(invalid, &declared).is_err(),
+                "{invalid}"
+            );
+        }
+    }
 
     fn descriptor(shape: Vec<Dimension>) -> OperandDescriptor {
         OperandDescriptor {

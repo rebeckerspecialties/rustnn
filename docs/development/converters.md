@@ -102,6 +102,10 @@ Rules that hold for every converter:
 
 ### CoreML
 
+- WebNN operand names are reversibly escaped when they are not valid MIL identifiers or are
+  reserved words. The model carries an explicit name-encoding metadata marker; runtime binding
+  translation is enabled only for marked models. See the
+  [tensor-name contract](https://rustnn.github.io/rustnn/integration/coreml/#tensor-names).
 - MIL has no rank-0 tensors at the boundary, no dilation in pooling, no `edge`/`reflection`
   padding above two dimensions and no tensors of rank 6 and above; integer arithmetic runs in
   float32.
@@ -114,6 +118,19 @@ Rules that hold for every converter:
   A scalar result keeps the `[1]` CoreML boundary representation without changing the WebNN rank.
 - Float16 weights go to the weight blob written by `weight_file_builder.rs` and returned as
   `weights_data`.
+- WebNN names need not be MIL identifiers, and its input/output namespaces are independent.
+  Unsafe or colliding names receive unique physical identifiers. Creator-defined
+  `rustnn.webnn.input_aliases` and `rustnn.webnn.output_aliases` JSON mappings preserve
+  logical bindings in both execution paths and standalone exports.
+  Source-proven identity/same-type-cast outputs with identical type and shape share one
+  physical result: CoreML can omit duplicate scalar/dynamic copy features from prediction.
+  Logical tensors still receive independent results. Unequal computations and real dtype
+  conversions remain distinct. Same-float32 casts lower as identity rather than the native
+  cast kernel, which can narrow represented values through float16.
+  Produced copies rooted in a graph input additionally record that source and its descriptor
+  in `rustnn.webnn.output_passthroughs`. Execution snapshots the original bound input before
+  prediction, validates its dtype, actual shape and byte length, then supplies independent
+  output bytes. This also preserves a public float32 copy when CoreML narrows another consumer.
 - The internal `shape` extension lowers to MIL `shape`, retaining its native int32 result
   inside CoreML and widening the public int64 result at readback. Imported shape tensors
   retain their type and rank through the shared `unsqueeze` inference path.

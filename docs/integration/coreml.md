@@ -54,6 +54,26 @@ establishes placement, energy savings or prediction-time fallback; use separate 
    turn and reports each attempt; `--coreml-compiled-output <dir>` stores the compiled
    `.mlmodelc` for reuse.
 
+## Tensor names
+
+Input and output names remain independent in the RustNN API, including names containing
+spaces, Unicode, punctuation, leading digits or MIL keywords. The converter records JSON
+logical-to-physical bindings in creator-defined `rustnn.webnn.input_aliases` and
+`rustnn.webnn.output_aliases` metadata. RustNN applies them automatically; standalone
+consumers should apply them when binding and retrieving CoreML features.
+Previous exports with only the `rustnn.coreml.name_encoding=hex-v1` marker remain
+readable; unmarked third-party models keep literal feature names.
+Proven equal copy outputs may share one physical result, avoiding CoreML's omission of
+duplicate scalar/dynamic features. RustNN supplies each requested logical output tensor;
+unequal computations and real dtype conversions remain separate. Returning an original
+input or constant directly remains invalid under WebNN's build rules.
+For produced identity/same-type-cast chains rooted in an input, the serialized
+`rustnn.webnn.output_passthroughs` map identifies the logical input and original descriptor.
+RustNN validates dtype, actual shape and byte length and snapshots that input before
+prediction, supplying independent output copies even if CoreML omits or changes a copy
+feature. Standalone consumers should honor these proven-copy bindings too; they must not
+infer an input/output alias from matching names or values.
+
 ## Testing
 
 ```bash
