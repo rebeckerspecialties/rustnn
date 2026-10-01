@@ -1326,23 +1326,28 @@ impl CoremlMlProgramConverter {
         let constant_operations = constant_closure(&block.operations);
         let mut cuts = BTreeSet::new();
         let graph_outputs: HashSet<_> = block.outputs.iter().cloned().collect();
-        let float32_affine_layer_norm_inputs: HashSet<_> = graph
+        let float32_affine_normalization_inputs: HashSet<_> = graph
             .operations
             .iter()
             .filter_map(|operation| {
-                let Operation::LayerNormalization {
-                    input,
-                    options: Some(options),
-                    ..
-                } = operation
-                else {
-                    return None;
+                let (input, scale, bias) = match operation {
+                    Operation::LayerNormalization {
+                        input,
+                        options: Some(options),
+                        ..
+                    } => (*input, options.scale, options.bias),
+                    Operation::InstanceNormalization {
+                        input,
+                        options: Some(options),
+                        ..
+                    } => (*input, options.scale, options.bias),
+                    _ => return None,
                 };
-                ((options.scale.is_some() || options.bias.is_some())
+                ((scale.is_some() || bias.is_some())
                     && graph
-                        .operand(*input)
+                        .operand(input)
                         .is_some_and(|operand| operand.descriptor.data_type == DataType::Float32))
-                .then(|| operand_name(graph, *input))
+                .then(|| operand_name(graph, input))
             })
             .collect();
         let protected_half_results: HashSet<_> = graph
@@ -1380,7 +1385,7 @@ impl CoremlMlProgramConverter {
             // omit or reorder nontrailing-axis affine parameters.
             if operation.r#type == "layer_norm"
                 && named_input(operation, "x")
-                    .is_some_and(|name| float32_affine_layer_norm_inputs.contains(name))
+                    .is_some_and(|name| float32_affine_normalization_inputs.contains(name))
                 && !operation.inputs.contains_key("gamma")
                 && !operation.inputs.contains_key("beta")
                 && operation.outputs.iter().any(|output| {

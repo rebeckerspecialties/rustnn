@@ -9007,8 +9007,8 @@ impl CoremlMlProgramConverter {
                 }
             }
 
-            // Layer normalization with any affine parameters, and instance
-            // normalization with runtime scale/bias:
+            // Layer normalization with affine parameters, and spatial instance
+            // normalization with optional affine parameters:
             // CoreML's native layer_norm/instance_norm require const
             // gamma/beta ("Param 'gamma' must be const"), so run the native op
             // without them and apply `y = norm(x) * scale + bias` with explicit
@@ -9034,22 +9034,13 @@ impl CoremlMlProgramConverter {
                     ),
                     _ => (None, None),
                 };
-                let is_runtime = |id: Option<u32>| {
-                    id.and_then(|id| graph_info.operand(id))
-                        .map(|o| o.kind != crate::graph::OperandKind::Constant)
-                        .unwrap_or(false)
-                };
                 let layer_norm = matches!(op, Operation::LayerNormalization { .. });
                 let half_normalization = op
                     .input_operands()
                     .first()
                     .and_then(|&id| graph_info.operand(id))
                     .is_some_and(|operand| operand.descriptor.data_type == DataType::Float16);
-                if is_runtime(scale_id)
-                    || is_runtime(bias_id)
-                    || ((layer_norm || half_normalization)
-                        && (scale_id.is_some() || bias_id.is_some()))
-                {
+                if !layer_norm || scale_id.is_some() || bias_id.is_some() {
                     let x_id = *op.input_operands().first().ok_or_else(|| {
                         GraphError::ConversionFailed {
                             format: "coreml_mlprogram".to_string(),
@@ -9156,7 +9147,12 @@ impl CoremlMlProgramConverter {
                         }
                         _ => {}
                     }
-                    let norm_name = fresh("nogb");
+                    let norm_name =
+                        if !half_normalization && scale_id.is_none() && bias_id.is_none() {
+                            out_name.clone()
+                        } else {
+                            fresh("nogb")
+                        };
                     let mut norm_overrides = operand_name_overrides.clone();
                     norm_overrides.insert(out_id, norm_name.clone());
                     let mut mil = self.convert_operation_with_overrides(
@@ -9201,17 +9197,23 @@ impl CoremlMlProgramConverter {
                             norm_name.clone(),
                             mil_dtype,
                         )?];
-                        if matches!(op, Operation::InstanceNormalization { options: Some(options), .. }
-                            if options.layout.eq_ignore_ascii_case("nhwc"))
+                    }
+                    if let Operation::InstanceNormalization { options, .. } = op {
+                        // Native instance_norm can substitute a default-sized
+                        // epsilon, including for source Float32 inputs. Use
+                        // LayerNorm over exactly the source spatial axes and
+                        // apply channel affine parameters explicitly below.
+                        mil.r#type = mil_ops::LAYER_NORM.into();
+                        let axes = if options
+                            .as_ref()
+                            .is_some_and(|options| options.layout.eq_ignore_ascii_case("nhwc"))
                         {
-                            // Normalize exactly the NHWC spatial axes. Gamma
-                            // and beta are applied below on the channel axis;
-                            // widening them must not turn native const params
-                            // into live Pipeline features.
-                            mil.r#type = mil_ops::LAYER_NORM.into();
-                            mil.inputs
-                                .insert("axes".into(), Self::create_immediate_int_array(&[1, 2]));
-                        }
+                            [1, 2]
+                        } else {
+                            [2, 3]
+                        };
+                        mil.inputs
+                            .insert("axes".into(), Self::create_immediate_int_array(&axes));
                     }
                     main_block.operations.push(mil);
 
