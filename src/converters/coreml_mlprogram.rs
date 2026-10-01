@@ -713,16 +713,27 @@ impl CoremlMlProgramConverter {
                     data_type:
                         MLOperandDataType::Int8
                         | MLOperandDataType::Int32
+                        | MLOperandDataType::Float16
                         | MLOperandDataType::Float32,
                     ..
                 } => Some(vec![*input]),
-                Operation::DequantizeLinear { input, zero_point, .. }
-                    if graph.operand(*input).is_some_and(|operand|
-                        operand.descriptor.data_type == DataType::Int8)
-                        && operation.output_operand().and_then(|id| graph.operand(id))
-                            .is_some_and(|operand| operand.descriptor.data_type == DataType::Float16) =>
+                Operation::DequantizeLinear {
+                    input, zero_point, ..
+                } if graph
+                    .operand(*input)
+                    .is_some_and(|operand| operand.descriptor.data_type == DataType::Int8)
+                    && operation
+                        .output_operand()
+                        .and_then(|id| graph.operand(id))
+                        .is_some_and(|operand| {
+                            operand.descriptor.data_type == DataType::Float16
+                        }) =>
                 {
-                    Some(std::iter::once(*input).chain(zero_point.iter().copied()).collect())
+                    Some(
+                        std::iter::once(*input)
+                            .chain(zero_point.iter().copied())
+                            .collect(),
+                    )
                 }
                 _ => None,
             })
