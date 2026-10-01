@@ -80,7 +80,7 @@ fn constant(operation: &MilOperation) -> bool {
     operation.r#type == "const" || operation.r#type.starts_with("constexpr_")
 }
 
-fn constant_closure(operations: &[MilOperation]) -> HashSet<usize> {
+fn constant_closure(operations: &[MilOperation], materialized: &HashSet<String>) -> HashSet<usize> {
     use crate::protos::coreml::mil_spec::{tensor_value, value};
     let exact_unit_transport = |operation: &MilOperation| {
         if !matches!(operation.r#type.as_str(), "mul" | "real_div")
@@ -117,14 +117,18 @@ fn constant_closure(operations: &[MilOperation]) -> HashSet<usize> {
                 tensor(output).is_some_and(|value| value.data_type == MilDataType::Float16 as i32)
             })
             && !source_is_half;
-        if constant(operation)
-            || (operation.blocks.is_empty()
-                && (matches!(
-                    operation.r#type.as_str(),
-                    "cast" | "identity" | "reshape" | "transpose"
-                ) || exact_unit_transport(operation))
-                && !true_narrowing
-                && inputs(operation).iter().all(|name| values.contains(name)))
+        if !operation
+            .outputs
+            .iter()
+            .any(|output| materialized.contains(&output.name))
+            && (constant(operation)
+                || (operation.blocks.is_empty()
+                    && (matches!(
+                        operation.r#type.as_str(),
+                        "cast" | "identity" | "reshape" | "transpose"
+                    ) || exact_unit_transport(operation))
+                    && !true_narrowing
+                    && inputs(operation).iter().all(|name| values.contains(name))))
         {
             closure.insert(index);
             values.extend(operation.outputs.iter().map(|value| value.name.clone()));
@@ -142,6 +146,68 @@ fn constant_closure(operations: &[MilOperation]) -> HashSet<usize> {
         }
     }
     closure
+}
+
+// Only materialize stored Half constants whose represented values feed the
+// empirically affected predicate/arg kernels. Unrelated model weights remain
+// compile-time constant closures, rather than large per-prediction features.
+fn predicate_half_constant_inputs(graph: &GraphInfo) -> HashSet<String> {
+    let mut origins: HashMap<u32, HashSet<u32>> = graph
+        .constant_operand_ids_to_handles
+        .keys()
+        .filter(|&&id| {
+            graph
+                .operand(id)
+                .is_some_and(|operand| operand.descriptor.data_type == DataType::Float16)
+        })
+        .map(|&id| (id, [id].into_iter().collect()))
+        .collect();
+    let mut required = HashSet::new();
+    for operation in &graph.operations {
+        if matches!(
+            operation,
+            Operation::Equal { .. }
+                | Operation::NotEqual { .. }
+                | Operation::Greater { .. }
+                | Operation::GreaterOrEqual { .. }
+                | Operation::Lesser { .. }
+                | Operation::LesserOrEqual { .. }
+                | Operation::ArgMin { .. }
+                | Operation::ArgMax { .. }
+        ) {
+            for input in operation.all_input_operands() {
+                if let Some(roots) = origins.get(&input) {
+                    required.extend(roots.iter().copied());
+                }
+            }
+        }
+        let input = match operation {
+            Operation::Cast {
+                input,
+                data_type: MLOperandDataType::Float16 | MLOperandDataType::Float32,
+                ..
+            }
+            | Operation::Identity { input, .. }
+            | Operation::Reshape { input, .. }
+            | Operation::Transpose { input, .. } => Some(*input),
+            _ => None,
+        };
+        if let Some(roots) = input.and_then(|input| origins.get(&input)).cloned() {
+            for &output in operation.outputs() {
+                origins.insert(output, roots.clone());
+            }
+        }
+    }
+    origins
+        .into_iter()
+        .filter(|(id, roots)| {
+            !roots.is_disjoint(&required)
+                && graph
+                    .operand(*id)
+                    .is_some_and(|operand| operand.descriptor.data_type == DataType::Float16)
+        })
+        .map(|(id, _)| operand_name(graph, id))
+        .collect()
 }
 
 #[derive(Default)]
@@ -536,6 +602,7 @@ fn pack_half_widenings(
     graph: &GraphInfo,
     function_inputs: &[NamedValueType],
     block: &mut Block,
+    materialized_constants: &HashSet<String>,
 ) -> Result<PackedWidenings, GraphError> {
     let types: HashMap<_, _> = function_inputs
         .iter()
@@ -548,7 +615,7 @@ fn pack_half_widenings(
         .map(|value| (value.name.clone(), value.clone()))
         .collect();
     let shapes = shape_bounds(graph, &types, &block.operations);
-    let constant_operations = constant_closure(&block.operations);
+    let constant_operations = constant_closure(&block.operations, materialized_constants);
     let constant_values: HashSet<_> = block
         .operations
         .iter()
@@ -914,8 +981,11 @@ impl Boundary {
 }
 
 impl CoremlMlProgramConverter {
-    fn materialize_public_half_constants(function_inputs: &[NamedValueType], block: &mut Block) {
-        let outputs: HashSet<_> = block.outputs.iter().cloned().collect();
+    fn materialize_half_constants(
+        function_inputs: &[NamedValueType],
+        block: &mut Block,
+        outputs: &HashSet<String>,
+    ) {
         let mut reserved: HashSet<_> = function_inputs
             .iter()
             .chain(
@@ -1090,7 +1160,8 @@ impl CoremlMlProgramConverter {
                 block.operations[index] = folded;
             }
         }
-        Self::materialize_public_half_constants(&function.inputs, block);
+        let outputs = block.outputs.iter().cloned().collect();
+        Self::materialize_half_constants(&function.inputs, block, &outputs);
         Ok(())
     }
 
@@ -1099,16 +1170,19 @@ impl CoremlMlProgramConverter {
         graph: &GraphInfo,
         mut model: Model,
         promoted: &HashSet<String>,
+        materialized_boolean_results: &HashSet<String>,
     ) -> Result<Model, GraphError> {
         let Some(model::Type::MlProgram(program)) = &mut model.r#type else {
             return Ok(model);
         };
+        let materialized_constants = predicate_half_constant_inputs(graph);
         let (preparation, packed, protected_widenings) = {
             let function = program.functions.get_mut("main").unwrap();
             let block = function
                 .block_specializations
                 .get_mut(&function.opset)
                 .unwrap();
+            Self::materialize_half_constants(&function.inputs, block, &materialized_constants);
             let preparation = prepare_select_conditions(&function.inputs, block, promoted);
             let protected_inputs: HashSet<_> = graph
                 .operations
@@ -1125,6 +1199,14 @@ impl CoremlMlProgramConverter {
                             | Operation::Triangular { .. }
                             | Operation::IsNaN { .. }
                             | Operation::IsInfinite { .. }
+                            | Operation::Equal { .. }
+                            | Operation::NotEqual { .. }
+                            | Operation::Greater { .. }
+                            | Operation::GreaterOrEqual { .. }
+                            | Operation::Lesser { .. }
+                            | Operation::LesserOrEqual { .. }
+                            | Operation::ArgMin { .. }
+                            | Operation::ArgMax { .. }
                     )
                 })
                 .flat_map(|operation| operation.all_input_operands())
@@ -1134,6 +1216,7 @@ impl CoremlMlProgramConverter {
                         .is_some_and(|operand| operand.descriptor.data_type == DataType::Float16)
                 })
                 .map(|id| operand_name(graph, id))
+                .chain(materialized_constants.iter().cloned())
                 .collect();
             let protected_widenings: HashSet<_> = block
                 .operations
@@ -1150,7 +1233,8 @@ impl CoremlMlProgramConverter {
                 })
                 .map(|output| output.name.clone())
                 .collect();
-            let packed = pack_half_widenings(graph, &function.inputs, block)?;
+            let packed =
+                pack_half_widenings(graph, &function.inputs, block, &materialized_constants)?;
             function
                 .inputs
                 .extend(packed.input_views.iter().map(|(_, view)| view.clone()));
@@ -1318,7 +1402,7 @@ impl CoremlMlProgramConverter {
                     .map(move |value| (value.name.clone(), index))
             })
             .collect();
-        let constant_operations = constant_closure(&block.operations);
+        let constant_operations = constant_closure(&block.operations, &materialized_constants);
         let mut cuts = BTreeSet::new();
         let graph_outputs: HashSet<_> = block.outputs.iter().cloned().collect();
         let float32_affine_layer_norm_inputs: HashSet<_> = graph
@@ -1367,6 +1451,20 @@ impl CoremlMlProgramConverter {
             cuts.insert(producers[last] + 1);
         }
         for (index, operation) in block.operations.iter().enumerate() {
+            if operation
+                .outputs
+                .iter()
+                .any(|output| materialized_constants.contains(&output.name))
+            {
+                cuts.insert(index + 1);
+            }
+            if operation
+                .outputs
+                .iter()
+                .any(|output| materialized_boolean_results.contains(&output.name))
+            {
+                cuts.insert(index + 1);
+            }
             // Keep explicitly lowered LayerNorm affine work outside the
             // native normalization plan. A fused native gamma/beta plan can
             // omit or reorder nontrailing-axis affine parameters.
