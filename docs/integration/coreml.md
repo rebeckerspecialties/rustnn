@@ -75,6 +75,11 @@ RustNN validates dtype, actual shape and byte length and snapshots that input be
 prediction, supplying independent output copies even if CoreML omits or changes a copy
 feature. Standalone consumers should honor these proven-copy bindings too; they must not
 infer an input/output alias from matching names or values.
+Bounded copies accept each actual shape within the declared bound, including repeated
+grow/shrink predictions. `int8` and `uint8` identity and same-type cast kernels use exact
+`int32` temporaries; graph descriptors and stored bytes retain their original dtype.
+Signed constants used by these copies or casts to `int32`/`float32` retain their raw byte
+payload under a private unsigned interpretation, then recover the signed values in MIL.
 
 ## Converter-private input views
 
