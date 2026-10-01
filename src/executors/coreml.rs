@@ -733,7 +733,6 @@ fn snapshot_byte_passthroughs(
         })?;
         if input.descriptor.data_type != proof.descriptor.data_type
             || output.data_type != proof.descriptor.data_type
-            || output.shape != proof.descriptor.shape
             || output.pending_permutation != proof.descriptor.pending_permutation
             || input.descriptor.pending_permutation != proof.descriptor.pending_permutation
         {
@@ -1599,7 +1598,6 @@ unsafe fn snapshot_provider_passthroughs(
                 ))
             })?;
             if descriptor.data_type != proof.descriptor.data_type
-                || descriptor.shape != proof.descriptor.shape
                 || descriptor.pending_permutation != proof.descriptor.pending_permutation
             {
                 return Err(boundary_error(format!(
@@ -1643,6 +1641,9 @@ unsafe fn snapshot_provider_passthroughs(
             })
             .collect::<Result<_, _>>()?;
         shapes.validate_shape(&proof.input, &actual, &proof.descriptor, TensorKind::Input)?;
+        if let Some(descriptor) = expected.and_then(|outputs| outputs.get(&output)) {
+            shapes.validate_shape(&output, &actual, descriptor, TensorKind::Output)?;
+        }
         let data = unsafe { extract_mlmultiarray_data(array)? };
         validate_shape_data_length(&proof.input, &actual, data.len())?;
         result.insert(
@@ -2280,11 +2281,106 @@ mod checked_attempt_tests {
             )]);
             assert!(snapshot_byte_passthroughs(&proofs, &wrong_type, &outputs).is_err());
             let wrong_output = HashMap::from([
-                ("first".into(), actual.clone()),
+                (
+                    "first".into(),
+                    OperandDescriptor {
+                        shape: vec![Dimension::Static(3)],
+                        ..actual.clone()
+                    },
+                ),
                 ("second".into(), descriptor),
             ]);
             assert!(snapshot_byte_passthroughs(&proofs, &inputs, &wrong_output).is_err());
         }
+    }
+
+    #[test]
+    fn narrow_proven_copies_accept_actual_shapes_and_reject_invalid_bindings() {
+        let bounded = OperandDescriptor {
+            data_type: DataType::Uint8,
+            shape: vec![Dimension::Dynamic(DynamicDimension {
+                name: "length".into(),
+                max_size: 256,
+            })],
+            pending_permutation: vec![],
+        };
+        let proofs = HashMap::from([(
+            "copy".into(),
+            CoremlPassthrough {
+                input: "source".into(),
+                descriptor: bounded.clone(),
+            },
+        )]);
+        for length in [1, 256, 3, 1] {
+            let actual = OperandDescriptor {
+                shape: vec![Dimension::Static(length)],
+                ..bounded.clone()
+            };
+            let bytes = (0..length).map(|value| value as u8).collect::<Vec<_>>();
+            let inputs = HashMap::from([(
+                "source".into(),
+                CoremlByteInput {
+                    data: &bytes,
+                    descriptor: &actual,
+                },
+            )]);
+            for output in [&bounded, &actual] {
+                let outputs = HashMap::from([("copy".into(), output.clone())]);
+                assert_eq!(
+                    snapshot_byte_passthroughs(&proofs, &inputs, &outputs).unwrap()["copy"],
+                    bytes
+                );
+            }
+            for invalid_shape in [vec![Dimension::Static(length + 1)], vec![]] {
+                let invalid = OperandDescriptor {
+                    shape: invalid_shape,
+                    ..actual.clone()
+                };
+                assert!(
+                    snapshot_byte_passthroughs(
+                        &proofs,
+                        &inputs,
+                        &HashMap::from([("copy".into(), invalid)])
+                    )
+                    .is_err()
+                );
+            }
+            let short = HashMap::from([(
+                "source".into(),
+                CoremlByteInput {
+                    data: &bytes[..bytes.len() - 1],
+                    descriptor: &actual,
+                },
+            )]);
+            assert!(
+                snapshot_byte_passthroughs(
+                    &proofs,
+                    &short,
+                    &HashMap::from([("copy".into(), actual.clone())])
+                )
+                .is_err()
+            );
+        }
+        let too_large = OperandDescriptor {
+            shape: vec![Dimension::Static(257)],
+            ..bounded.clone()
+        };
+        let bytes = vec![0; 257];
+        let inputs = HashMap::from([(
+            "source".into(),
+            CoremlByteInput {
+                data: &bytes,
+                descriptor: &too_large,
+            },
+        )]);
+        assert!(
+            snapshot_byte_passthroughs(
+                &proofs,
+                &inputs,
+                &HashMap::from([("copy".into(), too_large.clone())])
+            )
+            .is_err()
+        );
     }
 
     #[test]
