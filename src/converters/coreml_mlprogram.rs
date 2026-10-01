@@ -1107,13 +1107,18 @@ impl CoremlMlProgramConverter {
 
     /// Create an Argument from an immediate float16 value (scalar)
     fn create_immediate_float16(value: f32) -> Argument {
+        Self::create_immediate_float16_from_f64(f64::from(value))
+    }
+
+    /// WebNN double/MLNumber options cast directly to the source operand type.
+    /// Rounding through Float32 first changes values next to Half midpoints.
+    fn create_immediate_float16_from_f64(value: f64) -> Argument {
         use crate::protos::coreml::mil_spec::{
             DataType as MilDataType, TensorType, TensorValue, Value, ValueType, tensor_value,
             value, value_type,
         };
 
-        // Convert f32 to f16 bytes
-        let f16_bits = half::f16::from_f32(value).to_bits();
+        let f16_bits = half::f16::from_f64(value).to_bits();
         let bytes = f16_bits.to_le_bytes().to_vec();
 
         let tensor_value = TensorValue {
@@ -1141,6 +1146,19 @@ impl CoremlMlProgramConverter {
             arguments: vec![crate::protos::coreml::mil_spec::argument::Binding {
                 binding: Some(Binding::Value(val)),
             }],
+        }
+    }
+
+    fn create_float_option(graph: &GraphInfo, op: &Operation, value: f64) -> Argument {
+        if op
+            .input_operands()
+            .first()
+            .and_then(|&id| graph.operand(id))
+            .is_some_and(|operand| operand.descriptor.data_type == DataType::Float16)
+        {
+            Self::create_immediate_float16_from_f64(value)
+        } else {
+            Self::create_immediate_float(value as f32)
         }
     }
 
@@ -1789,6 +1807,9 @@ impl CoremlMlProgramConverter {
                     // Half subtraction can erase represented NaN/infinity
                     // classes on accelerator-enabled execution paths.
                     | "sub"
+                    // Native Half clip changes represented values under A12
+                    // accelerator-enabled policies, including an exact zero.
+                    | "clip"
             );
             let half = operation.outputs.iter().any(|value| {
                 tensor(value).is_some_and(|t| t.data_type == MilDataType::Float16 as i32)
@@ -4945,15 +4966,15 @@ impl CoremlMlProgramConverter {
                 if !input_names.is_empty() {
                     inputs.insert("x".to_string(), Self::create_argument(&input_names[0]));
                 }
-                let alpha = options.as_ref().map(|o| o.alpha as f32).unwrap_or(1.0);
-                inputs.insert("alpha".to_string(), Self::create_immediate_float(alpha));
+                let alpha = options.as_ref().map_or(1.0, |o| o.alpha);
+                inputs.insert("alpha".to_string(), Self::create_float_option(graph, op, alpha));
             }
             Operation::LeakyRelu { options, .. } => {
                 if !input_names.is_empty() {
                     inputs.insert("x".to_string(), Self::create_argument(&input_names[0]));
                 }
-                let alpha = options.as_ref().map(|o| o.alpha as f32).unwrap_or(0.01);
-                inputs.insert("alpha".to_string(), Self::create_immediate_float(alpha));
+                let alpha = options.as_ref().map_or(0.01, |o| o.alpha);
+                inputs.insert("alpha".to_string(), Self::create_float_option(graph, op, alpha));
             }
 
             // HardSwish: decomposed in main loop (hardsigmoid + mul)
@@ -4970,16 +4991,8 @@ impl CoremlMlProgramConverter {
                 if !input_names.is_empty() {
                     inputs.insert("x".to_string(), Self::create_argument(&input_names[0]));
                 }
-                if let Some(opts) = options {
-                    inputs.insert(
-                        "alpha".to_string(),
-                        Self::create_immediate_float(opts.alpha as f32),
-                    );
-                    inputs.insert(
-                        "beta".to_string(),
-                        Self::create_immediate_float(opts.beta as f32),
-                    );
-                }
+                inputs.insert("alpha".to_string(), Self::create_float_option(graph, op, options.as_ref().map_or(0.2, |o| o.alpha)));
+                inputs.insert("beta".to_string(), Self::create_float_option(graph, op, options.as_ref().map_or(0.5, |o| o.beta)));
             }
 
             // Clamp operation: x, alpha (min), beta (max)
@@ -4993,12 +5006,12 @@ impl CoremlMlProgramConverter {
                     .as_ref()
                     .map(|o| {
                         let min =
-                            Self::parse_clamp_bound(o.min_value.as_ref(), f64::NEG_INFINITY) as f32;
+                            Self::parse_clamp_bound(o.min_value.as_ref(), f64::NEG_INFINITY);
                         let max =
-                            Self::parse_clamp_bound(o.max_value.as_ref(), f64::INFINITY) as f32;
+                            Self::parse_clamp_bound(o.max_value.as_ref(), f64::INFINITY);
                         (min, max)
                     })
-                    .unwrap_or((f32::NEG_INFINITY, f32::INFINITY));
+                    .unwrap_or((f64::NEG_INFINITY, f64::INFINITY));
 
                 // Alpha and beta must match input type (CoreML requirement)
                 // Check first input operand type and use appropriate immediate value method
@@ -5015,15 +5028,15 @@ impl CoremlMlProgramConverter {
                 if use_float16 {
                     inputs.insert(
                         "alpha".to_string(),
-                        Self::create_immediate_float16(min_value),
+                        Self::create_immediate_float16_from_f64(min_value),
                     );
                     inputs.insert(
                         "beta".to_string(),
-                        Self::create_immediate_float16(max_value),
+                        Self::create_immediate_float16_from_f64(max_value),
                     );
                 } else {
-                    inputs.insert("alpha".to_string(), Self::create_immediate_float(min_value));
-                    inputs.insert("beta".to_string(), Self::create_immediate_float(max_value));
+                    inputs.insert("alpha".to_string(), Self::create_immediate_float(min_value as f32));
+                    inputs.insert("beta".to_string(), Self::create_immediate_float(max_value as f32));
                 }
             }
 
@@ -5368,18 +5381,10 @@ impl CoremlMlProgramConverter {
                         );
                     }
                 }
-                let use_f16 = op
-                    .input_operands()
-                    .first()
-                    .and_then(|&id| graph.operand(id))
-                    .is_some_and(|o| o.descriptor.data_type == DataType::Float16);
-                let epsilon = options.as_ref().map_or(1e-5, |o| o.epsilon as f32);
-                let eps_arg = if use_f16 {
-                    Self::create_immediate_float16(epsilon)
-                } else {
-                    Self::create_immediate_float(epsilon)
-                };
-                inputs.insert("epsilon".to_string(), eps_arg);
+                inputs.insert(
+                    "epsilon".into(),
+                    Self::create_float_option(graph, op, options.as_ref().map_or(1e-5, |o| o.epsilon)),
+                );
 
                 // Add axes parameter (REQUIRED by CoreML, must not be empty;
                 // empty axes are caught before this point).
@@ -5444,19 +5449,8 @@ impl CoremlMlProgramConverter {
                     } else if input_names.len() >= 5 {
                         inputs.insert("beta".to_string(), Self::create_argument(&input_names[4]));
                     }
-                    let use_f16_bn = op
-                        .input_operands()
-                        .first()
-                        .and_then(|&id| graph.operand(id))
-                        .map(|o| o.descriptor.data_type == DataType::Float16)
-                        .unwrap_or(false);
-                    let eps_bn = if use_f16_bn {
-                        Self::create_immediate_float16(opts.epsilon as f32)
-                    } else {
-                        Self::create_immediate_float(opts.epsilon as f32)
-                    };
-                    inputs.insert("epsilon".to_string(), eps_bn);
                 }
+                inputs.insert("epsilon".into(), Self::create_float_option(graph, op, options.as_ref().map_or(1e-5, |o| o.epsilon)));
             }
             Operation::InstanceNormalization { options, .. } => {
                 if !input_names.is_empty() {
@@ -5475,19 +5469,8 @@ impl CoremlMlProgramConverter {
                             Self::create_argument(&operand_name(graph, bias_id)),
                         );
                     }
-                    let use_f16_in = op
-                        .input_operands()
-                        .first()
-                        .and_then(|&id| graph.operand(id))
-                        .map(|o| o.descriptor.data_type == DataType::Float16)
-                        .unwrap_or(false);
-                    let eps_in = if use_f16_in {
-                        Self::create_immediate_float16(opts.epsilon as f32)
-                    } else {
-                        Self::create_immediate_float(opts.epsilon as f32)
-                    };
-                    inputs.insert("epsilon".to_string(), eps_in);
                 }
+                inputs.insert("epsilon".into(), Self::create_float_option(graph, op, options.as_ref().map_or(1e-5, |o| o.epsilon)));
             }
 
             Operation::Concat { axis, .. } => {
@@ -5748,7 +5731,7 @@ impl CoremlMlProgramConverter {
                     .cloned()
                     .unwrap_or(DataType::Float32);
                 let cval_arg = match input_dtype {
-                    DataType::Float16 => Self::create_immediate_float16(constant_val as f32),
+                    DataType::Float16 => Self::create_immediate_float16_from_f64(constant_val),
                     DataType::Int32 => Self::create_immediate_int(constant_val as u32),
                     DataType::Int8 | DataType::Uint8 => {
                         Self::create_immediate_int(constant_val as u32)
@@ -7052,30 +7035,30 @@ impl CoremlMlProgramConverter {
                         self.create_operation_inputs(graph_info, op, &[wide_input_name])?;
                     // WebNN casts these parameters to the input type at graph
                     // construction. Widen the rounded value, not the original.
-                    let rounded = |value: f32| {
-                        Self::create_immediate_float(half::f16::from_f32(value).to_f32())
+                    let rounded = |value: f64| {
+                        Self::create_immediate_float(half::f16::from_f64(value).to_f32())
                     };
                     match op {
                         Operation::LeakyRelu { options, .. } => {
                             inputs.insert(
                                 "alpha".into(),
-                                rounded(options.as_ref().map_or(0.01, |o| o.alpha as f32)),
+                                rounded(options.as_ref().map_or(0.01, |o| o.alpha)),
                             );
                         }
                         Operation::Elu { options, .. } => {
                             inputs.insert(
                                 "alpha".into(),
-                                rounded(options.as_ref().map_or(1.0, |o| o.alpha as f32)),
+                                rounded(options.as_ref().map_or(1.0, |o| o.alpha)),
                             );
                         }
                         Operation::HardSigmoid { options, .. } => {
                             inputs.insert(
                                 "alpha".into(),
-                                rounded(options.as_ref().map_or(0.2, |o| o.alpha as f32)),
+                                rounded(options.as_ref().map_or(0.2, |o| o.alpha)),
                             );
                             inputs.insert(
                                 "beta".into(),
-                                rounded(options.as_ref().map_or(0.5, |o| o.beta as f32)),
+                                rounded(options.as_ref().map_or(0.5, |o| o.beta)),
                             );
                         }
                         _ => {}
@@ -7736,7 +7719,7 @@ impl CoremlMlProgramConverter {
                     };
                     let bound_arg = |v: f64| {
                         if use_float16 {
-                            Self::create_immediate_float16(v as f32)
+                            Self::create_immediate_float16_from_f64(v)
                         } else {
                             Self::create_immediate_float(v as f32)
                         }
@@ -8290,8 +8273,8 @@ impl CoremlMlProgramConverter {
 
                 let (alpha, beta) = match &op {
                     Operation::Gemm { options, .. } => (
-                        options.as_ref().map(|o| o.alpha as f32).unwrap_or(1.0),
-                        options.as_ref().map(|o| o.beta as f32).unwrap_or(1.0),
+                        options.as_ref().map_or(1.0, |o| o.alpha),
+                        options.as_ref().map_or(1.0, |o| o.beta),
                     ),
                     _ => (1.0, 1.0),
                 };
@@ -8301,17 +8284,21 @@ impl CoremlMlProgramConverter {
                     _ => None,
                 };
                 let has_bias = c_operand_id_opt.is_some();
-                let needs_alpha_mul = (alpha - 1.0).abs() > f32::EPSILON;
-                let needs_beta_mul = has_bias && (beta - 1.0).abs() > f32::EPSILON;
+                let represented = |value| match output_operand.descriptor.data_type {
+                    DataType::Float16 => half::f16::from_f64(value).to_f32(),
+                    _ => value as f32,
+                };
+                let needs_alpha_mul = represented(alpha) != 1.0;
+                let needs_beta_mul = has_bias && represented(beta) != 1.0;
 
                 let (alpha_arg, beta_arg) = match output_operand.descriptor.data_type {
                     DataType::Float16 => (
-                        Self::create_immediate_float16(alpha),
-                        Self::create_immediate_float16(beta),
+                        Self::create_immediate_float16_from_f64(alpha),
+                        Self::create_immediate_float16_from_f64(beta),
                     ),
                     DataType::Float32 => (
-                        Self::create_immediate_float(alpha),
-                        Self::create_immediate_float(beta),
+                        Self::create_immediate_float(alpha as f32),
+                        Self::create_immediate_float(beta as f32),
                     ),
                     _ => {
                         return Err(GraphError::ConversionFailed {
@@ -8459,19 +8446,100 @@ impl CoremlMlProgramConverter {
                 let (alpha, beta) = match &op {
                     Operation::Linear { options, .. } => options
                         .as_ref()
-                        .map(|o| (o.alpha as f32, o.beta as f32))
+                        .map(|o| (o.alpha, o.beta))
                         .unwrap_or((1.0, 0.0)),
                     _ => (1.0, 0.0),
                 };
 
+                if input_operand.descriptor.data_type == DataType::Float16 {
+                    let (output_name, output_type) = Self::create_output_value(
+                        graph_info,
+                        output_operand_id,
+                        &operand_name_overrides,
+                    )?;
+                    let mut reserved: std::collections::HashSet<_> = graph_info
+                        .operands
+                        .iter()
+                        .enumerate()
+                        .map(|(id, _)| operand_name(graph_info, id as u32))
+                        .chain(operand_name_overrides.values().cloned())
+                        .chain(main_block.operations.iter().flat_map(|operation| {
+                            operation.outputs.iter().map(|output| output.name.clone())
+                        }))
+                        .collect();
+                    let mut fresh = |base: String| {
+                        let mut name = base.clone();
+                        let mut suffix = 0;
+                        while !reserved.insert(name.clone()) {
+                            suffix += 1;
+                            name = format!("{base}_{suffix}");
+                        }
+                        name
+                    };
+                    let wide_input = fresh(format!("{output_name}_linear_input_fp32"));
+                    let product = fresh(format!("{output_name}_linear_product_fp32"));
+                    let result = fresh(format!("{output_name}_linear_result_fp32"));
+                    let float32 = crate::protos::coreml::mil_spec::DataType::Float32 as i32;
+                    main_block.operations.push(Self::create_cast_operation(
+                        Self::output_name_for_operand(
+                            graph_info,
+                            op.input_operands()[0],
+                            &operand_name_overrides,
+                        ),
+                        Self::create_value_with_mil_type(
+                            graph_info,
+                            op.input_operands()[0],
+                            wide_input.clone(),
+                            float32,
+                        )?,
+                        "fp32",
+                    ));
+                    // Linear is one declared WebNN operation: do not round or
+                    // underflow its product before adding the represented beta.
+                    let represented =
+                        |value| Self::create_immediate_float(half::f16::from_f64(value).to_f32());
+                    main_block.operations.push(Self::create_mil_operation(
+                        mil_ops::MUL,
+                        HashMap::from([
+                            ("x".into(), Self::create_name_argument(wide_input)),
+                            ("y".into(), represented(alpha)),
+                        ]),
+                        vec![Self::create_value_with_mil_type(
+                            graph_info,
+                            output_operand_id,
+                            product.clone(),
+                            float32,
+                        )?],
+                    ));
+                    main_block.operations.push(Self::create_mil_operation(
+                        mil_ops::ADD,
+                        HashMap::from([
+                            ("x".into(), Self::create_name_argument(product)),
+                            ("y".into(), represented(beta)),
+                        ]),
+                        vec![Self::create_value_with_mil_type(
+                            graph_info,
+                            output_operand_id,
+                            result.clone(),
+                            float32,
+                        )?],
+                    ));
+                    main_block.operations.push(Self::create_cast_operation(
+                        result,
+                        output_type,
+                        "fp16",
+                    ));
+                    continue;
+                }
+
                 let (alpha_arg, beta_arg) = match input_operand.descriptor.data_type {
                     DataType::Float16 => (
-                        Self::create_immediate_float16(alpha),
-                        Self::create_immediate_float16(beta),
+                        Self::create_immediate_float16_from_f64(alpha),
+                        Self::create_immediate_float16_from_f64(beta),
                     ),
                     DataType::Float32 => (
-                        Self::create_immediate_float(alpha),
-                        Self::create_immediate_float(beta),
+                        Self::create_immediate_float(alpha as f32),
+                        Self::create_immediate_float(beta as f32),
                     ),
                     _ => {
                         return Err(GraphError::ConversionFailed {
@@ -9115,13 +9183,13 @@ impl CoremlMlProgramConverter {
                             .insert("x".into(), Self::create_name_argument(wide_name));
                         let epsilon = match op {
                             Operation::LayerNormalization { options, .. } => {
-                                options.as_ref().map_or(1e-5, |o| o.epsilon as f32)
+                                options.as_ref().map_or(1e-5, |o| o.epsilon)
                             }
                             _ => unreachable!(),
                         };
                         mil.inputs.insert(
                             "epsilon".into(),
-                            Self::create_immediate_float(half::f16::from_f32(epsilon).to_f32()),
+                            Self::create_immediate_float(half::f16::from_f64(epsilon).to_f32()),
                         );
                         mil.outputs = vec![Self::create_value_with_mil_type(
                             graph_info,
@@ -10655,7 +10723,7 @@ impl CoremlMlProgramConverter {
                 let variance_id = op.input_operands().get(2).copied();
                 let scale_id = options.as_ref().and_then(|o| o.scale);
                 let bias_id = options.as_ref().and_then(|o| o.bias);
-                let epsilon = options.as_ref().map(|o| o.epsilon as f32).unwrap_or(1e-5);
+                let epsilon = options.as_ref().map_or(1e-5, |o| o.epsilon);
                 let axis = options.as_ref().map(|o| o.axis as usize).unwrap_or(1);
 
                 let is_runtime_param = |id: Option<u32>| {
@@ -10876,9 +10944,9 @@ impl CoremlMlProgramConverter {
                     };
                     let var_eps_name = format!("{}_bn_veps", output_name);
                     let eps_arg = if is_f16 {
-                        Self::create_immediate_float16(epsilon)
+                        Self::create_immediate_float16_from_f64(epsilon)
                     } else {
-                        Self::create_immediate_float(epsilon)
+                        Self::create_immediate_float(epsilon as f32)
                     };
                     let mut veps_in: HashMap<String, Argument> = HashMap::new();
                     veps_in.insert(
