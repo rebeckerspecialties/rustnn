@@ -40,14 +40,16 @@ establishes placement, energy savings or prediction-time fallback; use separate 
 
 ## How a graph runs
 
-1. The converter lowers the graph to a MIL program. Rank-0 operands are promoted to `[1]` at the
+1. The converter lowers the graph to MIL programs. Rank-0 operands are promoted to `[1]` at the
    model boundary, comparison and logical results are produced as `uint8`, and reductions with
    empty axes, `resample2d` on arbitrary axis pairs and the stable `reduceLogSumExp` form are
    lowered explicitly because MIL has no direct equivalent.
-2. Float16 weights are written as a separate weights blob (`ConvertedGraph::weights_data`), and
-   the model is packaged as an in-memory asset together with that blob. Graphs for which the
-   in-memory compiler is known to misbehave (`gather` with a rank-0 index) are written to a
-   temporary directory and compiled from its URL instead (`supports_in_memory_asset`).
+2. Float16 weights remain a separate shared blob (`ConvertedGraph::weights_data`). MLProgram
+   graphs compile locally from a URL: the in-memory route changes represented values on
+   multiple tested CoreML stacks. This does not force CPU-only execution.
+   Real precision boundaries are materialized as native Pipeline children where needed.
+   The children expose live values only and reuse the original weight storage; the public
+   WebNN graph, types and shapes are unchanged.
 3. `MLGraphBuilder::build` compiles the model with `MLModel` and keeps the compiled model;
    `dispatch` binds `MLMultiArray`s over the tensor storage and runs a prediction.
 4. The legacy CLI path (`--convert coreml --run-coreml`) tries the compute-unit configurations in
