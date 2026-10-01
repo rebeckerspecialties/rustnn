@@ -371,7 +371,7 @@ pub fn run_one_test_case_with_audit(
     let graph = &test_case.graph;
     let graph_op_names = graph_operator_names(graph);
     let graph_op_refs: Vec<&str> = graph_op_names.iter().map(String::as_str).collect();
-    let strict_tolerance = tolerance::strict_wpt_tolerance();
+    let strict_tolerance = wpt_config::strict_wpt_tolerance();
 
     wpt_context_pool::with_context(backend, |context| {
         let needs_intermediates = strict_tolerance && test_case.tolerance.is_none();

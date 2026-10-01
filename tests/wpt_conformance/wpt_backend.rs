@@ -109,12 +109,12 @@ impl WptBackend {
             if backend.prefix == "coreml"
                 && cfg!(all(feature = "coreml-runtime", target_os = "macos"))
             {
-                let requested = std::env::var("WPT_COREML_DEVICE").unwrap_or_else(|_| "cpu".into());
-                let device_type = match requested.as_str() {
+                let requested = super::wpt_config::coreml_requested_device();
+                let device_type = match requested {
                     "cpu" => DeviceType::Cpu,
                     "gpu" => DeviceType::Gpu,
                     "npu" => DeviceType::Npu,
-                    _ => panic!("WPT_COREML_DEVICE must be cpu, gpu, or npu; got {requested:?}"),
+                    _ => unreachable!("validated CoreML policy"),
                 };
                 backend.options = MLContextOptions::new(
                     MLPowerPreference::Default,

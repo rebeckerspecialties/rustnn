@@ -101,7 +101,7 @@ fn main() {
 
     eprintln!(
         "[WPT] comparison: {}",
-        if wpt_conformance::tolerance::strict_wpt_tolerance() {
+        if wpt_conformance::wpt_config::strict_wpt_tolerance() {
             "strict upstream tolerance (no local ULP or absolute floors)"
         } else {
             "compatibility tolerance (local ULP and absolute floors enabled)"

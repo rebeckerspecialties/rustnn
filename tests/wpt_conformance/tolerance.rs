@@ -184,14 +184,8 @@ pub fn get_operation_tolerance(
         operation,
         tolerance_override,
         graph_operator_names,
-        strict_wpt_tolerance(),
+        super::wpt_config::strict_wpt_tolerance(),
     )
-}
-
-/// Opt-in upstream budgets; ordinary runs retain the historical compatibility
-/// floors. The caller rejects a missing source tolerance in strict mode.
-pub fn strict_wpt_tolerance() -> bool {
-    std::env::var("WPT_STRICT_TOLERANCE").is_ok_and(|value| value == "1")
 }
 
 /// Reject missing or malformed source budgets instead of guessing in strict mode.
@@ -463,6 +457,7 @@ pub fn check_ulp_tolerance(
             )),
         );
     }
+    let tol = tolerance as u32;
     let abs_floor = if float16 { 1e-2_f32 } else { 2e-6_f32 };
     for (i, (&a, &e)) in actual.iter().zip(expected.iter()).enumerate() {
         let ulp = if float16 {
@@ -471,7 +466,7 @@ pub fn check_ulp_tolerance(
             ulp_distance_f32(a, e)
         };
         let abs_ok = allow_absolute_floor && (a - e).abs() <= abs_floor;
-        if u64::from(ulp) > tolerance && !abs_ok {
+        if ulp > tol && !abs_ok {
             return (
                 false,
                 Some(format!(
@@ -598,7 +593,7 @@ pub fn check_rtol_tolerance(actual: &[f32], expected: &[f32], rtol: f64) -> (boo
         }
         let denom = e.abs().max(eps);
         let rel = (a - e).abs() / denom;
-        if !a.is_finite() || rel > rtol_f {
+        if rel > rtol_f {
             return (
                 false,
                 Some(format!(
@@ -648,7 +643,7 @@ pub fn check_atol_tolerance(
             continue;
         }
         let diff = (a - e).abs();
-        if !a.is_finite() || diff > tol {
+        if diff > tol {
             return (
                 false,
                 Some(format!(

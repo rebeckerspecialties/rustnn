@@ -348,14 +348,12 @@ impl WptReportCollector {
                         .clone()
                         .or_else(|| report_output_path().map(|p| p.display().to_string())),
                     filter: state.filter.clone(),
-                    strict_tolerance: super::tolerance::strict_wpt_tolerance(),
+                    strict_tolerance: super::wpt_config::strict_wpt_tolerance(),
                     coreml_requested_device: state
                         .backends
                         .iter()
                         .any(|name| name == "coreml")
-                        .then(|| {
-                            std::env::var("WPT_COREML_DEVICE").unwrap_or_else(|_| "cpu".into())
-                        }),
+                        .then(|| super::wpt_config::coreml_requested_device().to_string()),
                 },
                 cwd: std::env::current_dir()
                     .map(|p| p.display().to_string())
@@ -405,7 +403,7 @@ fn backend_and_variant(backend_prefix: &str) -> (String, String) {
         "cann" => ("cann".to_string(), "npu".to_string()),
         "coreml" => (
             "coreml".to_string(),
-            std::env::var("WPT_COREML_DEVICE").unwrap_or_else(|_| "cpu".into()),
+            super::wpt_config::coreml_requested_device().to_string(),
         ),
         other => (other.to_string(), "default".to_string()),
     }

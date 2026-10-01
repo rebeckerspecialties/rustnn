@@ -223,9 +223,9 @@ impl WptAuditCollector {
         let state = self.inner.lock().expect("audit lock");
         let flagged_cases = state.cases.iter().filter(|c| c.flagged).count() as u64;
         let report = AuditReport {
-            strict_tolerance: super::tolerance::strict_wpt_tolerance(),
+            strict_tolerance: super::wpt_config::strict_wpt_tolerance(),
             coreml_requested_device: (state.backend == "coreml")
-                .then(|| std::env::var("WPT_COREML_DEVICE").unwrap_or_else(|_| "cpu".into())),
+                .then(|| super::wpt_config::coreml_requested_device().to_string()),
             backend: state.backend.clone(),
             passed_cases: state.cases.len() as u64,
             flagged_cases,

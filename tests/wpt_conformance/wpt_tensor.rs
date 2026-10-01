@@ -293,10 +293,7 @@ pub(crate) fn output_names(op: &WptOperator) -> Vec<String> {
 
 /// Serialize tensor spec data to bytes (for constants).
 pub(crate) fn tensor_spec_to_bytes(spec: &WptTensorSpec) -> Result<Vec<u8>, String> {
-    tensor_spec_to_bytes_with_mode(
-        spec,
-        std::env::var("WPT_STRICT_TOLERANCE").is_ok_and(|value| value == "1"),
-    )
+    tensor_spec_to_bytes_with_mode(spec, super::wpt_config::strict_wpt_tolerance())
 }
 
 pub(crate) fn tensor_spec_to_bytes_with_mode(
@@ -522,10 +519,7 @@ pub fn tensor_f32_values(spec: &WptTensorSpec) -> Vec<f32> {
 
 /// Float16 payload as raw bits for runtime I/O and builder constants.
 pub fn tensor_f16_bits(spec: &WptTensorSpec) -> Vec<u16> {
-    tensor_f16_bits_with_mode(
-        spec,
-        std::env::var("WPT_STRICT_TOLERANCE").is_ok_and(|value| value == "1"),
-    )
+    tensor_f16_bits_with_mode(spec, super::wpt_config::strict_wpt_tolerance())
 }
 
 pub(crate) fn tensor_f16_bits_with_mode(spec: &WptTensorSpec, strict: bool) -> Vec<u16> {

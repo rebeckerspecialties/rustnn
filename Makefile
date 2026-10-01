@@ -199,7 +199,7 @@ test-wpt-coreml:
 test-wpt-tolerance:
 	$(CARGO) test --test test_wpt_tolerance
 
-test-wpt-tolerance-parity:
+test-wpt-tolerance-parity: require-wpt-cache
 	$(CARGO) test --test test_wpt_tolerance strict_comparator_matches_upstream_javascript -- --ignored
 
 .PHONY: test-coreml-gather

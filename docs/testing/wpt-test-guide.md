@@ -130,6 +130,8 @@ preserves the historical default while exposing numerical conformance gaps.
 A missing or malformed source tolerance fails explicitly rather than selecting
 a local default. Strict mode accepts upstream ULP and ATOL, not the local RTOL
 extension. Keep strict and compatibility results separate when reporting passes.
+The compatibility ATOL/RTOL and ULP comparators retain their existing behavior;
+the stronger nonfinite gate and full-width ULP budgets apply only to strict mode.
 Callbacks that require intermediate operands are reevaluated with shapes and
 types from the Rust builder, using Node.js and the fetched source file. No
 tolerance formula is reimplemented. An upstream callback that still returns
@@ -146,7 +148,7 @@ Strict FP16 runtime inputs and constants also use
 the upstream halfway-rounding helper; compatibility packing is unchanged.
 
 `make test-wpt-tolerance` runs the comparator regressions without a backend.
-With Node.js and the fetched WPT corpus available, run
+Fetch the corpus with `make fetch-wpt`, then, with Node.js available, run
 `make test-wpt-tolerance-parity` to compare finite ULP cases directly with the
 upstream JavaScript helpers across every finite FP16 encoding, opposite signs,
 zeros and adjacent halfway values, plus FP32 and ATOL boundary cases. Set

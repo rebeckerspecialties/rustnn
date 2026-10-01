@@ -10,6 +10,9 @@ mod wpt_audit;
 #[path = "wpt_conformance/wpt_backend.rs"]
 mod wpt_backend;
 #[allow(dead_code)]
+#[path = "wpt_conformance/wpt_config.rs"]
+mod wpt_config;
+#[allow(dead_code)]
 #[path = "wpt_conformance/wpt_js_loader.rs"]
 mod wpt_js_loader;
 #[allow(dead_code)]
@@ -177,14 +180,18 @@ fn strict_nonfinite_gate_cannot_be_overridden_by_large_budget() {
 }
 
 #[test]
-fn compatibility_atol_and_rtol_reject_unexpected_nan() {
-    assert!(!tolerance::check_atol_tolerance(&[f32::NAN], &[0.0], 0.1).0);
-    assert!(!tolerance::check_rtol_tolerance(&[f32::NAN], &[0.0], 0.1).0);
+fn compatibility_comparators_retain_default_behavior() {
+    // Strict nonfinite rejection is opt-in; this PR must not change the
+    // historical comparisons used by unqualified backend configurations.
+    assert!(tolerance::check_atol_tolerance(&[f32::NAN], &[0.0], 0.1).0);
+    assert!(tolerance::check_rtol_tolerance(&[f32::NAN], &[0.0], 0.1).0);
+    assert!(!check_ulp_tolerance(&[1.0], &[0.0], 1u64 << 32, false, false).0);
+    assert!(!tolerance::check_atol_tolerance(&[1.0], &[0.0], 0.1).0);
+    assert!(!tolerance::check_rtol_tolerance(&[1.0], &[0.0], 0.1).0);
 }
 
 #[test]
-fn large_ulp_budget_is_not_truncated_to_u32() {
-    assert!(check_ulp_tolerance(&[1.0], &[0.0], 1u64 << 32, false, false).0);
+fn strict_large_ulp_budget_is_not_truncated_to_u32() {
     assert!(
         tolerance::validate_upstream_result(&[1.0], &[0.0], ToleranceKind::Ulp, 1u64 << 32, false)
             .0
