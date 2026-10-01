@@ -114,6 +114,13 @@ Rules that hold for every converter:
   A scalar result keeps the `[1]` CoreML boundary representation without changing the WebNN rank.
 - Float16 weights go to the weight blob written by `weight_file_builder.rs` and returned as
   `weights_data`.
+- Float16 `gelu` widens to float32 for MIL `gelu(mode="EXACT")`, then rounds back to
+  float16. Native float16 GELU can exceed WebNN's error bound under accelerator-enabled
+  policies. This preserves the public dtype and shape without forcing CPU execution;
+  float32 GELU is unchanged. Deferred layout transposes are emitted after the final cast.
+  Graphs containing float16 GELU use local file compilation: the in-memory compiler
+  still loses small values on A12/iOS 18 and A10X/tvOS 26 with GPU allowed. This
+  preserves the requested compute policy and does not widen stored weights or tensors.
 - The internal `shape` extension lowers to MIL `shape`, retaining its native int32 result
   inside CoreML and widening the public int64 result at readback. Imported shape tensors
   retain their type and rank through the shared `unsqueeze` inference path.

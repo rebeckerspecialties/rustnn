@@ -201,6 +201,10 @@ test-coreml-gather:
 test-coreml-dtypes:
 	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_dtypes -- $(TEST_FILTER) --test-threads=1
 
+.PHONY: test-coreml-gelu
+test-coreml-gelu:
+	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_gelu --test test_coreml_gelu_precision -- $(TEST_FILTER) --test-threads=1
+
 # Build every target, including examples and the separately run WPT harness.
 build-coreml:
 	$(CARGO) build --all-targets --no-default-features --features $(COREML_FEATURES)

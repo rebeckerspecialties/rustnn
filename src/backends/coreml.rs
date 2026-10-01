@@ -117,6 +117,12 @@ impl<'context, 'builder> MLBackendBuilder<'context, 'builder> for CoremlBuilder 
 /// differences.
 fn supports_in_memory_asset(graph: &GraphInfo) -> bool {
     !graph.operations.iter().any(|operation| match operation {
+        // With GPU allowed, MLModelAsset loses small values in promoted FP16
+        // GELU on A12/iOS 18 and A10X/tvOS 26. The same serialized model passes
+        // through local URL compilation; this does not change compute units.
+        Operation::Gelu { input, .. } => graph
+            .operand(*input)
+            .is_some_and(|operand| operand.descriptor.data_type == DataType::Float16),
         // MLModelAsset reports an invalid output feature shape when MIL gather
         // consumes a rank-0 index, although the URL compiler accepts it.
         Operation::Gather { indices, .. } => graph
@@ -427,6 +433,44 @@ mod test {
             Ok(ctx) => Some(ctx),
             Err(crate::error::Error::NoBackendAvailableForBackendHint { .. }) => None,
             Err(e) => panic!("unexpected context creation error: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn gelu_url_compilation_is_limited_to_float16() {
+        use crate::graph::{DataType, GraphInfo, Operand, OperandDescriptor, OperandKind};
+        use crate::operators::Operation;
+
+        for data_type in [DataType::Float16, DataType::Float32] {
+            let mut graph = GraphInfo {
+                operands: vec![Operand {
+                    kind: OperandKind::Input,
+                    name: Some("input".into()),
+                    descriptor: OperandDescriptor {
+                        data_type,
+                        shape: vec![],
+                        pending_permutation: vec![],
+                    },
+                }],
+                operations: vec![Operation::Gelu {
+                    input: 0,
+                    options: None,
+                    outputs: vec![1],
+                }],
+                ..Default::default()
+            };
+            let mut output = graph.operands[0].clone();
+            output.kind = OperandKind::Output;
+            output.name = Some("result".into());
+            graph.operands.push(output);
+            graph.input_operands = vec![0];
+            graph.output_operands = vec![1];
+            assert_eq!(
+                super::supports_in_memory_asset(&graph),
+                data_type != DataType::Float16
+            );
+            graph.operations.clear();
+            assert!(super::supports_in_memory_asset(&graph));
         }
     }
 
