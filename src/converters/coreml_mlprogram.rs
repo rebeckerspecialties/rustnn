@@ -1810,6 +1810,7 @@ impl CoremlMlProgramConverter {
                     // Native Half clip changes represented values under A12
                     // accelerator-enabled policies, including an exact zero.
                     | "clip"
+                    | "instance_norm"
             );
             let half = operation.outputs.iter().any(|value| {
                 tensor(value).is_some_and(|t| t.data_type == MilDataType::Float16 as i32)
@@ -9039,15 +9040,15 @@ impl CoremlMlProgramConverter {
                         .unwrap_or(false)
                 };
                 let layer_norm = matches!(op, Operation::LayerNormalization { .. });
-                let half_layer_norm = layer_norm
-                    && op
-                        .input_operands()
-                        .first()
-                        .and_then(|&id| graph_info.operand(id))
-                        .is_some_and(|operand| operand.descriptor.data_type == DataType::Float16);
+                let half_normalization = op
+                    .input_operands()
+                    .first()
+                    .and_then(|&id| graph_info.operand(id))
+                    .is_some_and(|operand| operand.descriptor.data_type == DataType::Float16);
+                let half_layer_norm = layer_norm && half_normalization;
                 if is_runtime(scale_id)
                     || is_runtime(bias_id)
-                    || (layer_norm && (scale_id.is_some() || bias_id.is_some()))
+                    || ((layer_norm || half_normalization) && (scale_id.is_some() || bias_id.is_some()))
                 {
                     let x_id = *op.input_operands().first().ok_or_else(|| {
                         GraphError::ConversionFailed {
@@ -9064,7 +9065,7 @@ impl CoremlMlProgramConverter {
                             })?;
                     let x_shape = x_op.descriptor.static_or_max_shape();
                     let rank = x_shape.len();
-                    let mil_dtype = if half_layer_norm {
+                    let mil_dtype = if half_normalization {
                         crate::protos::coreml::mil_spec::DataType::Float32 as i32
                     } else {
                         Self::graph_value_mil_type(&x_op.descriptor.data_type)?
@@ -9163,7 +9164,7 @@ impl CoremlMlProgramConverter {
                         &stripped,
                         &norm_overrides,
                     )?;
-                    if half_layer_norm {
+                    if half_normalization {
                         let wide_name = fresh("normalization_fp32_input");
                         main_block.operations.push(Self::create_cast_operation(
                             Self::output_name_for_operand(
@@ -9185,6 +9186,9 @@ impl CoremlMlProgramConverter {
                             Operation::LayerNormalization { options, .. } => {
                                 options.as_ref().map_or(1e-5, |o| o.epsilon)
                             }
+                            Operation::InstanceNormalization { options, .. } => {
+                                options.as_ref().map_or(1e-5, |o| o.epsilon)
+                            }
                             _ => unreachable!(),
                         };
                         mil.inputs.insert(
@@ -9197,11 +9201,22 @@ impl CoremlMlProgramConverter {
                             norm_name.clone(),
                             mil_dtype,
                         )?];
+                        if matches!(op, Operation::InstanceNormalization { options: Some(options), .. }
+                            if options.layout.eq_ignore_ascii_case("nhwc"))
+                        {
+                            // Normalize exactly the NHWC spatial axes. Gamma
+                            // and beta are applied below on the channel axis;
+                            // widening them must not turn native const params
+                            // into live Pipeline features.
+                            mil.r#type = mil_ops::LAYER_NORM.into();
+                            mil.inputs
+                                .insert("axes".into(), Self::create_immediate_int_array(&[1, 2]));
+                        }
                     }
                     main_block.operations.push(mil);
 
                     let mut cur = norm_name;
-                    if half_layer_norm && scale_id.is_none() && bias_id.is_some() {
+                    if half_normalization && scale_id.is_none() && bias_id.is_some() {
                         // A fused normalization-plus-bias plan can apply the
                         // broadcast bias only to its first batch. Explicit unit
                         // scale retains the complete affine composition.
@@ -9233,7 +9248,7 @@ impl CoremlMlProgramConverter {
                             param_id,
                             &operand_name_overrides,
                         );
-                        if half_layer_norm {
+                        if half_normalization {
                             let wide_name = fresh(&format!("{tag}_fp32"));
                             main_block.operations.push(Self::create_cast_operation(
                                 param_name,
@@ -9279,7 +9294,7 @@ impl CoremlMlProgramConverter {
                             fresh(&format!("{tag}_bcast")),
                             mil_dtype,
                         );
-                        let (step_name, step_type) = if i == last && !half_layer_norm {
+                        let (step_name, step_type) = if i == last && !half_normalization {
                             (out_name.clone(), out_type.clone())
                         } else {
                             let name = fresh(&format!("{tag}_applied"));
@@ -9301,7 +9316,7 @@ impl CoremlMlProgramConverter {
                         ));
                         cur = step_name;
                     }
-                    if half_layer_norm {
+                    if half_normalization {
                         main_block
                             .operations
                             .push(Self::create_cast_operation(cur, out_type, "fp16"));

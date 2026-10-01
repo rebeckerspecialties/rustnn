@@ -485,7 +485,9 @@ fn shape_bounds_seeded(
                 continue;
             }
             let input = match operation.r#type.as_str() {
-                "cast" | "identity" | "band_part" => named_input(operation, "x"),
+                "cast" | "identity" | "band_part" | "layer_norm" | "instance_norm" => {
+                    named_input(operation, "x")
+                }
                 "fill_like" => named_input(operation, "ref_tensor"),
                 _ => None,
             };
@@ -1127,6 +1129,7 @@ impl CoremlMlProgramConverter {
                             | Operation::Triangular { .. }
                             | Operation::IsNaN { .. }
                             | Operation::IsInfinite { .. }
+                            | Operation::InstanceNormalization { .. }
                     )
                 })
                 .flat_map(|operation| operation.all_input_operands())
@@ -1356,6 +1359,7 @@ impl CoremlMlProgramConverter {
                         | Operation::Prelu { .. }
                         | Operation::Gemm { .. }
                         | Operation::Triangular { .. }
+                        | Operation::InstanceNormalization { .. }
                 )
             })
             .flat_map(|operation| operation.outputs())
