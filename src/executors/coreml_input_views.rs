@@ -1,0 +1,387 @@
+//! Bind converter-private flat Half views without changing public WebNN inputs.
+
+#[cfg(any(target_vendor = "apple", test))]
+use std::collections::HashSet;
+use std::ffi::c_void;
+use std::ptr;
+
+use block::ConcreteBlock;
+use objc::runtime::{BOOL, NO, Object};
+use objc::{class, msg_send, sel, sel_impl};
+use serde::Deserialize;
+
+use super::{
+    NativeType, ReleaseOnDrop, boundary_error, create_multi_array, multiarray_storage,
+    ns_error_to_string, nsarray_to_i64_vec, nsstring_from_str, read_array_storage,
+    write_array_storage,
+};
+use crate::error::GraphError;
+
+#[cfg(target_vendor = "apple")]
+use super::nsarray_to_strings;
+
+#[cfg(target_vendor = "apple")]
+pub(crate) const METADATA_KEY: &str = "rustnn.webnn.compact_input_views";
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Binding {
+    pub(crate) source: String,
+    pub(crate) view: String,
+}
+
+#[cfg(any(target_vendor = "apple", test))]
+fn parse(json: &str, declared_inputs: &[String]) -> Result<Vec<Binding>, GraphError> {
+    let bindings: Vec<Binding> = serde_json::from_str(json).map_err(|error| {
+        boundary_error(format!("invalid CoreML compact-input metadata: {error}"))
+    })?;
+    let mut sources = HashSet::new();
+    let mut views = HashSet::new();
+    for binding in &bindings {
+        if binding.source.is_empty()
+            || binding.view.is_empty()
+            || binding.source == binding.view
+            || !declared_inputs.contains(&binding.source)
+            || !declared_inputs.contains(&binding.view)
+            || !sources.insert(&binding.source)
+            || !views.insert(&binding.view)
+        {
+            return Err(boundary_error(format!(
+                "invalid compact input `{}` from `{}`",
+                binding.view, binding.source
+            )));
+        }
+    }
+    if sources.iter().any(|source| views.contains(source)) {
+        return Err(boundary_error("compact-input bindings cannot chain"));
+    }
+    Ok(bindings)
+}
+
+pub(crate) unsafe fn from_model(model: *mut Object) -> Result<Vec<Binding>, GraphError> {
+    #[cfg(target_vendor = "apple")]
+    {
+        let Some(json) = (unsafe { super::model_metadata_value(model, METADATA_KEY)? }) else {
+            return Ok(Vec::new());
+        };
+        let description: *mut Object = msg_send![model, modelDescription];
+        let inputs: *mut Object = msg_send![description, inputDescriptionsByName];
+        let keys: *mut Object = msg_send![inputs, allKeys];
+        let bindings = parse(&json, &unsafe { nsarray_to_strings(keys) })?;
+        for binding in &bindings {
+            let source = unsafe { declared_half_input(inputs, &binding.source, false)? };
+            let view = unsafe { declared_half_input(inputs, &binding.view, true)? };
+            let _ = (source, view);
+        }
+        Ok(bindings)
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        let _ = model;
+        Ok(Vec::new())
+    }
+}
+
+unsafe fn declared_half_input(
+    input_descriptions: *mut Object,
+    name: &str,
+    flat: bool,
+) -> Result<*mut Object, GraphError> {
+    let key = unsafe { nsstring_from_str(name)? };
+    let description: *mut Object = msg_send![input_descriptions, objectForKey: key];
+    if description.is_null() {
+        return Err(boundary_error(format!(
+            "compact input `{name}` is not declared"
+        )));
+    }
+    let constraint: *mut Object = msg_send![description, multiArrayConstraint];
+    if constraint.is_null() {
+        return Err(boundary_error(format!(
+            "compact input `{name}` is not a multi-array"
+        )));
+    }
+    let code: i64 = msg_send![constraint, dataType];
+    if NativeType::from_code(code)? != NativeType::Float16 {
+        return Err(boundary_error(format!(
+            "compact input `{name}` must have Half storage"
+        )));
+    }
+    if flat {
+        let shape: *mut Object = msg_send![constraint, shape];
+        if unsafe { nsarray_to_i64_vec(shape)? }.len() != 1 {
+            return Err(boundary_error(format!(
+                "compact view `{name}` must have rank one"
+            )));
+        }
+    }
+    Ok(description)
+}
+
+/// Owns the native view through prediction. A borrowed-pointer view's native
+/// deallocator block additionally retains the source array until the view itself
+/// dies, including if CoreML retains it beyond the caller's dictionary lifetime.
+pub(crate) struct OwnedView {
+    array: ReleaseOnDrop,
+    #[cfg(all(test, target_vendor = "apple"))]
+    copied: bool,
+}
+
+unsafe fn flat_view(source: *mut Object) -> Result<OwnedView, GraphError> {
+    if source.is_null() {
+        return Err(boundary_error("compact input source has no native array"));
+    }
+    let (kind, layout, data) = unsafe { multiarray_storage(source)? };
+    if kind != NativeType::Float16 {
+        return Err(boundary_error(
+            "compact input source must retain Half storage",
+        ));
+    }
+    let count = i64::try_from(layout.count)
+        .map_err(|_| boundary_error("compact input element count exceeds native shape range"))?;
+    if !layout.contiguous {
+        let bytes = unsafe { read_array_storage(data, &layout, kind.element_size()) };
+        let array = unsafe { create_multi_array(&[count], kind.code())? };
+        let array: *mut Object = msg_send![array, retain];
+        let array = ReleaseOnDrop(array);
+        let (actual_kind, actual_layout, actual_data) = unsafe { multiarray_storage(array.0)? };
+        if actual_kind != kind || actual_layout.count != layout.count {
+            return Err(boundary_error(
+                "compact input copy allocation has the wrong type or length",
+            ));
+        }
+        unsafe { write_array_storage(actual_data, &actual_layout, kind.element_size(), &bytes)? };
+        return Ok(OwnedView {
+            array,
+            #[cfg(all(test, target_vendor = "apple"))]
+            copied: true,
+        });
+    }
+
+    let retained: *mut Object = msg_send![source, retain];
+    let source_owner = ReleaseOnDrop(retained);
+    let deallocator = ConcreteBlock::new(move |_data: *mut c_void| {
+        // Capture the entire owner, not its raw pointer. Dropping the copied
+        // block releases the source after MLMultiArray has finished with it.
+        let _ = &source_owner;
+    })
+    .copy();
+    let number: *mut Object = msg_send![class!(NSNumber), numberWithLongLong: count];
+    let shape: *mut Object = msg_send![class!(NSArray), arrayWithObject: number];
+    let one: *mut Object = msg_send![class!(NSNumber), numberWithLongLong: 1i64];
+    let strides: *mut Object = msg_send![class!(NSArray), arrayWithObject: one];
+    let mut error: *mut Object = ptr::null_mut();
+    let alloc: *mut Object = msg_send![class!(MLMultiArray), alloc];
+    let array: *mut Object = msg_send![alloc,
+        initWithDataPointer: data.cast::<c_void>()
+        shape: shape
+        dataType: kind.code()
+        strides: strides
+        deallocator: &*deallocator
+        error: &mut error];
+    if array.is_null() {
+        return Err(boundary_error(unsafe {
+            ns_error_to_string(error, "compact input view init failed")
+        }));
+    }
+    let array = ReleaseOnDrop(array);
+    let (actual_kind, actual_layout, actual_data) = unsafe { multiarray_storage(array.0)? };
+    if actual_kind != kind
+        || actual_layout.count != layout.count
+        || !actual_layout.contiguous
+        || actual_data != data
+    {
+        return Err(boundary_error(
+            "compact input view did not preserve its storage pointer/type/count",
+        ));
+    }
+    Ok(OwnedView {
+        array,
+        #[cfg(all(test, target_vendor = "apple"))]
+        copied: false,
+    })
+}
+
+/// Add only declared converter-private views to the input dictionary. Callers
+/// keep these guards alive until synchronous prediction has finished.
+pub(crate) unsafe fn bind(
+    model: *mut Object,
+    dictionary: *mut Object,
+    bindings: &[Binding],
+) -> Result<Vec<OwnedView>, GraphError> {
+    let description: *mut Object = msg_send![model, modelDescription];
+    let descriptions: *mut Object = msg_send![description, inputDescriptionsByName];
+    let mut result = Vec::with_capacity(bindings.len());
+    for binding in bindings {
+        let source_description =
+            unsafe { declared_half_input(descriptions, &binding.source, false)? };
+        let view_description = unsafe { declared_half_input(descriptions, &binding.view, true)? };
+        let source_key = unsafe { nsstring_from_str(&binding.source)? };
+        let source_feature: *mut Object = msg_send![dictionary, objectForKey: source_key];
+        if source_feature.is_null() {
+            return Err(boundary_error(format!(
+                "compact input source `{}` is not bound",
+                binding.source
+            )));
+        }
+        let allowed: BOOL = msg_send![source_description, isAllowedValue: source_feature];
+        if allowed == NO {
+            return Err(boundary_error(format!(
+                "compact input source `{}` violates its declared type/shape",
+                binding.source
+            )));
+        }
+        let source: *mut Object = msg_send![source_feature, multiArrayValue];
+        let view = unsafe { flat_view(source)? };
+        let feature: *mut Object =
+            msg_send![class!(MLFeatureValue), featureValueWithMultiArray: view.array.0];
+        let allowed: BOOL = msg_send![view_description, isAllowedValue: feature];
+        if allowed == NO {
+            return Err(boundary_error(format!(
+                "compact view `{}` violates its declared type/shape",
+                binding.view
+            )));
+        }
+        let key = unsafe { nsstring_from_str(&binding.view)? };
+        let () = msg_send![dictionary, setObject: feature forKey: key];
+        result.push(view);
+    }
+    Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_metadata_requires_distinct_declared_one_level_bindings() {
+        let declared = vec!["x".into(), "x_view".into(), "y".into(), "y_view".into()];
+        assert_eq!(
+            parse(r#"[{"source":"x","view":"x_view"}]"#, &declared)
+                .unwrap()
+                .len(),
+            1
+        );
+        for invalid in [
+            r#"{}"#,
+            r#"[{"source":"x","view":"x_view","unknown":true}]"#,
+            r#"[{"source":"missing","view":"x_view"}]"#,
+            r#"[{"source":"x","view":"missing"}]"#,
+            r#"[{"source":"x","view":"x"}]"#,
+            r#"[{"source":"","view":"x_view"}]"#,
+            r#"[{"source":"x","view":"x_view"},{"source":"x","view":"y_view"}]"#,
+            r#"[{"source":"x","view":"x_view"},{"source":"y","view":"x_view"}]"#,
+            r#"[{"source":"x","view":"x_view"},{"source":"x_view","view":"y_view"}]"#,
+        ] {
+            assert!(parse(invalid, &declared).is_err(), "accepted {invalid}");
+        }
+    }
+
+    #[cfg(target_vendor = "apple")]
+    unsafe fn strided_source(data: &mut [u8], shape: &[i64], strides: &[i64]) -> *mut Object {
+        let numbers = |values: &[i64]| {
+            let values: Vec<*mut Object> = values
+                .iter()
+                .map(|&value| {
+                    let number: *mut Object =
+                        msg_send![class!(NSNumber), numberWithLongLong: value];
+                    number
+                })
+                .collect();
+            let array: *mut Object =
+                msg_send![class!(NSArray), arrayWithObjects: values.as_ptr() count: values.len()];
+            array
+        };
+        let alloc: *mut Object = msg_send![class!(MLMultiArray), alloc];
+        let mut error: *mut Object = ptr::null_mut();
+        let array: *mut Object = msg_send![alloc,
+            initWithDataPointer: data.as_mut_ptr().cast::<c_void>()
+            shape: numbers(shape)
+            dataType: NativeType::Float16.code()
+            strides: numbers(strides)
+            deallocator: ptr::null_mut::<Object>()
+            error: &mut error];
+        assert!(!array.is_null(), "{}", unsafe {
+            ns_error_to_string(error, "strided source init failed")
+        });
+        let array: *mut Object = msg_send![array, autorelease];
+        array
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn contiguous_half_view_retains_source_after_its_pool_drains() {
+        let expected: Vec<u8> = [0x8000_u16, 1, 0x8001, 0x7e01, 0x7c00, 0xfc00]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let view = objc::rc::autoreleasepool(|| unsafe {
+            let source = create_multi_array(&[1, 2, 1, 3], NativeType::Float16.code()).unwrap();
+            let (kind, layout, pointer) = multiarray_storage(source).unwrap();
+            write_array_storage(pointer, &layout, kind.element_size(), &expected).unwrap();
+            let view = flat_view(source).unwrap();
+            let (_, flat, flat_pointer) = multiarray_storage(view.array.0).unwrap();
+            assert!(!view.copied);
+            assert_eq!(pointer, flat_pointer);
+            assert_eq!(flat.count, 6);
+            view
+        });
+        // The source's +0 pool reference is gone. Only the native view's
+        // copied deallocator block owns it while its bytes are read here.
+        objc::rc::autoreleasepool(|| unsafe {
+            let (kind, layout, pointer) = multiarray_storage(view.array.0).unwrap();
+            assert_eq!(
+                read_array_storage(pointer, &layout, kind.element_size()),
+                expected
+            );
+        });
+        drop(view);
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn padded_half_sources_copy_exact_bits_and_not_padding() {
+        let expected: Vec<u8> = [0x8000_u16, 1, 0x8001, 0x7e01, 0x7c00, 0xfc00]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        for (shape, strides, length) in [
+            (vec![2, 3], vec![8, 2], 28),
+            (vec![1, 6, 1, 1], vec![512, 32, 32, 1], 324),
+        ] {
+            let mut source_bytes = vec![0x55; length];
+            let view = objc::rc::autoreleasepool(|| unsafe {
+                let source = strided_source(&mut source_bytes, &shape, &strides);
+                let (kind, layout, pointer) = multiarray_storage(source).unwrap();
+                assert!(!layout.contiguous);
+                write_array_storage(pointer, &layout, kind.element_size(), &expected).unwrap();
+                let before = source_bytes.clone();
+                let view = flat_view(source).unwrap();
+                let (_, flat, flat_pointer) = multiarray_storage(view.array.0).unwrap();
+                assert!(view.copied);
+                assert_ne!(pointer, flat_pointer);
+                assert!(flat.contiguous);
+                assert_eq!(source_bytes, before);
+                view
+            });
+            source_bytes.fill(0);
+            drop(source_bytes);
+            objc::rc::autoreleasepool(|| unsafe {
+                let (kind, layout, pointer) = multiarray_storage(view.array.0).unwrap();
+                assert_eq!(
+                    read_array_storage(pointer, &layout, kind.element_size()),
+                    expected
+                );
+            });
+        }
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn compact_views_reject_other_storage_and_null_sources() {
+        objc::rc::autoreleasepool(|| unsafe {
+            assert!(flat_view(ptr::null_mut()).is_err());
+            let source = create_multi_array(&[2], NativeType::Float32.code()).unwrap();
+            assert!(flat_view(source).is_err());
+        });
+    }
+}
