@@ -2628,6 +2628,146 @@ impl CoremlMlProgramConverter {
         }
     }
 
+    /// Native reduce_log_sum adds a non-WebNN epsilon on older CoreML stacks.
+    /// Use zero-epsilon log and wide Half accumulation instead.
+    fn emit_reduce_log_sum(
+        graph: &GraphInfo,
+        op: &Operation,
+        overrides: &HashMap<u32, String>,
+        block: &mut Block,
+    ) -> Result<(), GraphError> {
+        let Operation::ReduceLogSum { input, options, .. } = op else {
+            return Err(GraphError::ConversionFailed {
+                format: "coreml_mlprogram".into(),
+                reason: "LogSum lowering called on another operation".into(),
+            });
+        };
+        let output = op
+            .output_operand()
+            .ok_or_else(|| GraphError::ConversionFailed {
+                format: "coreml_mlprogram".into(),
+                reason: "LogSum requires an output".into(),
+            })?;
+        let operand = graph
+            .operand(*input)
+            .ok_or_else(|| GraphError::ConversionFailed {
+                format: "coreml_mlprogram".into(),
+                reason: format!("LogSum input {input} not found"),
+            })?;
+        let half = match operand.descriptor.data_type {
+            DataType::Float16 => true,
+            DataType::Float32 => false,
+            _ => {
+                return Err(GraphError::ConversionFailed {
+                    format: "coreml_mlprogram".into(),
+                    reason: "LogSum requires floating input".into(),
+                });
+            }
+        };
+        let float32 = crate::protos::coreml::mil_spec::DataType::Float32 as i32;
+        let rank = operand.descriptor.shape.len();
+        let axes: Vec<u32> = options
+            .as_ref()
+            .and_then(|options| options.axes.clone())
+            .unwrap_or_else(|| (0..rank as u32).collect());
+        if axes.iter().any(|&axis| axis as usize >= rank) {
+            return Err(GraphError::ConversionFailed {
+                format: "coreml_mlprogram".into(),
+                reason: "LogSum axis out of range".into(),
+            });
+        }
+        let (output_name, output_type) = Self::create_output_value(graph, output, overrides)?;
+        let mut working_shape = if rank == 0 {
+            vec![GraphDimension::Static(1)]
+        } else {
+            operand.descriptor.shape.clone()
+        };
+        let mut current = Self::output_name_for_operand(graph, *input, overrides);
+        if half {
+            current = Self::cast_with_graph_shape(
+                block,
+                &current,
+                format!("{output_name}_logsum_wide_input"),
+                float32,
+                &working_shape,
+            );
+        }
+        if !axes.is_empty() {
+            for &axis in &axes {
+                working_shape[axis as usize] = GraphDimension::Static(1);
+            }
+            let sum_name = format!("{output_name}_logsum_sum");
+            let sum_type =
+                Self::create_named_value_type(sum_name.clone(), float32, &working_shape, false);
+            let mut inputs = HashMap::new();
+            inputs.insert("x".into(), Self::create_name_argument(current));
+            inputs.insert("axes".into(), Self::create_immediate_int_array(&axes));
+            inputs.insert("keep_dims".into(), Self::create_immediate_bool(true));
+            block.operations.push(Self::create_mil_operation(
+                mil_ops::REDUCE_SUM,
+                inputs,
+                vec![sum_type],
+            ));
+            current = sum_name;
+        }
+        let needs_shape = !axes.is_empty()
+            && !options
+                .as_ref()
+                .is_some_and(|options| options.keep_dimensions);
+        let log_name = if half || needs_shape {
+            format!("{output_name}_logsum_log")
+        } else {
+            output_name.clone()
+        };
+        let log_type = if half || needs_shape {
+            Self::create_named_value_type(log_name.clone(), float32, &working_shape, false)
+        } else {
+            output_type.clone()
+        };
+        let mut inputs = HashMap::new();
+        inputs.insert("x".into(), Self::create_name_argument(current));
+        inputs.insert("epsilon".into(), Self::create_immediate_float(0.));
+        block.operations.push(Self::create_mil_operation(
+            mil_ops::LOG,
+            inputs,
+            vec![log_type],
+        ));
+        current = log_name;
+        if needs_shape {
+            let shape_name = if half {
+                format!("{output_name}_logsum_wide_output")
+            } else {
+                output_name.clone()
+            };
+            let shape_type =
+                Self::create_value_with_mil_type(graph, output, shape_name.clone(), float32)?;
+            let mut inputs = HashMap::new();
+            inputs.insert("x".into(), Self::create_name_argument(current));
+            let scalar = graph
+                .operand(output)
+                .is_some_and(|operand| operand.descriptor.shape.is_empty());
+            let operation = if scalar {
+                inputs.insert("shape".into(), Self::create_immediate_int_array(&[1]));
+                mil_ops::RESHAPE
+            } else {
+                inputs.insert("axes".into(), Self::create_immediate_int_array(&axes));
+                mil_ops::SQUEEZE
+            };
+            block.operations.push(Self::create_mil_operation(
+                operation,
+                inputs,
+                vec![shape_type],
+            ));
+            current = shape_name;
+        }
+        if half {
+            block
+                .operations
+                .push(Self::create_cast_operation(current, output_type, "fp16"));
+        }
+        Ok(())
+    }
+
     /// Lower `reduceLogSumExp` using the numerically stable max-shift identity:
     ///
     /// `log(sum(exp(x))) = max(x) + log(sum(exp(x - max(x))))`.
@@ -8714,6 +8854,21 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                 continue;
             }
 
+            if op_type_lower == "reducelogsum" {
+                Self::emit_reduce_log_sum(
+                    graph_info,
+                    op,
+                    &operand_name_overrides,
+                    &mut main_block,
+                )?;
+                if let Some(output) = op.output_operand()
+                    && let Some((pending, name)) = deferred_transposes.remove(&output)
+                {
+                    main_block.operations.extend(pending);
+                    operand_name_overrides.insert(output, name);
+                }
+                continue;
+            }
             if op_type_lower == "reducelogsumexp" {
                 Self::emit_stable_reduce_log_sum_exp(
                     graph_info,
