@@ -54,6 +54,8 @@ establishes placement, energy savings or prediction-time fallback; use separate 
    turn and reports each attempt; `--coreml-compiled-output <dir>` stores the compiled
    `.mlmodelc` for reuse.
 
+## Tensor names
+
 Input and output names remain independent in the RustNN API, including names containing
 spaces, Unicode, punctuation, leading digits or MIL keywords. The converter records JSON
 logical-to-physical bindings in creator-defined `rustnn.webnn.input_aliases` and

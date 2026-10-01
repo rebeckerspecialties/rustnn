@@ -102,6 +102,10 @@ Rules that hold for every converter:
 
 ### CoreML
 
+- WebNN operand names are reversibly escaped when they are not valid MIL identifiers or are
+  reserved words. The model carries an explicit name-encoding metadata marker; runtime binding
+  translation is enabled only for marked models. See the
+  [tensor-name contract](https://rustnn.github.io/rustnn/integration/coreml/#tensor-names).
 - MIL has no rank-0 tensors at the boundary, no dilation in pooling, no `edge`/`reflection`
   padding above two dimensions and no tensors of rank 6 and above; integer arithmetic runs in
   float32.
