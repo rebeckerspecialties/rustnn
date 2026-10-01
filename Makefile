@@ -128,6 +128,10 @@ test:
 	@echo "Checking backend operator support report drift..."
 	$(MAKE) docs-backend-ops-check
 
+.PHONY: test-coreml-spatial-reductions
+test-coreml-spatial-reductions:
+	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_fp16_spatial_reductions -- $(TEST_FILTER) --test-threads=1
+
 fetch-wpt:
 	node scripts/fetch_wpt.mjs
 

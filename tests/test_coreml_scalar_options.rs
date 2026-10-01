@@ -369,7 +369,9 @@ fn normalization_epsilon_rounds_the_original_double_to_half() {
         &json!({"epsilon":epsilon}),
     )
     .unwrap();
-    expect_scalar(&graph, "batch_norm", "epsilon", 0x3c01);
+    // The complete Half BatchNorm formula adds its represented epsilon to
+    // variance in Float32 instead of using native batch_norm const parameters.
+    expect_scalar(&graph, "add", "y", 0x3c01);
 }
 
 #[test]
