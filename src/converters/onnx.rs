@@ -28,7 +28,7 @@ use crate::converters::{ConvertedGraph, ONNX_EXTERNAL_WEIGHTS_FILENAME, operand_
 use crate::debug_print;
 use crate::error::GraphError;
 use crate::graph::{
-    DataType, Dimension, GraphInfo, OperandKind, get_static_or_max_size, unpack_int4, unpack_uint4,
+    DataType, Dimension, GraphInfo, get_static_or_max_size, unpack_int4, unpack_uint4,
 };
 use crate::operator_enums::MLOperandDataType;
 use crate::operator_options::{MLDimension, MLPool2dOptions, mldimensions_static_or_max};
@@ -43,8 +43,6 @@ use crate::shape_inference::{
     broadcast_shapes, infer_gather_shape, infer_matmul_shape, infer_transpose_shape,
     infer_unsqueeze_shape, infer_where_shape,
 };
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
 use prost::Message;
 use webnn_onnx_utils::{
     attributes::AttrBuilder, data_types as utils_data_types, operation_names::mapper,
@@ -3135,143 +3133,6 @@ impl crate::converters::GraphConverter for OnnxConverter {
                         continue;
                     }
                 }
-            }
-
-            // WebNN constant() op: encode as initializer, not a node
-            if matches!(&op, Operation::Constant { .. }) {
-                let output_id = op.output_operand().ok_or_else(|| {
-                    Self::invalid_operand("constant output", idx as u32, Some((op, idx)))
-                })?;
-
-                // Get constant data: try 'init' from typed options first, then 'data' (inline base64).
-                let (init_opt, data_opt, dtype_str_opt) = match &op {
-                    Operation::Constant { options, .. } => options
-                        .as_ref()
-                        .map(|o| {
-                            (
-                                o.init.clone(),
-                                o.data.clone(),
-                                (!o.data_type.is_empty()).then(|| o.data_type.clone()),
-                            )
-                        })
-                        .unwrap_or((None, None, None)),
-                    _ => (None, None, None),
-                };
-
-                let data = if let Some(init_ref) = init_opt {
-                    // 'init' attribute references a named constant declaration (e.g., "$_name")
-                    // The operand name in the graph keeps the '$' prefix
-                    debug_print!("[DEBUG] Constant operation with 'init' reference:");
-                    debug_print!("  Operation index: {}", idx);
-                    debug_print!("  Output operand: {}", output_id);
-                    debug_print!("  Init reference: {}", init_ref);
-                    debug_print!("  Looking for constant operand named: {}", init_ref);
-
-                    // Find the constant operand with matching name
-                    // Note: Named constants from the constants{} section have OperandKind::Constant
-                    let const_operand_id = graph
-                        .operands
-                        .iter()
-                        .enumerate()
-                        .find(|(_, op)| {
-                            op.name.as_deref() == Some(init_ref.as_str())
-                                && op.kind == OperandKind::Constant
-                        })
-                        .map(|(id, _)| id as u32)
-                        .ok_or_else(|| {
-                            debug_print!("[DEBUG] Failed to find constant operand:");
-                            debug_print!("  All constant operands:");
-                            for (id, op) in graph.operands.iter().enumerate() {
-                                if op.kind == OperandKind::Constant {
-                                    debug_print!("    ID {}: name={:?}", id, op.name);
-                                }
-                            }
-                            GraphError::ConversionFailed {
-                                format: "onnx".to_string(),
-                                reason: format!(
-                                    "Constant op init='{}' references unknown constant operand",
-                                    init_ref
-                                ),
-                            }
-                        })?;
-
-                    // Look up the constant data
-                    graph
-                        .constant_operand_ids_to_handles
-                        .get(&const_operand_id)
-                        .map(|const_data| const_data.data.clone())
-                        .ok_or_else(|| GraphError::ConversionFailed {
-                            format: "onnx".to_string(),
-                            reason: format!(
-                                "Constant op init='{}' found operand {} but no data in constant_operand_ids_to_handles",
-                                init_ref, const_operand_id
-                            ),
-                        })?
-                } else if let Some(data_b64) = data_opt {
-                    // 'data' attribute contains inline base64-encoded data
-                    STANDARD
-                        .decode(data_b64)
-                        .map_err(|e| GraphError::ConversionFailed {
-                            format: "onnx".to_string(),
-                            reason: format!("Constant op base64 decode failed: {}", e),
-                        })?
-                } else {
-                    debug_print!("[DEBUG] Constant operation missing 'data' or 'init' attribute:");
-                    debug_print!("  Operation index: {}", idx);
-                    debug_print!("  Output operand: {}", output_id);
-                    return Err(GraphError::ConversionFailed {
-                        format: "onnx".to_string(),
-                        reason: "Constant op missing both 'data' and 'init' attributes (use typed options)".to_string(),
-                    });
-                };
-
-                let dtype_str = dtype_str_opt.ok_or_else(|| GraphError::ConversionFailed {
-                    format: "onnx".to_string(),
-                    reason: "Constant op missing 'dataType' attribute".to_string(),
-                })?;
-                let data_type = match dtype_str.to_ascii_lowercase().as_str() {
-                    "float32" => DataType::Float32,
-                    "float16" => DataType::Float16,
-                    "int32" => DataType::Int32,
-                    "uint32" => DataType::Uint32,
-                    "int64" => DataType::Int64,
-                    "uint64" => DataType::Uint64,
-                    "int8" => DataType::Int8,
-                    "uint8" => DataType::Uint8,
-                    "int4" => DataType::Int4,
-                    "uint4" => DataType::Uint4,
-                    other => {
-                        return Err(GraphError::ConversionFailed {
-                            format: "onnx".to_string(),
-                            reason: format!("Unsupported constant dataType '{}'", other),
-                        });
-                    }
-                };
-
-                let shape: Vec<i64> = graph
-                    .operand(output_id)
-                    .ok_or_else(|| {
-                        Self::invalid_operand(
-                            "constant output shape lookup",
-                            output_id,
-                            Some((op, idx)),
-                        )
-                    })?
-                    .descriptor
-                    .static_or_max_shape()
-                    .into_iter()
-                    .map(i64::from)
-                    .collect();
-
-                initializers.push(TensorProto {
-                    name: operand_name(graph, output_id),
-                    data_type: Self::data_type_code(data_type) as i32,
-                    dims: shape,
-                    raw_data: data,
-                    ..Default::default()
-                });
-
-                continue;
             }
 
             let op_name = {
@@ -8335,21 +8196,13 @@ impl crate::converters::GraphConverter for OnnxConverter {
                 output_sizes[axes[0]] = spatial_sizes[0];
                 output_sizes[axes[1]] = spatial_sizes[1];
 
-                // Provide only scales input to avoid ORT ambiguity when both scales/sizes exist.
-                let scales: Vec<f32> = output_sizes
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &out_dim)| {
-                        let in_dim = input_shape[i].max(1) as f32;
-                        out_dim as f32 / in_dim
-                    })
-                    .collect();
-                let scales_name = format!("{}_scales", op_name);
+                // Exact `sizes`, not fractional `scales`: Resize floors output dims (in * scale).
+                let sizes_name = format!("{}_sizes", op_name);
                 initializers.push(TensorProto {
-                    name: scales_name.clone(),
-                    data_type: ProtoDataType::Float as i32,
-                    dims: vec![scales.len() as i64],
-                    float_data: scales,
+                    name: sizes_name.clone(),
+                    data_type: ProtoDataType::Int64 as i32,
+                    dims: vec![output_sizes.len() as i64],
+                    int64_data: output_sizes,
                     ..Default::default()
                 });
 
@@ -8368,7 +8221,7 @@ impl crate::converters::GraphConverter for OnnxConverter {
                 };
 
                 nodes.push(NodeProto {
-                    input: vec![input_name, String::new(), scales_name],
+                    input: vec![input_name, String::new(), String::new(), sizes_name],
                     output: vec![output_name],
                     name: op_name,
                     op_type: "Resize".to_string(),
@@ -9022,15 +8875,13 @@ impl crate::converters::GraphConverter for OnnxConverter {
                 let input_layout = match &op {
                     Operation::Conv2d { options, .. } => options
                         .as_ref()
-                        .map(|o| o.input_layout.clone())
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or_else(|| "nchw".to_string()),
+                        .map(|o| o.input_layout.as_str())
+                        .unwrap_or("nchw"),
                     Operation::ConvTranspose2d { options, .. } => options
                         .as_ref()
-                        .map(|o| o.input_layout.clone())
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or_else(|| "nchw".to_string()),
-                    _ => "nchw".to_string(),
+                        .map(|o| o.input_layout.as_str())
+                        .unwrap_or("nchw"),
+                    _ => "nchw",
                 };
 
                 let input_name = operand_name(graph, op.input_operands()[0]);
@@ -9056,56 +8907,35 @@ impl crate::converters::GraphConverter for OnnxConverter {
                 };
                 conv_inputs.push(transposed_input);
 
-                let filter_layout = match &op {
-                    Operation::Conv2d { options, .. } => options
-                        .as_ref()
-                        .map(|o| o.filter_layout.clone())
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or_else(|| "oihw".to_string()),
-                    Operation::ConvTranspose2d { options, .. } => options
-                        .as_ref()
-                        .map(|o| o.filter_layout.clone())
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or_else(|| "iohw".to_string()),
-                    _ => {
-                        if matches!(&op, Operation::ConvTranspose2d { .. }) {
-                            "iohw".to_string()
-                        } else {
-                            "oihw".to_string()
-                        }
-                    }
+                use crate::operator_enums::{
+                    MLConv2dFilterOperandLayout as ConvLayout,
+                    MLConvTranspose2dFilterOperandLayout as TransposeLayout,
                 };
-
+                let filter_perm = match &op {
+                    Operation::Conv2d { options, .. } => match options
+                        .as_ref()
+                        .map(|o| o.filter_layout)
+                        .unwrap_or_default()
+                    {
+                        ConvLayout::Oihw => None,
+                        ConvLayout::Hwio => Some(vec![3, 2, 0, 1]),
+                        ConvLayout::Ohwi => Some(vec![0, 3, 1, 2]),
+                        ConvLayout::Ihwo => Some(vec![3, 0, 1, 2]),
+                    },
+                    Operation::ConvTranspose2d { options, .. } => match options
+                        .as_ref()
+                        .map(|o| o.filter_layout)
+                        .unwrap_or_default()
+                    {
+                        TransposeLayout::Iohw => None,
+                        TransposeLayout::Hwoi => Some(vec![3, 2, 0, 1]),
+                        TransposeLayout::Ohwi => Some(vec![3, 0, 1, 2]),
+                    },
+                    _ => None,
+                };
                 let filter_name = operand_name(graph, op.input_operands()[1]);
 
-                let is_transpose = matches!(&op, Operation::ConvTranspose2d { .. });
-                let needs_transpose = if is_transpose {
-                    // ConvTranspose: ONNX expects IOHW (Input, Output, H, W)
-                    filter_layout != "iohw"
-                } else {
-                    // Conv: ONNX expects OIHW (Output, Input, H, W)
-                    filter_layout != "oihw"
-                };
-
-                let transposed_filter = if needs_transpose {
-                    let perm = if is_transpose {
-                        // ConvTranspose filter layout conversions → IOHW
-                        match filter_layout.as_str() {
-                            "hwoi" => vec![3, 2, 0, 1], // HWOI (H,W,O,I) → IOHW (I,O,H,W)
-                            "ohwi" => vec![3, 0, 1, 2], // OHWI (O,H,W,I) → IOHW (I,O,H,W)
-                            "oihw" => vec![1, 0, 2, 3], // OIHW (O,I,H,W) → IOHW (I,O,H,W)
-                            _ => vec![0, 1, 2, 3],      // Default: no transpose
-                        }
-                    } else {
-                        // Conv2d filter layout conversions → OIHW
-                        match filter_layout.as_str() {
-                            "hwio" => vec![3, 2, 0, 1], // HWIO (H,W,I,O) → OIHW (O,I,H,W)
-                            "ohwi" => vec![0, 3, 1, 2], // OHWI (O,H,W,I) → OIHW (O,I,H,W)
-                            "ihwo" => vec![3, 0, 1, 2], // IHWO (I,H,W,O) → OIHW (O,I,H,W)
-                            _ => vec![0, 1, 2, 3],      // Default: no transpose
-                        }
-                    };
-
+                let transposed_filter = if let Some(perm) = filter_perm {
                     let transpose_output = format!("{}_filter_transposed", op_name);
                     nodes.push(NodeProto {
                         input: vec![filter_name],
@@ -11265,6 +11095,39 @@ mod tests {
             .find(|a| a.name == "reverse")
             .expect("reverse attr");
         assert_eq!(reverse_attr.i, 1);
+    }
+
+    // TODO: Get rid of this test once we run WPT promise_test.
+    // This test verifies the behaviour logic of resample2d-gather-shape-divergence.https.any.js
+    #[test]
+    fn test_resample2d_emits_exact_sizes() {
+        // 19 -> 37: fractional scales (37/19) floor to 36 in ORT, so the emitted Resize
+        // must carry exact int64 `sizes` and leave `scales` empty.
+        let src = r#"
+webnn_graph "t" v1 {
+  inputs { x: f32[1, 19, 19, 64]; }
+  nodes { y = resample2d(x, scales=[1.9473684, 1.9473684], axes=[1, 2]); }
+  outputs { y; }
+}"#;
+        let json = webnn_graph::parser::parse_wg_text(src).expect("parse");
+        let graph = crate::webnn_json::from_graph_json(&json).expect("import");
+        let converted = OnnxConverter.convert(&graph).expect("convert");
+        let model = ModelProto::decode(converted.data.as_slice()).expect("decode");
+        let proto = model.graph.expect("graph");
+
+        let resize = proto
+            .node
+            .iter()
+            .find(|n| n.op_type == "Resize")
+            .expect("Resize node");
+        assert!(resize.input[2].is_empty(), "scales must be omitted");
+        let sizes = proto
+            .initializer
+            .iter()
+            .find(|t| t.name == resize.input[3])
+            .expect("sizes initializer");
+        assert_eq!(sizes.data_type, ProtoDataType::Int64 as i32);
+        assert_eq!(sizes.int64_data, vec![1, 37, 37, 64]);
     }
 
     #[test]

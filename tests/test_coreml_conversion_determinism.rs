@@ -10,7 +10,7 @@ use rustnn::graph::{
 use rustnn::operators::Operation;
 use rustnn::protos::coreml::{
     mil_spec::value,
-    specification::{Model, model},
+    specification::{Metadata, Model, model},
 };
 
 fn graph(reverse_insertion: bool, dtype: DataType) -> GraphInfo {
@@ -86,6 +86,81 @@ fn conversion_worker() {
             "ARTIFACT:{}",
             serde_json::to_string(&(converted.data, converted.weights_data)).unwrap()
         );
+    }
+}
+
+#[test]
+fn metadata_worker() {
+    let Ok(reverse) = std::env::var("RUSTNN_TEST_COREML_METADATA_WORKER") else {
+        return;
+    };
+    let mut bindings = vec![
+        ("rustnn.coreml.name_encoding", "hex-v1"),
+        (
+            "rustnn.webnn.input_aliases",
+            r#"{"state":"rustnn_escaped_7374617465"}"#,
+        ),
+        (
+            "rustnn.webnn.output_aliases",
+            r#"{"reply":"physical_reply"}"#,
+        ),
+        (
+            "rustnn.webnn.output_passthroughs",
+            r#"{"reply":{"input":"state","descriptor":{"data_type":"float32","shape":[2]}}}"#,
+        ),
+    ];
+    if reverse == "1" {
+        bindings.reverse();
+    }
+    let converted = CoremlMlProgramConverter
+        .convert(&graph(reverse == "1", DataType::Float16))
+        .unwrap();
+    let mut model = Model::decode(converted.data.as_slice()).unwrap();
+    // Exercise the protobuf map directly: real logical-name/copy bindings can
+    // add several metadata entries independently of the converter's MIL maps.
+    model.description.as_mut().unwrap().metadata = Some(Metadata {
+        user_defined: bindings
+            .into_iter()
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect(),
+        ..Default::default()
+    });
+    println!(
+        "METADATA:{}",
+        serde_json::to_string(&(model.encode_to_vec(), converted.weights_data)).unwrap()
+    );
+}
+
+#[test]
+fn metadata_maps_encode_identically_across_processes() {
+    let mut reference = None;
+    for iteration in 0..8 {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "metadata_worker", "--nocapture"])
+            .env(
+                "RUSTNN_TEST_COREML_METADATA_WORKER",
+                (iteration % 2).to_string(),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let artifacts: Vec<(Vec<u8>, Option<Vec<u8>>)> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.strip_prefix("METADATA:"))
+            .map(|json| serde_json::from_str(json).unwrap())
+            .collect();
+        assert_eq!(artifacts.len(), 1);
+        assert!(artifacts[0].1.is_some(), "retain the original sidecar");
+        if let Some(reference) = &reference {
+            assert_eq!(&artifacts, reference, "fresh metadata process {iteration}");
+        } else {
+            reference = Some(artifacts);
+        }
     }
 }
 
