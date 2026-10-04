@@ -99,6 +99,14 @@ bound for actual-shape queries and other consumers. Metadata, native dtype, shap
 constraints and storage layout are checked before prediction; standalone consumers
 of these exports must supply the same private bindings.
 
+## Comparison precision
+
+Half comparisons and argMin/argMax use Float32 kernels without changing stored Half
+constants or public Uint8/Int32 results. Constants feeding these kernels are materialized
+before a separate native widening step, preventing constant-cast fusion from flushing
+subnormals. Conditions retain their native Boolean producer; notEqual materializes the
+equality result before negation so unordered inputs remain unequal.
+
 ## Testing
 
 ```bash
