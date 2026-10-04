@@ -1118,7 +1118,7 @@ impl CoremlMlProgramConverter {
             value, value_type,
         };
 
-        let f16_bits = half::f16::from_f64(value).to_bits();
+        let f16_bits = crate::float16::f64_to_f16_bits(value);
         let bytes = f16_bits.to_le_bytes().to_vec();
 
         let tensor_value = TensorValue {
@@ -1147,6 +1147,11 @@ impl CoremlMlProgramConverter {
                 binding: Some(Binding::Value(val)),
             }],
         }
+    }
+
+    /// Widen the represented Half coefficient, not the original WebIDL double.
+    fn rounded_float16_as_float32(value: f64) -> f32 {
+        half::f16::from_bits(crate::float16::f64_to_f16_bits(value)).to_f32()
     }
 
     fn create_float_option(graph: &GraphInfo, op: &Operation, value: f64) -> Argument {
@@ -7113,7 +7118,7 @@ impl CoremlMlProgramConverter {
                     // WebNN casts these parameters to the input type at graph
                     // construction. Widen the rounded value, not the original.
                     let rounded = |value: f64| {
-                        Self::create_immediate_float(half::f16::from_f64(value).to_f32())
+                        Self::create_immediate_float(Self::rounded_float16_as_float32(value))
                     };
                     match op {
                         Operation::LeakyRelu { options, .. } => {
@@ -8362,7 +8367,7 @@ impl CoremlMlProgramConverter {
                 };
                 let has_bias = c_operand_id_opt.is_some();
                 let represented = |value| match output_operand.descriptor.data_type {
-                    DataType::Float16 => half::f16::from_f64(value).to_f32(),
+                    DataType::Float16 => Self::rounded_float16_as_float32(value),
                     _ => value as f32,
                 };
                 let needs_alpha_mul = represented(alpha) != 1.0;
@@ -8573,8 +8578,9 @@ impl CoremlMlProgramConverter {
                     ));
                     // Linear is one declared WebNN operation: do not round or
                     // underflow its product before adding the represented beta.
-                    let represented =
-                        |value| Self::create_immediate_float(half::f16::from_f64(value).to_f32());
+                    let represented = |value| {
+                        Self::create_immediate_float(Self::rounded_float16_as_float32(value))
+                    };
                     main_block.operations.push(Self::create_mil_operation(
                         mil_ops::MUL,
                         HashMap::from([
@@ -9266,7 +9272,7 @@ impl CoremlMlProgramConverter {
                         };
                         mil.inputs.insert(
                             "epsilon".into(),
-                            Self::create_immediate_float(half::f16::from_f64(epsilon).to_f32()),
+                            Self::create_immediate_float(Self::rounded_float16_as_float32(epsilon)),
                         );
                         mil.outputs = vec![Self::create_value_with_mil_type(
                             graph_info,
@@ -11057,7 +11063,7 @@ impl CoremlMlProgramConverter {
                     };
                     let var_eps_name = format!("{}_bn_veps", output_name);
                     let eps_arg = if is_f16 {
-                        Self::create_immediate_float(half::f16::from_f64(epsilon).to_f32())
+                        Self::create_immediate_float(Self::rounded_float16_as_float32(epsilon))
                     } else {
                         Self::create_immediate_float(epsilon as f32)
                     };

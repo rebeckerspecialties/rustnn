@@ -76,6 +76,16 @@ prediction, supplying independent output copies even if CoreML omits or changes 
 feature. Standalone consumers should honor these proven-copy bindings too; they must not
 infer an input/output alias from matching names or values.
 
+## Scalar option precision
+
+WebNN double/MLNumber options round directly to the source tensor dtype. Half
+coefficients use architecture-independent integer ties-to-even rounding, including
+the lowest sticky bits, subnormals, signed zero and finite overflow. This applies
+to activation coefficients, Linear/GEMM scale and bias, normalization epsilon,
+Clamp bounds and Pad values even when converting without a native runtime.
+Protected Float32 computations widen that represented Half value; they do not
+use the original double or introduce an intermediate Float32 rounding step.
+
 ## Converter-private input views
 
 Precision lowerings can request a compact native Half input through creator-defined

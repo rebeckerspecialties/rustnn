@@ -224,6 +224,55 @@ mod runtime {
             );
         }
     }
+    #[test]
+    fn half_batch_norm_retains_the_epsilon_sticky_bit_before_sqrt_and_affine() {
+        let midpoint = 2f64.powi(-25);
+        let epsilon = f64::from_bits(midpoint.to_bits() + 1);
+        // Source-Half epsilon is 2^-24, hence sqrt(epsilon) is exactly 2^-12.
+        // Narrowing epsilon to zero instead would make the division infinite.
+        let graph = GraphInfo {
+            operands: vec![
+                operand("input", &[1, 1, 1, 2], OperandKind::Input),
+                operand("mean", &[1], OperandKind::Constant),
+                operand("variance", &[1], OperandKind::Constant),
+                operand("scale", &[1], OperandKind::Constant),
+                operand("bias", &[1], OperandKind::Constant),
+                operand("result", &[1, 1, 1, 2], OperandKind::Output),
+            ],
+            input_operands: vec![0],
+            output_operands: vec![5],
+            operations: vec![
+                Operation::from_json_attributes(
+                    "batchNormalization",
+                    &[0, 1, 2],
+                    &[5],
+                    &json!({"epsilon":epsilon,"scale":3,"bias":4}),
+                )
+                .unwrap(),
+            ],
+            constant_operand_ids_to_handles: [
+                (1, constant(&[0.])),
+                (2, constant(&[0.])),
+                (3, constant(&[0.5])),
+                (4, constant(&[0.25])),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        for policy in [DeviceType::Cpu, DeviceType::Gpu, DeviceType::Npu] {
+            assert_eq!(
+                predict(
+                    graph.clone(),
+                    &[1, 1, 1, 2],
+                    &[2f32.powi(-12), -2f32.powi(-12)],
+                    policy
+                ),
+                [0x3a00, 0xb400],
+                "{policy:?}: represented epsilon must precede wide normalization and affine work"
+            );
+        }
+    }
 }
 
 use prost::Message;
@@ -328,34 +377,44 @@ fn check_kernel(graph: GraphInfo, kernel: &str) -> Vec<mil_spec::Operation> {
     operations
 }
 
-fn check_batch_norm(graph: GraphInfo, epsilon: f64) {
+fn check_batch_norm(graph: GraphInfo, expected_epsilon: u16) {
     use mil_spec::{argument::binding::Binding, tensor_value, value};
     let operations = check_kernel(graph, "real_div");
     assert!(operations.iter().all(|op| op.r#type != "batch_norm"));
     assert!(
-        operations.iter().filter(|op| op.r#type == "add").any(|op| {
-            let Some(argument) = op.inputs.get("y") else {
-                return false;
-            };
-            let Some(Binding::Value(epsilon_value)) = argument
-                .arguments
-                .first()
-                .and_then(|binding| binding.binding.as_ref())
-            else {
-                return false;
-            };
-            let Some(value::Value::ImmediateValue(immediate)) = epsilon_value.value.as_ref() else {
-                return false;
-            };
-            let Some(value::immediate_value::Value::Tensor(tensor)) = immediate.value.as_ref()
-            else {
-                return false;
-            };
-            let Some(tensor_value::Value::Floats(values)) = tensor.value.as_ref() else {
-                return false;
-            };
-            values.values == [half::f16::from_f64(epsilon).to_f32()]
-        }),
+        operations
+            .iter()
+            .filter(|op| op.r#type == "add"
+                && op
+                    .outputs
+                    .iter()
+                    .any(|output| output.name.ends_with("_bn_veps")))
+            .any(|op| {
+                let Some(argument) = op.inputs.get("y") else {
+                    return false;
+                };
+                let Some(Binding::Value(epsilon_value)) = argument
+                    .arguments
+                    .first()
+                    .and_then(|binding| binding.binding.as_ref())
+                else {
+                    return false;
+                };
+                let Some(value::Value::ImmediateValue(immediate)) = epsilon_value.value.as_ref()
+                else {
+                    return false;
+                };
+                let Some(value::immediate_value::Value::Tensor(tensor)) = immediate.value.as_ref()
+                else {
+                    return false;
+                };
+                let Some(tensor_value::Value::Floats(values)) = tensor.value.as_ref() else {
+                    return false;
+                };
+                values.values.len() == 1
+                    && values.values[0].to_bits()
+                        == half::f16::from_bits(expected_epsilon).to_f32().to_bits()
+            }),
         "the complete formula uses source-Half-rounded epsilon"
     );
     for operation in operations.iter().filter(|op| {
@@ -375,10 +434,15 @@ fn check_batch_norm(graph: GraphInfo, epsilon: f64) {
 
 #[test]
 fn half_batch_norm_rounds_epsilon_directly_from_binary64() {
-    for epsilon in [
-        2f64.powi(-25) + 2f64.powi(-55),
-        1.00048828125 - 2f64.powi(-40),
-        1.00048828125 + 2f64.powi(-40),
+    for (epsilon, expected) in [
+        (2f64.powi(-25) + 2f64.powi(-55), 0x0001),
+        (1.00048828125 - 2f64.powi(-40), 0x3c00),
+        (1.00048828125 + 2f64.powi(-40), 0x3c01),
+        (f64::from_bits(2f64.powi(-25).to_bits() + 1), 0x0001),
+        (f64::from_bits(1.00048828125f64.to_bits() - 1), 0x3c00),
+        (f64::from_bits(1.00048828125f64.to_bits() + 1), 0x3c01),
+        (f64::from_bits(1.00146484375f64.to_bits() - 1), 0x3c01),
+        (f64::from_bits(1.00146484375f64.to_bits() + 1), 0x3c02),
     ] {
         let graph = GraphInfo {
             operands: vec![
@@ -403,7 +467,7 @@ fn half_batch_norm_rounds_epsilon_directly_from_binary64() {
                 .collect(),
             ..Default::default()
         };
-        check_batch_norm(graph, epsilon);
+        check_batch_norm(graph, expected);
     }
 }
 
@@ -521,7 +585,7 @@ fn half_batch_norm_widens_its_already_input_rounded_epsilon() {
                 .collect(),
             ..Default::default()
         };
-        check_batch_norm(graph, 0.0001);
+        check_batch_norm(graph, 0x068e);
     }
 }
 
@@ -558,7 +622,7 @@ fn protected_dynamic_batch_norm_widening_keeps_actual_source_bounds() {
                 max_size: 3,
             });
     }
-    check_batch_norm(graph, 0.0001);
+    check_batch_norm(graph, 0x068e);
 }
 
 #[test]
@@ -641,7 +705,7 @@ fn absent_batch_norm_options_still_round_the_default_epsilon_to_source_half() {
         unreachable!()
     };
     *options = None;
-    check_batch_norm(graph, 1e-5);
+    check_batch_norm(graph, 0x00a8);
 }
 
 #[test]
