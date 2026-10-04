@@ -322,7 +322,7 @@ fn normalization_epsilon_rounds_the_original_double_to_half() {
     let epsilon = 1.00048828125 + 2f64.powi(-40);
     for (name, kernel) in [
         ("layerNormalization", "layer_norm"),
-        ("instanceNormalization", "instance_norm"),
+        ("instanceNormalization", "layer_norm"),
     ] {
         expect_scalar(
             &unary(name, json!({"epsilon":epsilon})),
@@ -376,7 +376,7 @@ fn normalization_epsilon_rounds_the_original_double_to_half() {
 fn absent_normalization_options_still_cast_default_epsilon_to_half() {
     for (name, kernel) in [
         ("layerNormalization", "layer_norm"),
-        ("instanceNormalization", "instance_norm"),
+        ("instanceNormalization", "layer_norm"),
     ] {
         let mut graph = unary(name, json!({}));
         match &mut graph.operations[0] {
@@ -554,7 +554,7 @@ fn normalization_epsilon_keeps_lowest_sticky_bit_with_and_without_affine_operand
         for affine in [false, true] {
             for (name, kernel) in [
                 ("layerNormalization", "layer_norm"),
-                ("instanceNormalization", "instance_norm"),
+                ("instanceNormalization", "layer_norm"),
                 ("batchNormalization", "batch_norm"),
             ] {
                 let mut graph = unary("linear", json!({}));

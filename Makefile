@@ -128,6 +128,10 @@ test:
 	@echo "Checking backend operator support report drift..."
 	$(MAKE) docs-backend-ops-check
 
+.PHONY: test-coreml-half-instance-norm
+test-coreml-half-instance-norm:
+	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_half_instance_norm -- $(TEST_FILTER) --test-threads=1
+
 fetch-wpt:
 	node scripts/fetch_wpt.mjs
 
