@@ -6400,7 +6400,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
 
             // Rank-0 (scalar) no-ops: transpose/tile/slice/expand/pad/reshape that map a
             // 0D scalar to a 0D scalar. CoreML rejects those ops on rank-0 tensors, so emit
-            // an identity (input * 1) instead.
+            // a [1] reshape without arithmetic or casts.
             if matches!(
                 op_type_lower.as_str(),
                 "transpose" | "tile" | "slice" | "expand" | "pad" | "reshape"
@@ -6423,7 +6423,11 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         )
                     })
                     .unwrap_or(false);
-                if in_scalar && out_scalar && is_float {
+                let is_int32_copy = out_op
+                    .map(|o| o.descriptor.data_type == DataType::Int32)
+                    .unwrap_or(false)
+                    && matches!(op_type_lower.as_str(), "transpose" | "slice");
+                if in_scalar && out_scalar && (is_float || is_int32_copy) {
                     let in_name =
                         Self::output_name_for_operand(graph_info, in_id, &operand_name_overrides);
                     let (_out_name, out_type) =

@@ -116,6 +116,8 @@ Rules that hold for every converter:
   an axis-specific squeeze removes only the indexed dimension afterward. This avoids native
   scalar-index gather failures while retaining dynamic extents and unrelated singleton axes.
   A scalar result keeps the `[1]` CoreML boundary representation without changing the WebNN rank.
+- Scalar Int32 `transpose` and `slice` are no-ops lowered to a `[1]` reshape, retaining the
+  logical rank-zero descriptor and integer type without inserting arithmetic or casts.
 - Float16 weights go to the weight blob written by `weight_file_builder.rs` and returned as
   `weights_data`.
 - WebNN names need not be MIL identifiers, and its input/output namespaces are independent.
