@@ -1547,7 +1547,7 @@ mod tests {
             "scale".to_string(),
             ConstDecl {
                 data_type: webnn_graph::ast::DataType::Float32,
-                shape: vec![],
+                shape: vec![1, 1],
                 init: ConstInit::Scalar {
                     value: serde_json::json!(0.5),
                 },
@@ -1557,7 +1557,7 @@ mod tests {
             "zero_point".to_string(),
             ConstDecl {
                 data_type: webnn_graph::ast::DataType::Uint8,
-                shape: vec![],
+                shape: vec![1, 1],
                 init: ConstInit::Scalar {
                     value: serde_json::json!(128),
                 },
