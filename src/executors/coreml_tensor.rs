@@ -752,6 +752,88 @@ mod tests {
     }
 
     #[test]
+    fn native_output_fallback_rounds_half_midpoint_neighbors_without_aliasing() {
+        // Derive expected bits from adjacent Half encodings, not from another
+        // float-to-Half converter. The neighbors retain sticky bits that the
+        // software conversion previously discarded on A10X.
+        let midpoint = 1. + 2f64.powi(-11);
+        let small_midpoint = 2f64.powi(-25);
+        let double_above = f64::from_bits(midpoint.to_bits() + 1);
+        let double_below = f64::from_bits(midpoint.to_bits() - 1);
+        let double_small_above = f64::from_bits(small_midpoint.to_bits() + 1);
+        let single_midpoint = midpoint as f32;
+        let single_small_midpoint = small_midpoint as f32;
+        let single_above = f32::from_bits(single_midpoint.to_bits() + 1);
+        let single_below = f32::from_bits(single_midpoint.to_bits() - 1);
+        let single_small_above = f32::from_bits(single_small_midpoint.to_bits() + 1);
+        let expected = [
+            0x3c00u16, 0x3c01, 0x3c00, 0xbc01, 0x0000, 0x0001, 0x8001, 0x8000,
+        ];
+        let expected = bytemuck::cast_slice::<u16, u8>(&expected);
+        let cases = [
+            (
+                NativeType::Double,
+                bytemuck::cast_slice::<f64, u8>(&[
+                    midpoint,
+                    double_above,
+                    double_below,
+                    -double_above,
+                    small_midpoint,
+                    double_small_above,
+                    -double_small_above,
+                    -0.,
+                ])
+                .to_vec(),
+            ),
+            (
+                NativeType::Float32,
+                bytemuck::cast_slice::<f32, u8>(&[
+                    single_midpoint,
+                    single_above,
+                    single_below,
+                    -single_above,
+                    single_small_midpoint,
+                    single_small_above,
+                    -single_small_above,
+                    -0.,
+                ])
+                .to_vec(),
+            ),
+        ];
+        autoreleasepool(|| {
+            for (kind, packed) in cases {
+                for strides in [[4i64, 1], [6, 1], [1, 2]] {
+                    let element = kind.element_size();
+                    let mut source = vec![0xa5u8; 12 * element];
+                    for index in 0..8 {
+                        let offset = (index / 4 * strides[0] as usize
+                            + index % 4 * strides[1] as usize)
+                            * element;
+                        source[offset..offset + element]
+                            .copy_from_slice(&packed[index * element..(index + 1) * element]);
+                    }
+                    let original = source.clone();
+                    let array = unsafe { view(source.as_mut_ptr(), &[2, 4], &strides, kind) };
+                    let mut destination = NativeTensor::new(DataType::Float16, 32).unwrap();
+                    destination.write(&[0xa5; 32]).unwrap();
+                    let mut desc = descriptor(&[2, 4]);
+                    desc.data_type = DataType::Float16;
+                    unsafe { copy_output(array.0, &mut destination, &desc).unwrap() };
+                    assert_eq!(
+                        destination.bytes(16).unwrap(),
+                        expected,
+                        "{kind:?} {strides:?}"
+                    );
+                    assert_eq!(&destination.bytes(32).unwrap()[16..], &[0xa5; 16]);
+                    assert_eq!(source, original);
+                    source.fill(0);
+                    assert_eq!(destination.bytes(16).unwrap(), expected, "source alias");
+                }
+            }
+        });
+    }
+
+    #[test]
     fn fixed_output_backing_proposals_follow_loaded_metadata() {
         use crate::backend_selection::DeviceType;
         use crate::converters::{CoremlMlProgramConverter, GraphConverter};

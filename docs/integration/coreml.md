@@ -82,6 +82,12 @@ layout rules. Equal element widths do not imply equal types (for example int32 a
 float32). Same-type copies preserve integer bits and float16 storage widths; overlapping
 strided views are gathered before writing the destination.
 
+Numeric conversions into float16 round directly from the source value using integer
+round-to-nearest, ties-to-even, retaining all discarded bits. This preserves subnormals
+and signed zero independently of hardware half-conversion support. Matching storage
+types are copied bit-for-bit, including NaN payloads; CoreML's internal arithmetic policy
+is unchanged.
+
 `RustNNOptions::coreml` controls this experimental path. `reuse_tensor_storage` defaults to
 `false`, preserving the byte-buffer reference implementation until an application measures
 a benefit on its workload. `output_backings` defaults to `true` when reuse is enabled and
