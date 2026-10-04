@@ -869,6 +869,38 @@ impl CoremlMlProgramConverter {
         }
     }
 
+    /// WebNN nearest resampling uses half-pixel centers and rounds ties down.
+    /// Calculate the indices as exact rational integers instead of float scales.
+    fn nearest_resample_indices(input_size: u32, output_size: u32) -> Result<Vec<u32>, GraphError> {
+        let error = |reason: &str| GraphError::ConversionFailed {
+            format: "coreml_mlprogram".to_string(),
+            reason: format!("resample2d: {reason}"),
+        };
+        if input_size == 0 || output_size == 0 {
+            return Err(error("nearest resized dimensions must be nonzero"));
+        }
+        let mut indices = Vec::new();
+        indices
+            .try_reserve_exact(output_size as usize)
+            .map_err(|_| error("cannot allocate nearest sampling indices"))?;
+        let denominator = 2 * i128::from(output_size);
+        for position in 0..output_size {
+            // ceil((position + 0.5) * input_size / output_size - 1),
+            // followed by clamping to the input bounds. i128 also covers
+            // products involving the full u32 dimension range.
+            let numerator = (2 * i128::from(position) + 1) * i128::from(input_size) - denominator;
+            let index = (numerator + denominator - 1)
+                .div_euclid(denominator)
+                .clamp(0, i128::from(input_size - 1));
+            let index = u32::try_from(index).expect("index is clamped to a u32 dimension");
+            if i32::try_from(index).is_err() {
+                return Err(error("nearest sampling index exceeds CoreML int32 range"));
+            }
+            indices.push(index);
+        }
+        Ok(indices)
+    }
+
     /// Create an Argument from an immediate integer scalar value (int32)
     fn create_immediate_int(value: u32) -> Argument {
         use crate::protos::coreml::mil_spec::{
@@ -8373,9 +8405,8 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                 continue;
             }
 
-            // Special handling for resample2d: lower to CoreML upsample ops.
-            // MIL only upsamples the final two dimensions, so transpose arbitrary
-            // WebNN axes into those positions before upsampling and transpose back.
+            // Nearest sampling requires exact WebNN indices. Linear sampling uses
+            // MIL's final-two-dimension upsample operation with spatial transposes.
             if op_type_lower == "resample2d" {
                 if op.input_operands().is_empty() || op.output_operand().is_none() {
                     return Err(GraphError::ConversionFailed {
@@ -8463,6 +8494,77 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         })?;
                 let dtype = Self::mil_data_type(&input_operand.descriptor.data_type)?;
 
+                let mode = if opts.mode.is_empty() {
+                    "nearest-neighbor"
+                } else {
+                    opts.mode.as_str()
+                };
+                if !mode.eq_ignore_ascii_case("linear") {
+                    let mut shape = input_operand.descriptor.shape.clone();
+                    let mut input_name = input_name_raw;
+                    for (position, &axis) in axes.iter().enumerate() {
+                        let axis = axis as usize;
+                        let (
+                            crate::graph::Dimension::Static(input_size),
+                            Some(crate::graph::Dimension::Static(output_size)),
+                        ) = (&shape[axis], output_operand.descriptor.shape.get(axis))
+                        else {
+                            return Err(GraphError::ConversionFailed {
+                                format: "coreml_mlprogram".to_string(),
+                                reason: format!(
+                                    "resample2d: dynamic resized axis {axis} requires runtime sampling indices"
+                                ),
+                            });
+                        };
+                        let indices = Self::nearest_resample_indices(*input_size, *output_size)?;
+                        shape[axis] = crate::graph::Dimension::Static(*output_size);
+                        let value_type = if position == axes.len() - 1 {
+                            output_type.clone()
+                        } else {
+                            let dimensions = Self::mil_dimensions_from_graph_shape(&shape, false);
+                            NamedValueType {
+                                name: format!("{output_name}_rs_axis_{axis}"),
+                                r#type: Some(ValueType {
+                                    r#type: Some(
+                                        crate::protos::coreml::mil_spec::value_type::Type::TensorType(
+                                            TensorType {
+                                                rank: dimensions.len() as i64,
+                                                data_type: dtype,
+                                                dimensions,
+                                                attributes: HashMap::new(),
+                                            },
+                                        ),
+                                    ),
+                                }),
+                            }
+                        };
+                        let mut inputs = HashMap::new();
+                        inputs.insert("x".to_string(), Self::create_name_argument(input_name));
+                        inputs.insert(
+                            "indices".to_string(),
+                            Self::create_immediate_int_array(&indices),
+                        );
+                        inputs.insert("axis".to_string(), Self::create_immediate_int(axis as u32));
+                        inputs.insert(
+                            "validate_indices".to_string(),
+                            Self::create_immediate_bool(false),
+                        );
+                        input_name = value_type.name.clone();
+                        main_block.operations.push(Self::create_mil_operation(
+                            "gather",
+                            inputs,
+                            vec![value_type],
+                        ));
+                    }
+                    if let Some((pending_ops, transposed_name)) =
+                        deferred_transposes.remove(&output_id)
+                    {
+                        main_block.operations.extend(pending_ops);
+                        operand_name_overrides.insert(output_id, transposed_name);
+                    }
+                    continue;
+                }
+
                 let (upsample_input_name, upsample_output_name, upsample_output_type) =
                     if needs_spatial_transpose {
                         let spatial_input_shape = Self::permute_graph_shape(
@@ -8548,12 +8650,6 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                     (sh, sw)
                 } else {
                     (1.0, 1.0)
-                };
-
-                let mode = if opts.mode.is_empty() {
-                    "nearest-neighbor"
-                } else {
-                    opts.mode.as_str()
                 };
 
                 let mil_op_name = if mode.eq_ignore_ascii_case("linear") {
@@ -10960,7 +11056,29 @@ mod tests {
     }
 
     #[test]
-    fn test_resample2d_moves_arbitrary_axes_to_spatial_dimensions() {
+    fn test_nearest_resample_rational_indices_cover_ties_and_large_dimensions() {
+        for (input, output, expected) in [
+            (3, 4, vec![0, 1, 1, 2]),
+            (4, 3, vec![0, 1, 3]),
+            (5, 2, vec![1, 3]),
+            (2, 3, vec![0, 0, 1]),
+            (3, 1, vec![1]),
+            (1, 4, vec![0, 0, 0, 0]),
+            (u32::MAX, 1, vec![i32::MAX as u32]),
+        ] {
+            assert_eq!(
+                CoremlMlProgramConverter::nearest_resample_indices(input, output).unwrap(),
+                expected,
+                "{input}->{output}"
+            );
+        }
+        assert!(CoremlMlProgramConverter::nearest_resample_indices(0, 1).is_err());
+        assert!(CoremlMlProgramConverter::nearest_resample_indices(1, 0).is_err());
+        assert!(CoremlMlProgramConverter::nearest_resample_indices(u32::MAX, 2).is_err());
+    }
+
+    #[test]
+    fn test_linear_resample2d_moves_arbitrary_axes_to_spatial_dimensions() {
         let graph = GraphInfo {
             input_operands: vec![0],
             output_operands: vec![1],
@@ -10991,7 +11109,7 @@ mod tests {
                 vec![],
                 OperatorOptions::from_json_with_op_type(
                     "resample2d",
-                    &serde_json::json!({ "axes": [0, 1], "sizes": [6, 4] }),
+                    &serde_json::json!({ "axes": [0, 1], "sizes": [6, 4], "mode": "linear" }),
                 )
                 .expect("resample2d options"),
             )],
@@ -11022,7 +11140,7 @@ mod tests {
             main_block
                 .operations
                 .iter()
-                .any(|op| op.r#type == mil_ops::UPSAMPLE_NEAREST_NEIGHBOR)
+                .any(|op| op.r#type == mil_ops::UPSAMPLE_BILINEAR)
         );
     }
 
