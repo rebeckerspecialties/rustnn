@@ -621,3 +621,221 @@ fn half_arg_extrema_compute_on_fp32_without_changing_index_type() {
         assert_eq!(seen, 1);
     }
 }
+
+#[cfg(all(target_os = "macos", feature = "coreml-runtime"))]
+mod runtime {
+    use super::*;
+    use rustnn::backend_selection::{BackendDevice, DeviceType};
+    use rustnn::graph::ConstantData;
+    use rustnn::mlcontext::{
+        MLContext, MLContextOptions, MLNamedTensors, MLPowerPreference, MLTensorDescriptor,
+    };
+
+    const VALUES: [u16; 11] = [
+        0x0001, 0x8001, 0x0000, 0x8000, 0x3c00, 0xbc00, 0x0400, 0x8400, 0x7c00, 0xfc00, 0x7e00,
+    ];
+    // Compared with either signed zero: equal, notEqual, greater,
+    // greaterOrEqual, lesser, lesserOrEqual. NaN is unequal and unordered.
+    const MASKS: [[u8; 11]; 6] = [
+        [0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0],
+        [1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1],
+        [1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0],
+        [1, 0, 1, 1, 1, 0, 1, 0, 1, 0, 0],
+        [0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0],
+        [0, 1, 1, 1, 0, 1, 0, 1, 0, 1, 0],
+    ];
+
+    fn context(policy: DeviceType) -> MLContext<'static> {
+        MLContext::create(
+            &MLContextOptions::new(MLPowerPreference::Default, policy != DeviceType::Cpu)
+                .with_rustnn_device_hint(BackendDevice::Coreml {
+                    device_type: policy,
+                }),
+        )
+        .unwrap()
+    }
+
+    fn stored_values(info: &mut GraphInfo, values: &[u16]) {
+        info.operands[0].kind = OperandKind::Constant;
+        info.input_operands.clear();
+        info.constant_operand_ids_to_handles.insert(
+            0,
+            ConstantData {
+                data: values
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect(),
+                label: None,
+            },
+        );
+    }
+
+    #[test]
+    fn half_predicates_return_exact_public_masks_and_where_values() {
+        for policy in [DeviceType::Cpu, DeviceType::Gpu, DeviceType::Npu] {
+            for constant in [false, true] {
+                for (index, expected) in MASKS.iter().enumerate() {
+                    let mut info = graph(index, &[Dimension::Static(VALUES.len() as u32)]);
+                    info.operands[2].kind = OperandKind::Output;
+                    info.output_operands = vec![2, 5];
+                    if constant {
+                        stored_values(&mut info, &VALUES);
+                        info.input_operands = vec![1, 3, 4];
+                    }
+                    let original = serde_json::to_vec(&info).unwrap();
+                    let mut context = context(policy);
+                    let mut graph = context.rustnn_build_graph(info.clone()).unwrap();
+                    assert_eq!(serde_json::to_vec(&info).unwrap(), original);
+
+                    let input = context
+                        .create_tensor(
+                            &MLTensorDescriptor::new(MLOperandDataType::Float16, vec![11])
+                                .to_readable()
+                                .to_writable(),
+                        )
+                        .unwrap();
+                    let threshold = context
+                        .create_tensor(
+                            &MLTensorDescriptor::new(MLOperandDataType::Float16, vec![])
+                                .to_writable(),
+                        )
+                        .unwrap();
+                    let scalar =
+                        MLTensorDescriptor::new(MLOperandDataType::Float32, vec![]).to_writable();
+                    let one = context.create_tensor(&scalar).unwrap();
+                    let zero = context.create_tensor(&scalar).unwrap();
+                    let mask = context
+                        .create_tensor(
+                            &MLTensorDescriptor::new(MLOperandDataType::Uint8, vec![11])
+                                .to_readable(),
+                        )
+                        .unwrap();
+                    let selected = context
+                        .create_tensor(
+                            &MLTensorDescriptor::new(MLOperandDataType::Float32, vec![11])
+                                .to_readable(),
+                        )
+                        .unwrap();
+                    context.write_tensor(&input, &VALUES).unwrap();
+                    context.write_tensor(&one, &[7.0f32]).unwrap();
+                    context.write_tensor(&zero, &[-3.0f32]).unwrap();
+                    let mut inputs = MLNamedTensors::from([
+                        ("threshold", &threshold),
+                        ("one", &one),
+                        ("zero", &zero),
+                    ]);
+                    if !constant {
+                        inputs.insert("x", &input);
+                    }
+                    for zero_bits in [0u16, 0x8000] {
+                        context.write_tensor(&threshold, &[zero_bits]).unwrap();
+                        context
+                            .dispatch(
+                                &mut graph,
+                                &inputs,
+                                &MLNamedTensors::from([
+                                    ("condition", &mask),
+                                    ("selected", &selected),
+                                ]),
+                            )
+                            .unwrap();
+                        let mut actual_mask = [0u8; 11];
+                        context.read_tensor(&mask, &mut actual_mask).unwrap();
+                        assert_eq!(actual_mask, *expected, "{index}/{constant}/{policy:?}");
+                        let mut actual = [0f32; 11];
+                        context.read_tensor(&selected, &mut actual).unwrap();
+                        assert_eq!(
+                            actual,
+                            expected.map(|value| if value == 1 { 7.0 } else { -3.0 }),
+                            "where {index}/{constant}/{policy:?}"
+                        );
+                        let mut retained = [0u16; 11];
+                        context.read_tensor(&input, &mut retained).unwrap();
+                        assert_eq!(retained, VALUES);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn half_arg_extrema_return_exact_indices_for_stored_and_runtime_values() {
+        for policy in [DeviceType::Cpu, DeviceType::Gpu, DeviceType::Npu] {
+            for (values, extrema) in [
+                ([0x0001, 0x0002, 0x8001, 0x8002, 0x0000, 0x8000], [3, 1]),
+                ([0x8000, 0x0000, 0x3c00, 0xbc00, 0x3c01, 0xbc01], [5, 4]),
+            ] {
+                for constant in [false, true] {
+                    for maximum in [false, true] {
+                        let mut info = GraphInfo {
+                            operands: vec![
+                                operand(
+                                    "x",
+                                    OperandKind::Input,
+                                    DataType::Float16,
+                                    &[Dimension::Static(1), Dimension::Static(6)],
+                                ),
+                                operand(
+                                    "result",
+                                    OperandKind::Output,
+                                    DataType::Int32,
+                                    &[Dimension::Static(1)],
+                                ),
+                            ],
+                            input_operands: vec![0],
+                            output_operands: vec![1],
+                            operations: vec![
+                                Operation::from_json_attributes(
+                                    if maximum { "argMax" } else { "argMin" },
+                                    &[0],
+                                    &[1],
+                                    &serde_json::json!({"axis":1}),
+                                )
+                                .unwrap(),
+                            ],
+                            ..Default::default()
+                        };
+                        if constant {
+                            stored_values(&mut info, &values);
+                        }
+                        let original = serde_json::to_vec(&info).unwrap();
+                        let mut context = context(policy);
+                        let mut graph = context.rustnn_build_graph(info.clone()).unwrap();
+                        assert_eq!(serde_json::to_vec(&info).unwrap(), original);
+                        let input = context
+                            .create_tensor(
+                                &MLTensorDescriptor::new(MLOperandDataType::Float16, vec![1, 6])
+                                    .to_writable(),
+                            )
+                            .unwrap();
+                        let output = context
+                            .create_tensor(
+                                &MLTensorDescriptor::new(MLOperandDataType::Int32, vec![1])
+                                    .to_readable(),
+                            )
+                            .unwrap();
+                        context.write_tensor(&input, &values).unwrap();
+                        context
+                            .dispatch(
+                                &mut graph,
+                                &if constant {
+                                    MLNamedTensors::new()
+                                } else {
+                                    MLNamedTensors::from([("x", &input)])
+                                },
+                                &MLNamedTensors::from([("result", &output)]),
+                            )
+                            .unwrap();
+                        let mut actual = [0i32];
+                        context.read_tensor(&output, &mut actual).unwrap();
+                        assert_eq!(
+                            actual,
+                            [extrema[usize::from(maximum)]],
+                            "{values:x?}/{constant}/{maximum}/{policy:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
