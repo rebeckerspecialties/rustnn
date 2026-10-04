@@ -6,6 +6,10 @@ use rustnn::graph::{DataType, Dimension, GraphInfo, Operand, OperandDescriptor, 
 use rustnn::operators::Operation;
 use rustnn::protos::coreml::{mil_spec, specification};
 
+#[path = "common/half_reference.rs"]
+mod half_reference;
+use half_reference::reference_half_bits;
+
 fn graph(data_type: DataType, shape: Vec<Dimension>) -> GraphInfo {
     let descriptor = OperandDescriptor {
         data_type,
@@ -54,39 +58,6 @@ fn tensor_type(value: &mil_spec::NamedValueType) -> &mil_spec::TensorType {
         panic!("expected tensor");
     };
     tensor
-}
-
-// Keep the erf oracle independent of hardware half conversion. The dependency's
-// binary64 software fallback drops sticky bits before rounding on older CPUs.
-fn reference_half_bits(value: f64) -> u16 {
-    let bits = value.to_bits();
-    let sign = ((bits >> 48) & 0x8000) as u16;
-    let exponent = ((bits >> 52) & 0x7ff) as i32;
-    let fraction = bits & ((1u64 << 52) - 1);
-    if exponent == 0x7ff {
-        return sign | if fraction == 0 { 0x7c00 } else { 0x7e00 };
-    }
-    if exponent == 0 {
-        return sign;
-    }
-    let exponent = exponent - 1023;
-    if exponent > 15 {
-        return sign | 0x7c00;
-    }
-    let significand = fraction | (1u64 << 52);
-    let round = |shift: u32| {
-        let retained = significand >> shift;
-        let discarded = significand & ((1u64 << shift) - 1);
-        let midpoint = 1u64 << (shift - 1);
-        retained + u64::from(discarded > midpoint || (discarded == midpoint && retained & 1 != 0))
-    };
-    if exponent >= -14 {
-        return sign | ((((exponent + 15) as u16) << 10) + (round(42) as u16 - 1024));
-    }
-    if exponent < -25 {
-        return sign;
-    }
-    sign | round((28 - exponent) as u32) as u16
 }
 
 #[test]
