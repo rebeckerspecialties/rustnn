@@ -1,7 +1,11 @@
 //! Native instance normalization keeps its complete computation in Float32.
 
+#[path = "common/half_reference.rs"]
+mod half_reference;
+
 #[cfg(all(target_os = "macos", feature = "coreml-runtime"))]
 mod runtime {
+    use super::half_reference::reference_half_bits;
     use super::*;
     use half::f16;
     use rustnn::backend_selection::{BackendDevice, DeviceType};
@@ -184,12 +188,11 @@ mod runtime {
                 .sum::<f64>()
                 / 4.;
             for position in 0..4 {
-                reference[channel][position] = f16::from_f64(
+                reference[channel][position] = reference_half_bits(
                     (f64::from(channels[channel][position]) - mean) / (variance + epsilon).sqrt()
                         * scale[channel]
                         + f64::from(bias[channel]),
-                )
-                .to_bits();
+                );
             }
         }
         for policy in [DeviceType::Cpu, DeviceType::Gpu, DeviceType::Npu] {
