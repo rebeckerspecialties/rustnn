@@ -60,6 +60,154 @@ fn identity_graph(dtype: DataType, shape: Vec<Dimension>, constant: bool) -> Gra
     graph
 }
 
+fn signed_copy_and_half_cast_graph(scalar: bool) -> GraphInfo {
+    use rustnn::operator_enums::MLOperandDataType;
+    let shape = if scalar {
+        vec![]
+    } else {
+        vec![Dimension::Static(256)]
+    };
+    let mut graph = identity_graph(DataType::Int8, shape, true);
+    let mut half = graph.operands[1].descriptor.clone();
+    half.data_type = DataType::Float16;
+    graph.operands.push(Operand {
+        name: Some("half".into()),
+        kind: OperandKind::Output,
+        descriptor: half,
+    });
+    graph.operations.push(Operation::Cast {
+        input: 0,
+        outputs: vec![2],
+        data_type: MLOperandDataType::Float16,
+        options: None,
+    });
+    graph.output_operands.push(2);
+    graph
+}
+
+#[test]
+fn signed_constant_copy_proof_does_not_admit_the_real_half_cast() {
+    for scalar in [false, true] {
+        let graph = signed_copy_and_half_cast_graph(scalar);
+        let before = serde_json::to_vec(&graph).unwrap();
+        let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+        let model = specification::Model::decode(converted.data.as_slice()).unwrap();
+        let metadata = model.description.unwrap().metadata.unwrap().user_defined;
+        let copies: serde_json::Value =
+            serde_json::from_str(&metadata["rustnn.webnn.output_constant_copies"]).unwrap();
+        assert_eq!(copies["sources"].as_object().unwrap().len(), 1);
+        assert_eq!(copies["outputs"].as_object().unwrap().len(), 1);
+        assert_eq!(copies["outputs"]["result"], 0);
+        assert!(copies["outputs"].get("half").is_none());
+        assert_eq!(serde_json::to_vec(&graph).unwrap(), before);
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "coreml-runtime"))]
+#[test]
+fn signed_constant_copy_and_real_half_cast_remain_independent_in_one_model() {
+    use rustnn::backend_selection::{BackendDevice, DeviceType};
+    use rustnn::executors::coreml::run_coreml_with_inputs_with_weights;
+    use rustnn::mlcontext::{
+        MLContext, MLContextOptions, MLNamedTensors, MLPowerPreference, MLTensorDescriptor,
+    };
+    use rustnn::operator_enums::MLOperandDataType;
+
+    for scalar in [false, true] {
+        let source = signed_copy_and_half_cast_graph(scalar);
+        let before = serde_json::to_vec(&source).unwrap();
+        let expected_raw = source.constant_operand_ids_to_handles[&0].data.clone();
+        let expected_numbers: Vec<f32> = expected_raw
+            .iter()
+            .map(|&byte| f32::from(byte as i8))
+            .collect();
+        let expected_half: Vec<u8> = expected_numbers
+            .iter()
+            .flat_map(|&value| half::f16::from_f32(value).to_bits().to_ne_bytes())
+            .collect();
+        let converted = CoremlMlProgramConverter.convert(&source).unwrap();
+        let attempts = run_coreml_with_inputs_with_weights(
+            &converted.data,
+            converted.weights_data.as_deref(),
+            vec![],
+        )
+        .unwrap();
+        for policy in ["ALL", "CPU_ONLY"] {
+            let attempt = attempts
+                .iter()
+                .find(|attempt| attempt.compute_unit == policy)
+                .unwrap();
+            let outputs = attempt
+                .result
+                .as_ref()
+                .unwrap_or_else(|error| panic!("{policy}, scalar={scalar}: {error}"));
+            assert_eq!(outputs.len(), 2);
+            for name in ["result", "half"] {
+                let output = outputs.iter().find(|output| output.name == name).unwrap();
+                assert_eq!(
+                    output.data, expected_numbers,
+                    "{policy}, scalar={scalar}, {name}"
+                );
+            }
+        }
+        for device in [DeviceType::Cpu, DeviceType::Gpu, DeviceType::Npu] {
+            let mut context = MLContext::create(
+                &MLContextOptions::new(MLPowerPreference::Default, device != DeviceType::Cpu)
+                    .with_rustnn_device_hint(BackendDevice::Coreml {
+                        device_type: device,
+                    }),
+            )
+            .unwrap();
+            let mut graph = context.rustnn_build_graph(source.clone()).unwrap();
+            let shape = if scalar { vec![] } else { vec![256] };
+            let raw = context
+                .create_tensor(
+                    &MLTensorDescriptor::new(MLOperandDataType::Int8, shape.clone())
+                        .to_readable()
+                        .to_writable(),
+                )
+                .unwrap();
+            let half = context
+                .create_tensor(
+                    &MLTensorDescriptor::new(MLOperandDataType::Float16, shape)
+                        .to_readable()
+                        .to_writable(),
+                )
+                .unwrap();
+            for iteration in 0..2 {
+                context
+                    .dispatch(
+                        &mut graph,
+                        &MLNamedTensors::new(),
+                        &MLNamedTensors::from([("result", &raw), ("half", &half)]),
+                    )
+                    .unwrap();
+                let mut actual_raw = vec![0u8; expected_raw.len()];
+                let mut actual_half = vec![0u8; expected_half.len()];
+                context.read_tensor(&raw, &mut actual_raw).unwrap();
+                context.read_tensor(&half, &mut actual_half).unwrap();
+                assert_eq!(
+                    actual_raw, expected_raw,
+                    "{device:?}, scalar={scalar}, iteration={iteration}"
+                );
+                assert_eq!(
+                    actual_half, expected_half,
+                    "{device:?}, scalar={scalar}, iteration={iteration}"
+                );
+                context
+                    .write_tensor(&raw, &vec![0u8; expected_raw.len()])
+                    .unwrap();
+                context.read_tensor(&half, &mut actual_half).unwrap();
+                assert_eq!(
+                    actual_half, expected_half,
+                    "raw output mutation must not alter the numeric cast"
+                );
+            }
+        }
+        assert_eq!(serde_json::to_vec(&source).unwrap(), before);
+    }
+}
+
 #[test]
 fn narrow_identity_helpers_do_not_shadow_graph_inputs() {
     let mut graph = identity_graph(DataType::Uint8, vec![Dimension::Static(256)], false);
