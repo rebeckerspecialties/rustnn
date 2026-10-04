@@ -1,7 +1,11 @@
 //! Evidenced Half arithmetic kernels compute wide without changing GraphInfo.
 
+#[path = "common/half_reference.rs"]
+mod half_reference;
+
 #[cfg(all(target_os = "macos", feature = "coreml-runtime"))]
 mod runtime {
+    use super::half_reference::reference_half_bits;
     use super::*;
     use half::f16;
     use rustnn::backend_selection::{BackendDevice, DeviceType};
@@ -75,7 +79,7 @@ mod runtime {
                         if !exclusive {
                             sum += f64::from(values[index]);
                         }
-                        expected[index] = f16::from_f64(sum).to_bits();
+                        expected[index] = reference_half_bits(sum);
                         if exclusive {
                             sum += f64::from(values[index]);
                         }
@@ -125,7 +129,7 @@ mod runtime {
                     &values,
                     policy
                 ),
-                [f16::from_f64(expected).to_bits()],
+                [reference_half_bits(expected)],
                 "{policy:?}"
             );
         }
@@ -195,7 +199,7 @@ mod runtime {
         let expected: Vec<_> = values
             .iter()
             .map(|value| {
-                f16::from_f64(f64::from(*value) / epsilon.sqrt() * 0.75 + f64::from(unit)).to_bits()
+                reference_half_bits(f64::from(*value) / epsilon.sqrt() * 0.75 + f64::from(unit))
             })
             .collect();
         for policy in [DeviceType::Cpu, DeviceType::Gpu, DeviceType::Npu] {
@@ -205,8 +209,7 @@ mod runtime {
                 "{policy:?}"
             );
             let average =
-                f16::from_f64(values.iter().map(|value| f64::from(*value)).sum::<f64>() / 4.)
-                    .to_bits();
+                reference_half_bits(values.iter().map(|value| f64::from(*value)).sum::<f64>() / 4.);
             assert_eq!(
                 predict(
                     simple(
