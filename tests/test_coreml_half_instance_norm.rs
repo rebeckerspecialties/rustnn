@@ -85,64 +85,73 @@ mod runtime {
 
     #[test]
     fn minimum_half_epsilon_is_not_replaced_by_the_native_default() {
-        let epsilon = 2f64.powi(-25) + 2f64.powi(-55);
         let values = [1u16, 0x8001, 1, 0x8001];
-        for policy in [DeviceType::Cpu, DeviceType::Gpu, DeviceType::Npu] {
-            for layout in ["nchw", "nhwc"] {
-                let mut source = graph(layout, Some(epsilon));
-                let shape = if layout == "nchw" {
-                    vec![1, 1, 2, 2]
-                } else {
-                    vec![1, 2, 2, 1]
-                };
-                for id in [0, 3] {
-                    source.operands[id].descriptor.shape =
-                        shape.iter().copied().map(Dimension::Static).collect();
-                }
-                for id in [1, 2] {
-                    source.operands[id].descriptor.shape = vec![Dimension::Static(1)];
-                }
-                source
-                    .constant_operand_ids_to_handles
-                    .get_mut(&1)
-                    .unwrap()
-                    .data = 0x3c00u16.to_le_bytes().to_vec();
-                source
-                    .constant_operand_ids_to_handles
-                    .get_mut(&2)
-                    .unwrap()
-                    .data = 0u16.to_le_bytes().to_vec();
-                let mut context = MLContext::create(
-                    &MLContextOptions::new(MLPowerPreference::Default, policy != DeviceType::Cpu)
+        // Both source values round to Half 2^-24, including the one
+        // whose deciding sticky bit is in the least significant source bit.
+        for epsilon in [
+            2f64.powi(-25) + 2f64.powi(-55),
+            f64::from_bits(2f64.powi(-25).to_bits() + 1),
+        ] {
+            for policy in [DeviceType::Cpu, DeviceType::Gpu, DeviceType::Npu] {
+                for layout in ["nchw", "nhwc"] {
+                    let mut source = graph(layout, Some(epsilon));
+                    let shape = if layout == "nchw" {
+                        vec![1, 1, 2, 2]
+                    } else {
+                        vec![1, 2, 2, 1]
+                    };
+                    for id in [0, 3] {
+                        source.operands[id].descriptor.shape =
+                            shape.iter().copied().map(Dimension::Static).collect();
+                    }
+                    for id in [1, 2] {
+                        source.operands[id].descriptor.shape = vec![Dimension::Static(1)];
+                    }
+                    source
+                        .constant_operand_ids_to_handles
+                        .get_mut(&1)
+                        .unwrap()
+                        .data = 0x3c00u16.to_le_bytes().to_vec();
+                    source
+                        .constant_operand_ids_to_handles
+                        .get_mut(&2)
+                        .unwrap()
+                        .data = 0u16.to_le_bytes().to_vec();
+                    let mut context = MLContext::create(
+                        &MLContextOptions::new(
+                            MLPowerPreference::Default,
+                            policy != DeviceType::Cpu,
+                        )
                         .with_rustnn_device_hint(BackendDevice::Coreml {
                             device_type: policy,
                         }),
-                )
-                .unwrap();
-                let mut graph = context.rustnn_build_graph(source).unwrap();
-                let descriptor = MLTensorDescriptor::new(
-                    MLOperandDataType::Float16,
-                    shape.iter().map(|&n| u64::from(n)).collect(),
-                );
-                let input = context
-                    .create_tensor(&descriptor.clone().to_writable())
-                    .unwrap();
-                let output = context.create_tensor(&descriptor.to_readable()).unwrap();
-                context.write_tensor(&input, &values).unwrap();
-                context
-                    .dispatch(
-                        &mut graph,
-                        &MLNamedTensors::from([("input", &input)]),
-                        &MLNamedTensors::from([("result", &output)]),
                     )
                     .unwrap();
-                let mut actual = [0u16; 4];
-                context.read_tensor(&output, &mut actual).unwrap();
-                assert_eq!(
-                    actual,
-                    [0x0c00, 0x8c00, 0x0c00, 0x8c00],
-                    "{layout}/{policy:?}"
-                );
+                    let mut graph = context.rustnn_build_graph(source).unwrap();
+                    let descriptor = MLTensorDescriptor::new(
+                        MLOperandDataType::Float16,
+                        shape.iter().map(|&n| u64::from(n)).collect(),
+                    );
+                    let input = context
+                        .create_tensor(&descriptor.clone().to_writable())
+                        .unwrap();
+                    let output = context.create_tensor(&descriptor.to_readable()).unwrap();
+                    context.write_tensor(&input, &values).unwrap();
+                    context
+                        .dispatch(
+                            &mut graph,
+                            &MLNamedTensors::from([("input", &input)]),
+                            &MLNamedTensors::from([("result", &output)]),
+                        )
+                        .unwrap();
+                    let mut actual = [0u16; 4];
+                    context.read_tensor(&output, &mut actual).unwrap();
+                    assert_eq!(
+                        actual,
+                        [0x0c00, 0x8c00, 0x0c00, 0x8c00],
+                        "{layout}/{policy:?}"
+                    );
+                }
             }
         }
     }
@@ -554,14 +563,19 @@ fn absent_instance_norm_options_round_the_default_epsilon_to_source_half() {
 #[test]
 fn half_instance_norm_rounds_epsilon_directly_from_binary64() {
     for layout in ["nchw", "nhwc"] {
-        for epsilon in [
-            2f64.powi(-25) + 2f64.powi(-55),
-            1.00048828125 - 2f64.powi(-40),
-            1.00048828125 + 2f64.powi(-40),
+        for (epsilon, expected) in [
+            (2f64.powi(-25) + 2f64.powi(-55), 0x0001),
+            (1.00048828125 - 2f64.powi(-40), 0x3c00),
+            (1.00048828125 + 2f64.powi(-40), 0x3c01),
+            (f64::from_bits(2f64.powi(-25).to_bits() + 1), 0x0001),
+            (f64::from_bits(1.00048828125f64.to_bits() - 1), 0x3c00),
+            (f64::from_bits(1.00048828125f64.to_bits() + 1), 0x3c01),
+            (f64::from_bits(1.00146484375f64.to_bits() - 1), 0x3c01),
+            (f64::from_bits(1.00146484375f64.to_bits() + 1), 0x3c02),
         ] {
             check(
                 &graph(layout, Some(epsilon)),
-                half::f16::from_f64(epsilon).to_f32(),
+                half::f16::from_bits(expected).to_f32(),
             );
         }
     }

@@ -447,3 +447,170 @@ fn gemm_does_not_discard_a_represented_one_ulp_coefficient() {
         "only an exactly represented unit coefficient can omit a scaling operation"
     );
 }
+
+fn coefficient_boundaries() -> Vec<(f64, u16)> {
+    // Adjacent Half encodings independently define each exact midpoint. Use
+    // binary64's immediate neighbors so even the lowest sticky bit matters.
+    let mut cases = vec![(0., 0), (-0., 0x8000), (65504., 0x7bff)];
+    for (midpoint, lower, upper) in [
+        (2f64.powi(-25), 0x0000, 0x0001),
+        (1023.5 * 2f64.powi(-24), 0x03ff, 0x0400),
+        (1.00048828125, 0x3c00, 0x3c01),
+        (1.00146484375, 0x3c01, 0x3c02),
+        (65520., 0x7bff, 0x7c00),
+    ] {
+        let tie = if lower & 1 == 0 { lower } else { upper };
+        for (offset, expected) in [(-1i64, lower), (0, tie), (1, upper)] {
+            let value = f64::from_bits((midpoint.to_bits() as i64 + offset) as u64);
+            cases.push((value, expected));
+            cases.push((-value, expected | 0x8000));
+        }
+    }
+    cases
+}
+
+#[test]
+fn scalar_paths_keep_lowest_sticky_bit_at_underflow_normal_and_overflow_boundaries() {
+    for (value, expected) in coefficient_boundaries() {
+        let linear = unary("linear", json!({"alpha":value,"beta":value}));
+        expect_scalar(&linear, "mul", "y", expected);
+        expect_scalar(&linear, "add", "y", expected);
+
+        for (name, kernel) in [("elu", "elu"), ("leakyRelu", "leaky_relu")] {
+            expect_scalar(
+                &unary(name, json!({"alpha":value})),
+                kernel,
+                "alpha",
+                expected,
+            );
+        }
+        let sigmoid = unary("hardSigmoid", json!({"alpha":value,"beta":value}));
+        expect_scalar(&sigmoid, "sigmoid_hard", "alpha", expected);
+        expect_scalar(&sigmoid, "sigmoid_hard", "beta", expected);
+
+        for (options, key) in [
+            (json!({"minValue":value,"maxValue":"Infinity"}), "alpha"),
+            (json!({"minValue":"-Infinity","maxValue":value}), "beta"),
+        ] {
+            expect_scalar(&unary("clamp", options), "clip", key, expected);
+        }
+
+        let mut pad = unary("linear", json!({}));
+        pad.operands[1].descriptor.shape = [1, 1, 2, 4].map(Dimension::Static).into();
+        pad.operations[0] = Operation::from_json_attributes(
+            "pad",
+            &[0],
+            &[1],
+            &json!({"beginningPadding":[0,0,0,1],"endingPadding":[0,0,0,1],"value":value}),
+        )
+        .unwrap();
+        expect_scalar(&pad, "pad", "constant_val", expected);
+    }
+}
+
+#[test]
+fn gemm_scale_and_bias_keep_lowest_sticky_bit_and_only_omit_exact_one() {
+    for (value, expected) in coefficient_boundaries() {
+        let graph = GraphInfo {
+            operands: vec![
+                operand("a", &[1, 1], OperandKind::Input, DataType::Float16),
+                operand("b", &[1, 1], OperandKind::Input, DataType::Float16),
+                operand("c", &[1, 1], OperandKind::Input, DataType::Float16),
+                operand("result", &[1, 1], OperandKind::Output, DataType::Float16),
+            ],
+            input_operands: vec![0, 1, 2],
+            output_operands: vec![3],
+            operations: vec![
+                Operation::from_json_attributes(
+                    "gemm",
+                    &[0, 1],
+                    &[3],
+                    &json!({"alpha":value,"beta":value,"c":2}),
+                )
+                .unwrap(),
+            ],
+            ..Default::default()
+        };
+        let actual: Vec<_> = operations(&graph)
+            .iter()
+            .filter(|op| op.r#type == "mul")
+            .map(|op| immediate_half(&op.inputs["y"]).unwrap())
+            .collect();
+        let wanted = if expected == 0x3c00 {
+            vec![]
+        } else {
+            vec![expected; 2]
+        };
+        assert_eq!(actual, wanted, "GEMM alpha/beta, original double={value:?}");
+    }
+}
+
+#[test]
+fn normalization_epsilon_keeps_lowest_sticky_bit_with_and_without_affine_operands() {
+    for (epsilon, expected) in coefficient_boundaries()
+        .into_iter()
+        .filter(|(v, _)| *v >= 0.)
+    {
+        for affine in [false, true] {
+            for (name, kernel) in [
+                ("layerNormalization", "layer_norm"),
+                ("instanceNormalization", "layer_norm"),
+                ("batchNormalization", "batch_norm"),
+            ] {
+                let mut graph = unary("linear", json!({}));
+                let mut options = json!({"epsilon":epsilon});
+                let mut inputs = vec![0];
+                if name == "batchNormalization" {
+                    for (parameter, bits) in [("mean", 0x0000u16), ("variance", 0x3c00)] {
+                        let id = graph.operands.len() as u32;
+                        graph.operands.push(operand(
+                            parameter,
+                            &[1],
+                            OperandKind::Constant,
+                            DataType::Float16,
+                        ));
+                        graph.constant_operand_ids_to_handles.insert(
+                            id,
+                            ConstantData {
+                                data: bits.to_le_bytes().to_vec(),
+                                label: None,
+                            },
+                        );
+                        inputs.push(id);
+                    }
+                }
+                if affine {
+                    if name == "layerNormalization" {
+                        options["axes"] = json!([1]);
+                    }
+                    for (parameter, bits) in [("scale", 0x3c01u16), ("bias", 0x8001)] {
+                        let id = graph.operands.len() as u32;
+                        graph.operands.push(operand(
+                            parameter,
+                            &[1],
+                            OperandKind::Constant,
+                            DataType::Float16,
+                        ));
+                        graph.constant_operand_ids_to_handles.insert(
+                            id,
+                            ConstantData {
+                                data: bits.to_le_bytes().to_vec(),
+                                label: None,
+                            },
+                        );
+                        options[parameter] = json!(id);
+                    }
+                }
+                graph.operations[0] =
+                    Operation::from_json_attributes(name, &inputs, &[1], &options).unwrap();
+                expect_scalar(&graph, kernel, "epsilon", expected);
+                assert!(
+                    graph
+                        .operands
+                        .iter()
+                        .all(|operand| operand.descriptor.data_type == DataType::Float16)
+                );
+            }
+        }
+    }
+}
