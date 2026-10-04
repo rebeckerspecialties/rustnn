@@ -1,5 +1,8 @@
 //! Precision and shape boundaries for the CoreML exact-GELU lowering.
 
+#[path = "common/half_reference.rs"]
+mod half_reference;
+
 use prost::Message;
 use rustnn::converters::{CoremlMlProgramConverter, GraphConverter};
 use rustnn::graph::{DataType, Dimension, GraphInfo, Operand, OperandDescriptor, OperandKind};
@@ -131,7 +134,7 @@ mod runtime {
         let value = f16::from_bits(input).to_f64();
         // SAFETY: erf accepts every f64, including infinities and NaNs.
         let erf_value = unsafe { erf(value / std::f64::consts::SQRT_2) };
-        f16::from_f64(0.5 * value * (1.0 + erf_value)).to_bits()
+        half_reference::reference_half_bits(0.5 * value * (1.0 + erf_value))
     }
 
     fn check_output(input: u16, actual: u16, expected: u16, policy: DeviceType) {
