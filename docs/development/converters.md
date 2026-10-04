@@ -117,6 +117,16 @@ Rules that hold for every converter:
 - The internal `shape` extension lowers to MIL `shape`, retaining its native int32 result
   inside CoreML and widening the public int64 result at readback. Imported shape tensors
   retain their type and rank through the shared `unsqueeze` inference path.
+- Dynamic reshape uses a constant MIL target with one `-1` when input and target each
+  contain one matching, nonempty dynamic label, their positive static products match,
+  and the target bound covers the input. This avoids a runtime shape/slice/concat chain
+  without fixing the active extent to its maximum. Other targets retain explicit runtime
+  shape construction; labels are opaque, not arithmetic expressions. Static zero factors,
+  multiple unknown axes and unproved relationships do not take the inferred path. This
+  does not add zero-extent prediction support to CoreML.
+- Dynamic expand derives repetitions from proven broadcast relationships: matching axes
+  repeat once, singleton axes repeat by the target extent. It does not divide target by
+  input sizes, which would admit invalid broadcasts and introduce division by zero.
 
 ### LiteRT
 
