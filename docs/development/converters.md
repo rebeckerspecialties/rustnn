@@ -122,7 +122,7 @@ Rules that hold for every converter:
   Unsafe or colliding names receive unique physical identifiers. Creator-defined
   `rustnn.webnn.input_aliases` and `rustnn.webnn.output_aliases` JSON mappings preserve
   logical bindings in both execution paths and standalone exports.
-  Source-proven identity/same-type-cast outputs with identical type and shape share one
+  Source-proven copies with identical type, shape and pending layout share one
   physical result: CoreML can omit duplicate scalar/dynamic copy features from prediction.
   Logical tensors still receive independent results. Unequal computations and real dtype
   conversions remain distinct. Same-float32 casts lower as identity rather than the native
@@ -131,6 +131,14 @@ Rules that hold for every converter:
   in `rustnn.webnn.output_passthroughs`. Execution snapshots the original bound input before
   prediction, validates its dtype, actual shape and byte length, then supplies independent
   output bytes. This also preserves a public float32 copy when CoreML narrows another consumer.
+  Copy proofs cover identity, same-type cast, same-shape reshape, identity transpose, and
+  static full-span, unit-stride slice. An equal square shape does not prove a transpose is
+  an identity; dynamic maximum extents do not prove a full-span slice.
+  Copies rooted in original constants use versioned `rustnn.webnn.output_constant_copies`
+  metadata: output bindings reference a deduplicated descriptor and original base64 bytes.
+  Only output-reachable constants are included. Execution checks bounds and byte lengths
+  before decoding, then supplies independently owned results. The valid native graph still
+  runs; arithmetic-derived outputs are not reconstructed from inputs or constants.
 - The internal `shape` extension lowers to MIL `shape`, retaining its native int32 result
   inside CoreML and widening the public int64 result at readback. Imported shape tensors
   retain their type and rank through the shared `unsqueeze` inference path.
