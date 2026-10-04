@@ -252,6 +252,166 @@ fn half_gemm_keeps_weight_blob_half_and_rounds_source_options_before_widening() 
     assert_eq!(value.values, [half::f16::from_f32(0.33333).to_f32()]);
 }
 
+fn coefficient_cases() -> [(f64, u16); 6] {
+    [
+        (f64::from_bits(2f64.powi(-25).to_bits() - 1), 0x0000),
+        (f64::from_bits(2f64.powi(-25).to_bits() + 1), 0x0001),
+        (f64::from_bits(1.00048828125f64.to_bits() - 1), 0x3c00),
+        (f64::from_bits(1.00048828125f64.to_bits() + 1), 0x3c01),
+        (f64::from_bits(1.00146484375f64.to_bits() - 1), 0x3c01),
+        (f64::from_bits(1.00146484375f64.to_bits() + 1), 0x3c02),
+    ]
+}
+
+fn coefficient_graph(parameter: &str, coefficient: f64) -> GraphInfo {
+    let mut graph = GraphInfo {
+        operands: vec![
+            operand("a", &[1, 1], OperandKind::Input),
+            operand("b", &[1, 1], OperandKind::Constant),
+        ],
+        input_operands: vec![0],
+        constant_operand_ids_to_handles: [(
+            1,
+            ConstantData {
+                data: 0x3c00u16.to_le_bytes().to_vec(),
+                label: None,
+            },
+        )]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+    let mut options = json!({});
+    options[parameter] = json!(coefficient);
+    if parameter == "beta" {
+        graph
+            .operands
+            .push(operand("bias", &[1, 1], OperandKind::Constant));
+        graph.constant_operand_ids_to_handles.insert(
+            2,
+            ConstantData {
+                data: 0x3c00u16.to_le_bytes().to_vec(),
+                label: None,
+            },
+        );
+        options["c"] = json!(2);
+    }
+    let output_id = graph.operands.len() as u32;
+    graph
+        .operands
+        .push(operand("result", &[1, 1], OperandKind::Output));
+    graph.output_operands = vec![output_id];
+    graph.operations =
+        vec![Operation::from_json_attributes("gemm", &[0, 1], &[output_id], &options).unwrap()];
+    graph
+}
+
+fn check_gemm_coefficient(parameter: &str) {
+    use mil_spec::{argument::binding::Binding, tensor_value, value};
+    for (coefficient, expected) in coefficient_cases() {
+        let graph = coefficient_graph(parameter, coefficient);
+        let original = serde_json::to_vec(&graph).unwrap();
+        let ops = operations(&graph);
+        assert_eq!(serde_json::to_vec(&graph).unwrap(), original);
+        let coefficients: Vec<_> = ops
+            .iter()
+            .filter(|op| op.r#type == "mul")
+            .filter_map(|op| {
+                let Binding::Value(value) = op.inputs.get("y")?.arguments[0].binding.as_ref()?
+                else {
+                    return None;
+                };
+                let value::Value::ImmediateValue(value) = value.value.as_ref()? else {
+                    return None;
+                };
+                let value::immediate_value::Value::Tensor(value) = value.value.as_ref()? else {
+                    return None;
+                };
+                let tensor_value::Value::Floats(values) = value.value.as_ref()? else {
+                    return None;
+                };
+                Some(values.values.clone())
+            })
+            .collect();
+        if expected == 0x3c00 {
+            assert!(coefficients.is_empty(), "{parameter}: omit exactly one");
+        } else {
+            assert_eq!(
+                coefficients,
+                [vec![half::f16::from_bits(expected).to_f32()]],
+                "{parameter}={coefficient}: represent source Half before wide GEMM"
+            );
+        }
+    }
+}
+
+#[test]
+fn half_gemm_alpha_keeps_the_lowest_binary64_sticky_bit_before_widening() {
+    check_gemm_coefficient("alpha");
+}
+
+#[test]
+fn half_gemm_beta_keeps_the_lowest_binary64_sticky_bit_before_widening() {
+    check_gemm_coefficient("beta");
+}
+
+#[cfg(all(target_os = "macos", feature = "coreml-runtime"))]
+mod runtime {
+    use super::*;
+    use rustnn::backend_selection::{BackendDevice, DeviceType};
+    use rustnn::mlcontext::{
+        MLContext, MLContextOptions, MLNamedTensors, MLPowerPreference, MLTensorDescriptor,
+    };
+    use rustnn::operator_enums::MLOperandDataType;
+
+    fn check_native_coefficient(parameter: &str) {
+        for policy in [DeviceType::Cpu, DeviceType::Gpu, DeviceType::Npu] {
+            for (coefficient, expected) in coefficient_cases() {
+                let mut context = MLContext::create(
+                    &MLContextOptions::new(MLPowerPreference::Default, policy != DeviceType::Cpu)
+                        .with_rustnn_device_hint(BackendDevice::Coreml {
+                            device_type: policy,
+                        }),
+                )
+                .unwrap();
+                let mut graph = context
+                    .rustnn_build_graph(coefficient_graph(parameter, coefficient))
+                    .unwrap();
+                let descriptor = MLTensorDescriptor::new(MLOperandDataType::Float16, vec![1, 1]);
+                let input = context
+                    .create_tensor(&descriptor.clone().to_writable())
+                    .unwrap();
+                let output = context.create_tensor(&descriptor.to_readable()).unwrap();
+                // alpha: 1*1*alpha. beta: 0*1 + beta*1. Both final
+                // results expose the option's represented source-Half bits.
+                context
+                    .write_tensor(&input, &[if parameter == "alpha" { 0x3c00u16 } else { 0 }])
+                    .unwrap();
+                context
+                    .dispatch(
+                        &mut graph,
+                        &MLNamedTensors::from([("a", &input)]),
+                        &MLNamedTensors::from([("result", &output)]),
+                    )
+                    .unwrap();
+                let mut actual = [0u16];
+                context.read_tensor(&output, &mut actual).unwrap();
+                assert_eq!(actual, [expected], "{parameter}={coefficient}/{policy:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn half_gemm_alpha_returns_independently_represented_midpoint_neighbors() {
+        check_native_coefficient("alpha");
+    }
+
+    #[test]
+    fn half_gemm_beta_returns_independently_represented_midpoint_neighbors() {
+        check_native_coefficient("beta");
+    }
+}
+
 #[test]
 fn half_triangular_native_band_and_masked_select_preserve_kept_values() {
     for upper in [false, true] {

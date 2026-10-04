@@ -209,6 +209,10 @@ test-coreml-gelu:
 test-coreml-precision:
 	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_precision_pipeline -- $(TEST_FILTER) --test-threads=1
 
+.PHONY: test-coreml-scalar-options
+test-coreml-scalar-options:
+	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_scalar_options -- $(TEST_FILTER) --test-threads=1
+
 # Build every target, including examples and the separately run WPT harness.
 build-coreml:
 	$(CARGO) build --all-targets --no-default-features --features $(COREML_FEATURES)
