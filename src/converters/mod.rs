@@ -34,12 +34,15 @@ mod trtx_rnn;
 pub mod webnn;
 mod weight_file_builder;
 
+#[cfg(all(feature = "coreml-runtime", any(target_os = "macos", test)))]
+pub(crate) use coreml_mlprogram::CoremlConstantCopies;
 pub use coreml_mlprogram::CoremlMlProgramConverter;
 #[cfg(feature = "coreml-runtime")]
 pub(crate) use coreml_mlprogram::CoremlPassthrough;
 #[cfg(all(feature = "coreml-runtime", target_os = "macos"))]
 pub(crate) use coreml_mlprogram::{
-    INPUT_ALIASES_METADATA_KEY, OUTPUT_ALIASES_METADATA_KEY, OUTPUT_PASSTHROUGHS_METADATA_KEY,
+    INPUT_ALIASES_METADATA_KEY, OUTPUT_ALIASES_METADATA_KEY, OUTPUT_CONSTANT_COPIES_METADATA_KEY,
+    OUTPUT_PASSTHROUGHS_METADATA_KEY,
 };
 #[cfg(feature = "litert-runtime")]
 pub use litert::LiteRtConverter;

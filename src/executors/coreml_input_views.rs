@@ -276,6 +276,183 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    fn mixed_views_and_copy_outputs(rows: &[u32], dynamic: bool) {
+        use crate::backend_selection::DeviceType;
+        use crate::converters::{CoremlMlProgramConverter, GraphConverter, coreml_names};
+        use crate::graph::{
+            ConstantData, DataType, Dimension, DynamicDimension, GraphInfo, Operand,
+            OperandDescriptor, OperandKind,
+        };
+        use crate::operators::Operation;
+        use crate::protos::coreml::specification;
+        use prost::Message;
+        use std::collections::HashMap;
+
+        let descriptor = |data_type, shape| OperandDescriptor {
+            data_type,
+            shape,
+            pending_permutation: vec![],
+        };
+        let maximum = *rows.iter().max().unwrap();
+        let dimension = |name: &str, size| {
+            if dynamic {
+                Dimension::Dynamic(DynamicDimension {
+                    name: name.into(),
+                    max_size: size,
+                })
+            } else {
+                Dimension::Static(size)
+            }
+        };
+        let source = descriptor(
+            DataType::Float16,
+            vec![dimension("rows", maximum), Dimension::Static(2)],
+        );
+        let flat = descriptor(
+            DataType::Float16,
+            vec![dimension("flat_values", maximum * 2)],
+        );
+        let constant = descriptor(DataType::Int32, vec![Dimension::Static(4)]);
+        let operand = |name: &str, kind, descriptor| Operand {
+            name: Some(name.into()),
+            kind,
+            descriptor,
+        };
+        let constant_bytes: Vec<_> = [16_777_217i32, -16_777_217, i32::MIN, i32::MAX]
+            .into_iter()
+            .flat_map(i32::to_le_bytes)
+            .collect();
+        let graph = GraphInfo {
+            operands: vec![
+                operand("tensor", OperandKind::Input, source.clone()),
+                operand("flat.view", OperandKind::Input, flat.clone()),
+                operand("constant", OperandKind::Constant, constant.clone()),
+                operand("copy.source", OperandKind::Output, source.clone()),
+                operand("copy.constant", OperandKind::Output, constant.clone()),
+                operand("negated.view", OperandKind::Output, flat),
+            ],
+            input_operands: vec![0, 1],
+            output_operands: vec![3, 4, 5],
+            constant_operand_ids_to_handles: HashMap::from([(
+                2,
+                ConstantData {
+                    data: constant_bytes.clone(),
+                    label: None,
+                },
+            )]),
+            operations: vec![
+                Operation::Identity {
+                    input: 0,
+                    options: None,
+                    outputs: vec![3],
+                },
+                Operation::Identity {
+                    input: 2,
+                    options: None,
+                    outputs: vec![4],
+                },
+                Operation::Neg {
+                    input: 1,
+                    options: None,
+                    outputs: vec![5],
+                },
+            ],
+            ..Default::default()
+        };
+        let before = serde_json::to_vec(&graph).unwrap();
+        let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+        assert_eq!(serde_json::to_vec(&graph).unwrap(), before);
+        let mut model = specification::Model::decode(converted.data.as_slice()).unwrap();
+        let metadata = &mut model
+            .description
+            .as_mut()
+            .unwrap()
+            .metadata
+            .as_mut()
+            .unwrap()
+            .user_defined;
+        metadata.insert(
+            METADATA_KEY.into(),
+            serde_json::json!([{
+                "source": coreml_names::encode("tensor"),
+                "view": coreml_names::encode("flat.view"),
+            }])
+            .to_string(),
+        );
+        for policy in [DeviceType::Cpu, DeviceType::Gpu, DeviceType::Npu] {
+            let compiled = super::super::compile_model(
+                model.encode_to_vec(),
+                converted.weights_data.clone(),
+                policy,
+                false,
+            )
+            .unwrap();
+            assert_eq!(compiled.aliases.compact_input_views.len(), 1);
+            assert_eq!(compiled.aliases.passthroughs.len(), 1);
+            assert_eq!(compiled.aliases.constant_copies.len(), 1);
+            for &rows in rows {
+                let actual = descriptor(
+                    DataType::Float16,
+                    vec![Dimension::Static(rows), Dimension::Static(2)],
+                );
+                let original: Vec<_> = [0x3c00u16, 0x4000, 0x4200, 0x4400, 0x4500, 0x4600]
+                    .into_iter()
+                    .take(rows as usize * 2)
+                    .flat_map(u16::to_le_bytes)
+                    .collect();
+                let negated: Vec<_> = original
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .flat_map(|&bits| (u16::from_le_bytes(bits) ^ 0x8000).to_le_bytes())
+                    .collect();
+                let outputs = HashMap::from([
+                    // The byte executor accepts graph bounds for proven copies;
+                    // its returned bytes must still match the actual input.
+                    ("copy.source".into(), source.clone()),
+                    ("copy.constant".into(), constant.clone()),
+                    (
+                        "negated.view".into(),
+                        descriptor(DataType::Float16, vec![Dimension::Static(rows * 2)]),
+                    ),
+                ]);
+                let mut bytes = original.clone();
+                let mut result = super::super::run_coreml_bytes(
+                    &compiled,
+                    &HashMap::from([(
+                        "tensor".into(),
+                        super::super::CoremlByteInput {
+                            data: &bytes,
+                            descriptor: &actual,
+                        },
+                    )]),
+                    &outputs,
+                )
+                .unwrap();
+                bytes.fill(0);
+                assert_eq!(result["copy.source"], original, "{policy:?}, rows={rows}");
+                assert_eq!(result["copy.constant"], constant_bytes);
+                assert_eq!(result["negated.view"], negated);
+                result.get_mut("copy.source").unwrap().fill(0);
+                assert_eq!(result["copy.constant"], constant_bytes);
+                assert_eq!(result["negated.view"], negated);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn compact_views_coexist_with_proven_input_and_constant_outputs() {
+        mixed_views_and_copy_outputs(&[3, 3], false);
+    }
+
+    #[cfg(all(target_os = "macos", feature = "dynamic-inputs"))]
+    #[test]
+    fn compact_views_and_proven_outputs_keep_actual_grow_shrink_extents() {
+        mixed_views_and_copy_outputs(&[1, 3, 1], true);
+    }
+
     #[cfg(target_vendor = "apple")]
     unsafe fn strided_source(data: &mut [u8], shape: &[i64], strides: &[i64]) -> *mut Object {
         let numbers = |values: &[i64]| {
