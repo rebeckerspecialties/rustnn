@@ -40,6 +40,7 @@ use crate::protos::coreml::specification::Model;
 pub(crate) const OUTPUT_ALIASES_METADATA_KEY: &str = "rustnn.webnn.output_aliases";
 pub(crate) const INPUT_ALIASES_METADATA_KEY: &str = "rustnn.webnn.input_aliases";
 pub(crate) const OUTPUT_PASSTHROUGHS_METADATA_KEY: &str = "rustnn.webnn.output_passthroughs";
+pub(crate) const OUTPUT_CONSTANT_COPIES_METADATA_KEY: &str = "rustnn.webnn.output_constant_copies";
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CoremlPassthrough {
@@ -47,31 +48,126 @@ pub(crate) struct CoremlPassthrough {
     pub(crate) descriptor: crate::graph::OperandDescriptor,
 }
 
+#[serde_with::serde_as]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CoremlConstantCopies {
+    pub(crate) version: u32,
+    #[serde_as(as = "serde_with::MapPreventDuplicates<_, _>")]
+    pub(crate) sources: std::collections::BTreeMap<u32, CoremlConstantSource>,
+    #[serde_as(as = "serde_with::MapPreventDuplicates<_, _>")]
+    pub(crate) outputs: std::collections::BTreeMap<String, u32>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CoremlConstantSource {
+    pub(crate) descriptor: crate::graph::OperandDescriptor,
+    // Keep the encoded string until its declared byte length has been checked.
+    pub(crate) data: String,
+}
+
+fn proven_copy_input(graph: &GraphInfo, operation: &Operation, output: u32) -> Option<u32> {
+    let input = match operation {
+        Operation::Identity { input, .. }
+        | Operation::Cast { input, .. }
+        | Operation::Transpose { input, .. }
+        | Operation::Slice { input, .. }
+        | Operation::Reshape { input, .. } => *input,
+        _ => return None,
+    };
+    let source = &graph.operand(input)?.descriptor;
+    let destination = &graph.operand(output)?.descriptor;
+    if source.data_type != destination.data_type
+        || source.shape != destination.shape
+        || source.pending_permutation != destination.pending_permutation
+    {
+        return None;
+    }
+    let is_copy = match operation {
+        Operation::Identity { .. } => true,
+        Operation::Cast { data_type, .. } => DataType::from(*data_type) == source.data_type,
+        Operation::Transpose { options, .. } => {
+            let permutation = options
+                .as_ref()
+                .map(|options| options.permutation.as_slice())
+                .unwrap_or(&[]);
+            if permutation.is_empty() {
+                source.shape.len() <= 1
+            } else {
+                permutation.len() == source.shape.len()
+                    && permutation
+                        .iter()
+                        .enumerate()
+                        .all(|(axis, &value)| value as usize == axis)
+            }
+        }
+        Operation::Reshape { new_shape, .. } => {
+            new_shape
+                .iter()
+                .cloned()
+                .map(GraphDimension::from)
+                .collect::<Vec<_>>()
+                == source.shape
+        }
+        Operation::Slice {
+            starts,
+            sizes,
+            options,
+            ..
+        } => {
+            let strides = options
+                .as_ref()
+                .map(|options| options.strides.as_slice())
+                .unwrap_or(&[]);
+            source.static_shape().is_some()
+                && starts.len() == source.shape.len()
+                && starts.iter().all(|&start| start == 0)
+                && sizes
+                    .iter()
+                    .cloned()
+                    .map(GraphDimension::from)
+                    .collect::<Vec<_>>()
+                    == source.shape
+                && (strides.is_empty()
+                    || (strides.len() == source.shape.len()
+                        && strides.iter().all(|&stride| stride == 1)))
+        }
+        _ => false,
+    };
+    is_copy.then_some(input)
+}
+
+fn copy_origins(graph: &GraphInfo) -> Vec<Option<u32>> {
+    let mut origins = vec![None; graph.operands.len()];
+    for &input in &graph.input_operands {
+        origins[input as usize] = Some(input);
+    }
+    for (&id, data) in &graph.constant_operand_ids_to_handles {
+        if graph.operand(id).is_some_and(|operand| {
+            operand.kind == OperandKind::Constant
+                && operand.descriptor.static_shape().is_some()
+                && operand.descriptor.byte_length() == Some(data.data.len())
+        }) {
+            origins[id as usize] = Some(id);
+        }
+    }
+    for operation in &graph.operations {
+        for &output in operation.output_operands() {
+            if let Some(input) = proven_copy_input(graph, operation, output) {
+                origins[output as usize] = origins[input as usize];
+            }
+        }
+    }
+    origins
+}
+
 /// Proven copies of a graph input can be fulfilled from its original binding.
 /// This avoids CoreML eliminating no-op outputs or changing their precision
 /// when another consumer narrows the same input. No runtime value comparison
 /// or output-name heuristic is involved.
 fn input_passthroughs(graph: &GraphInfo) -> std::collections::BTreeMap<String, CoremlPassthrough> {
-    let mut origins = vec![None; graph.operands.len()];
-    for &input in &graph.input_operands {
-        origins[input as usize] = Some(input);
-    }
-    for operation in &graph.operations {
-        let input = match operation {
-            Operation::Identity { input, .. } | Operation::Cast { input, .. } => *input,
-            _ => continue,
-        };
-        for &output in operation.output_operands() {
-            if let (Some(source), Some(destination)) = (graph.operand(input), graph.operand(output))
-                && source.descriptor.data_type == destination.descriptor.data_type
-                && source.descriptor.shape == destination.descriptor.shape
-                && source.descriptor.pending_permutation
-                    == destination.descriptor.pending_permutation
-            {
-                origins[output as usize] = origins[input as usize];
-            }
-        }
-    }
+    let origins = copy_origins(graph);
     graph
         .output_operands
         .iter()
@@ -82,6 +178,9 @@ fn input_passthroughs(graph: &GraphInfo) -> std::collections::BTreeMap<String, C
                 return None;
             }
             let input = origins[output as usize]?;
+            if graph.operand(input)?.kind != OperandKind::Input {
+                return None;
+            }
             Some((
                 logical_operand_name(graph, output),
                 CoremlPassthrough {
@@ -91,6 +190,48 @@ fn input_passthroughs(graph: &GraphInfo) -> std::collections::BTreeMap<String, C
             ))
         })
         .collect()
+}
+
+fn constant_copies(graph: &GraphInfo) -> CoremlConstantCopies {
+    use base64::Engine;
+    let origins = copy_origins(graph);
+    let mut copies = CoremlConstantCopies {
+        version: 1,
+        sources: Default::default(),
+        outputs: Default::default(),
+    };
+    for &output in &graph.output_operands {
+        let Some(operand) = graph
+            .operand(output)
+            .filter(|operand| operand.kind == OperandKind::Output)
+        else {
+            continue;
+        };
+        let Some(origin) = origins[output as usize] else {
+            continue;
+        };
+        let Some(source) = graph
+            .operand(origin)
+            .filter(|source| source.kind == OperandKind::Constant)
+        else {
+            continue;
+        };
+        let Some(data) = graph.constant_operand_ids_to_handles.get(&origin) else {
+            continue;
+        };
+        copies
+            .sources
+            .entry(origin)
+            .or_insert_with(|| CoremlConstantSource {
+                descriptor: source.descriptor.clone(),
+                data: base64::engine::general_purpose::STANDARD.encode(&data.data),
+            });
+        copies
+            .outputs
+            .insert(logical_operand_name(graph, output), origin);
+        debug_assert_eq!(operand.descriptor.data_type, source.descriptor.data_type);
+    }
+    copies
 }
 
 // Public WebNN names need not be MIL identifiers. Keep logical names outside
@@ -125,20 +266,9 @@ fn equivalent_output_names(graph: &GraphInfo) -> HashMap<String, String> {
     let mut parents: Vec<_> = (0..graph.operands.len()).collect();
     let mut producers = HashMap::new();
     for (order, operation) in graph.operations.iter().enumerate() {
-        let source = match operation {
-            Operation::Identity { input, .. } | Operation::Cast { input, .. } => Some(*input),
-            _ => None,
-        };
         for &output in operation.output_operands() {
             producers.insert(output, order);
-            if let Some(input) = source
-                && let (Some(input_operand), Some(output_operand)) =
-                    (graph.operand(input), graph.operand(output))
-                && input_operand.descriptor.data_type == output_operand.descriptor.data_type
-                && input_operand.descriptor.shape == output_operand.descriptor.shape
-                && input_operand.descriptor.pending_permutation
-                    == output_operand.descriptor.pending_permutation
-            {
+            if let Some(input) = proven_copy_input(graph, operation, output) {
                 parents[output as usize] = root(&parents, input as usize);
             }
         }
@@ -11920,6 +12050,7 @@ impl CoremlMlProgramConverter {
             .any(|(logical, physical)| logical != physical);
         let inputs_changed = inputs.iter().any(|(logical, physical)| logical != physical);
         let passthroughs = input_passthroughs(graph_info);
+        let constant_copies = constant_copies(graph_info);
         let metadata = Some(Metadata {
             user_defined: [
                 (OUTPUT_ALIASES_METADATA_KEY, &aliases, outputs_changed),
@@ -11941,6 +12072,14 @@ impl CoremlMlProgramConverter {
                     .map_err(|error| GraphError::ConversionFailed {
                         format: "coreml_mlprogram".into(),
                         reason: format!("cannot serialize proven input copies: {error}"),
+                    })
+            }))
+            .chain((!constant_copies.outputs.is_empty()).then(|| {
+                serde_json::to_string(&constant_copies)
+                    .map(|value| (OUTPUT_CONSTANT_COPIES_METADATA_KEY.into(), value))
+                    .map_err(|error| GraphError::ConversionFailed {
+                        format: "coreml_mlprogram".into(),
+                        reason: format!("cannot serialize proven constant copies: {error}"),
                     })
             }))
             .chain(std::iter::once(Ok((
