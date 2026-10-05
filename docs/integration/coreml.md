@@ -56,6 +56,11 @@ establishes placement, energy savings or prediction-time fallback; use separate 
    turn and reports each attempt; `--coreml-compiled-output <dir>` stores the compiled
    `.mlmodelc` for reuse.
 
+Host-side numeric conversions into float16 use direct round-to-nearest, ties-to-even
+from the source value, preserving subnormals and signed zero independently of hardware
+half-conversion support. Matching storage types are copied bit-for-bit, including NaN
+payloads. This boundary conversion does not change CoreML's internal arithmetic policy.
+
 ## Tensor names
 
 Input and output names remain independent in the RustNN API, including names containing
