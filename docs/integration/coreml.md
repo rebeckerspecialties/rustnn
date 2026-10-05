@@ -69,7 +69,7 @@ Proven equal copy outputs may share one physical result, avoiding CoreML's omiss
 duplicate scalar/dynamic features. RustNN supplies each requested logical output tensor;
 unequal computations and real dtype conversions remain separate. Returning an original
 input or constant directly remains invalid under WebNN's build rules.
-For produced identity/same-type-cast chains rooted in an input, the serialized
+For produced copy chains rooted in an input, the serialized
 `rustnn.webnn.output_passthroughs` map identifies the logical input and original descriptor.
 RustNN validates dtype, actual shape and byte length and snapshots that input before
 prediction, supplying independent output copies even if CoreML omits or changes a copy
@@ -80,6 +80,13 @@ grow/shrink predictions. `int8` and `uint8` identity and same-type cast kernels 
 `int32` temporaries; graph descriptors and stored bytes retain their original dtype.
 Signed constants used by these copies or casts to `int32`/`float32` retain their raw byte
 payload under a private unsigned interpretation, then recover the signed values in MIL.
+Copy proofs also cover same-shape reshape, identity transpose and static full-span
+unit-stride slice. Original constant copies use version-1
+`rustnn.webnn.output_constant_copies` metadata, with one original raw base64 payload per
+output-reachable source and independent output bindings. Consumers must validate the
+descriptor and encoded/decoded byte lengths. This adds approximately four encoded bytes
+per three source bytes, once per referenced constant, not once per output or for all weights.
+The native graph still runs; these proofs do not replace arithmetic-derived results.
 
 ## Converter-private input views
 
