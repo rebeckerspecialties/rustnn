@@ -1,4 +1,7 @@
 //! Byte dequantization keeps source Half scales but evaluates its formula wide.
+#[path = "common/half_reference.rs"]
+mod half_reference;
+
 use prost::Message;
 use rustnn::converters::{CoremlMlProgramConverter, GraphConverter};
 use rustnn::graph::{
@@ -293,8 +296,9 @@ fn byte_dequantize_preserves_all_codes_at_scale_seams_rounding_ties_and_overflow
                             } else {
                                 f64::from(zero)
                             };
-                            f16::from_f64((value - zero) * f64::from(f16::from_bits(scale_bits)))
-                                .to_bits()
+                            half_reference::reference_half_bits(
+                                (value - zero) * f64::from(f16::from_bits(scale_bits)),
+                            )
                         })
                         .collect();
                     for policy in [DeviceType::Cpu, DeviceType::Gpu, DeviceType::Npu] {
@@ -489,7 +493,7 @@ fn reused_byte_dequantize_graph_preserves_small_block_scales_and_signed_zero_poi
                                 f64::from(zero_bytes[parameter])
                             };
                             let scale = f64::from(f16::from_bits([1, 2][parameter]));
-                            f16::from_f64((value - zero) * scale).to_bits()
+                            half_reference::reference_half_bits((value - zero) * scale)
                         })
                         .collect();
                     let mut actual = vec![0u16; bytes.len()];

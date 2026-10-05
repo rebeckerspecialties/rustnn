@@ -19,10 +19,13 @@ use objc::runtime::{Class, Object};
 use objc::{class, msg_send, sel, sel_impl};
 
 use super::coreml_dtype::{ArrayLayout, NativeType, boundary_error, from_native, to_native};
+#[cfg(any(target_os = "macos", test))]
+use crate::converters::CoremlConstantCopies;
 use crate::converters::{CoremlPassthrough, coreml_names};
 #[cfg(target_os = "macos")]
 use crate::converters::{
-    INPUT_ALIASES_METADATA_KEY, OUTPUT_ALIASES_METADATA_KEY, OUTPUT_PASSTHROUGHS_METADATA_KEY,
+    INPUT_ALIASES_METADATA_KEY, OUTPUT_ALIASES_METADATA_KEY, OUTPUT_CONSTANT_COPIES_METADATA_KEY,
+    OUTPUT_PASSTHROUGHS_METADATA_KEY,
 };
 use crate::error::GraphError;
 use crate::graph::{DataType, Dimension, OperandDescriptor, get_static_or_max_size};
@@ -284,6 +287,12 @@ struct CoremlFeatureAliases {
     outputs: HashMap<String, String>,
     passthroughs: HashMap<String, CoremlPassthrough>,
     compact_input_views: Vec<input_views::Binding>,
+    constant_copies: HashMap<String, CoremlConstantCopy>,
+}
+
+struct CoremlConstantCopy {
+    descriptor: OperandDescriptor,
+    bytes: Arc<[u8]>,
 }
 
 enum CoremlModelBacking {
@@ -620,8 +629,12 @@ pub(crate) fn run_coreml_bytes(
 ) -> Result<HashMap<String, Vec<u8>>, GraphError> {
     // Snapshot proven copies before CoreML sees an input. Every logical output
     // owns its own bytes; this is not a mutable alias of input tensor storage.
-    let passthroughs =
+    let mut passthroughs =
         snapshot_byte_passthroughs(&model.aliases.passthroughs, inputs, output_descriptors)?;
+    passthroughs.extend(snapshot_byte_constant_copies(
+        &model.aliases.constant_copies,
+        output_descriptors,
+    )?);
     autoreleasepool(|| unsafe {
         let dict: *mut Object = msg_send![class!(NSMutableDictionary), dictionary];
 
@@ -774,6 +787,41 @@ fn snapshot_byte_passthroughs(
         result.insert(name.clone(), input.data.to_vec());
     }
     Ok(result)
+}
+
+fn snapshot_byte_constant_copies(
+    copies: &HashMap<String, CoremlConstantCopy>,
+    outputs: &HashMap<String, OperandDescriptor>,
+) -> Result<HashMap<String, Vec<u8>>, GraphError> {
+    let mut result = HashMap::new();
+    for (name, copy) in copies {
+        validate_constant_copy_output(name, copy, outputs.get(name))?;
+        result.insert(name.clone(), copy.bytes.to_vec());
+    }
+    Ok(result)
+}
+
+fn validate_constant_copy_output(
+    name: &str,
+    copy: &CoremlConstantCopy,
+    output: Option<&OperandDescriptor>,
+) -> Result<(), GraphError> {
+    let output = output.ok_or_else(|| {
+        boundary_error(format!(
+            "proven constant output `{name}` is not a requested graph output"
+        ))
+    })?;
+    if output.data_type != copy.descriptor.data_type
+        || output.shape != copy.descriptor.shape
+        || output.pending_permutation != copy.descriptor.pending_permutation
+        || output.static_shape().is_none()
+        || output.byte_length() != Some(copy.bytes.len())
+    {
+        return Err(boundary_error(format!(
+            "proven constant output `{name}` has inconsistent descriptors or bytes"
+        )));
+    }
+    Ok(())
 }
 
 /// Read the actual allocation type and validate layout metadata before touching
@@ -1396,12 +1444,119 @@ unsafe fn model_aliases(model: *mut Object) -> Result<CoremlFeatureAliases, Grap
     let outputs = unsafe { model_output_aliases(model)? };
     let passthroughs = unsafe { model_passthroughs(model, &inputs, &outputs)? };
     let compact_input_views = unsafe { input_views::from_model(model)? };
+    let constant_copies = unsafe { model_constant_copies(model, &outputs, &passthroughs)? };
     Ok(CoremlFeatureAliases {
         inputs,
         outputs,
         passthroughs,
         compact_input_views,
+        constant_copies,
     })
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_constant_copies(
+    json: &str,
+    outputs: &HashMap<String, String>,
+    declared_outputs: &[String],
+    input_copies: &HashMap<String, CoremlPassthrough>,
+) -> Result<HashMap<String, CoremlConstantCopy>, GraphError> {
+    use base64::Engine;
+    let metadata: CoremlConstantCopies = serde_json::from_str(json).map_err(|error| {
+        boundary_error(format!("invalid CoreML constant-copy metadata: {error}"))
+    })?;
+    if metadata.version != 1 {
+        return Err(boundary_error(
+            "unsupported CoreML constant-copy metadata version",
+        ));
+    }
+    for (name, source) in &metadata.outputs {
+        let physical = outputs.get(name).unwrap_or(name);
+        if name.is_empty()
+            || !declared_outputs.contains(physical)
+            || input_copies.contains_key(name)
+            || !metadata.sources.contains_key(source)
+        {
+            return Err(boundary_error(format!(
+                "invalid proven constant output `{name}`"
+            )));
+        }
+    }
+    let mut sources = HashMap::new();
+    for (id, source) in metadata.sources {
+        if !metadata.outputs.values().any(|&origin| origin == id)
+            || source.descriptor.static_shape().is_none()
+        {
+            return Err(boundary_error(
+                "unused or dynamically shaped constant-copy source",
+            ));
+        }
+        let expected = source
+            .descriptor
+            .byte_length()
+            .ok_or_else(|| boundary_error("constant-copy source byte length overflow"))?;
+        let encoded = expected
+            .div_ceil(3)
+            .checked_mul(4)
+            .ok_or_else(|| boundary_error("constant-copy source encoded length overflow"))?;
+        if source.data.len() != encoded {
+            return Err(boundary_error(
+                "constant-copy source encoded byte length mismatch",
+            ));
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&source.data)
+            .map_err(|error| {
+                boundary_error(format!("invalid constant-copy source bytes: {error}"))
+            })?;
+        if bytes.len() != expected {
+            return Err(boundary_error("constant-copy source byte length mismatch"));
+        }
+        sources.insert(id, (source.descriptor, Arc::<[u8]>::from(bytes)));
+    }
+    Ok(metadata
+        .outputs
+        .into_iter()
+        .map(|(name, id)| {
+            let (descriptor, bytes) = &sources[&id];
+            (
+                name,
+                CoremlConstantCopy {
+                    descriptor: descriptor.clone(),
+                    bytes: Arc::clone(bytes),
+                },
+            )
+        })
+        .collect())
+}
+
+unsafe fn model_constant_copies(
+    model: *mut Object,
+    outputs: &HashMap<String, String>,
+    input_copies: &HashMap<String, CoremlPassthrough>,
+) -> Result<HashMap<String, CoremlConstantCopy>, GraphError> {
+    #[cfg(target_os = "macos")]
+    {
+        let Some(json) =
+            (unsafe { model_metadata_value(model, OUTPUT_CONSTANT_COPIES_METADATA_KEY)? })
+        else {
+            return Ok(HashMap::new());
+        };
+        let description: *mut Object = msg_send![model, modelDescription];
+        let output_features: *mut Object = msg_send![description, outputDescriptionsByName];
+        let keys: *mut Object = msg_send![output_features, allKeys];
+        parse_constant_copies(
+            &json,
+            outputs,
+            &unsafe { nsarray_to_strings(keys) },
+            input_copies,
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (model, outputs, input_copies);
+        Ok(HashMap::new())
+    }
 }
 
 fn parse_passthroughs(
@@ -1622,6 +1777,36 @@ unsafe fn snapshot_provider_passthroughs(
     let aliases = unsafe { model_aliases(model)? };
     let mut result = HashMap::new();
     let mut shapes = RuntimeShapeState::new();
+    for (output, copy) in aliases.constant_copies {
+        if let Some(expected) = expected {
+            validate_constant_copy_output(&output, &copy, expected.get(&output))?;
+        }
+        let shape = copy
+            .descriptor
+            .static_shape()
+            .ok_or_else(|| boundary_error("constant copy requires a static shape"))?;
+        let count = copy
+            .descriptor
+            .element_count()
+            .ok_or_else(|| boundary_error("constant copy element count overflow"))?;
+        let kind = NativeType::from_code(i64::from(map_dtype(copy.descriptor.data_type)))?;
+        let native = to_native(&copy.bytes, copy.descriptor.data_type, kind, count)?;
+        let floats = from_native(&native, kind, DataType::Float32, count)?;
+        result.insert(
+            output.clone(),
+            CoremlOutput {
+                name: output,
+                shape: shape.into_iter().map(i64::from).collect(),
+                data_type_code: i64::from(kind.code()),
+                data: floats
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|&bytes| f32::from_ne_bytes(bytes))
+                    .collect(),
+            },
+        );
+    }
     for (output, proof) in aliases.passthroughs {
         if let Some(expected) = expected {
             let descriptor = expected.get(&output).ok_or_else(|| {
@@ -2191,6 +2376,129 @@ mod dtype_storage_tests {
 mod checked_attempt_tests {
     use super::*;
     use crate::graph::DynamicDimension;
+
+    #[test]
+    fn constant_copy_metadata_is_bounded_typed_and_owns_independent_output_bytes() {
+        use base64::Engine;
+        for (dtype, bytes) in [
+            (
+                DataType::Int32,
+                [16_777_217i32, -16_777_217, i32::MIN, i32::MAX]
+                    .into_iter()
+                    .flat_map(i32::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                DataType::Float32,
+                [1u32, 0x80000000, 0x3f800001, 0x7fc12345]
+                    .into_iter()
+                    .flat_map(u32::to_le_bytes)
+                    .collect(),
+            ),
+            (
+                DataType::Float16,
+                [1u16, 0x8000, 0x3c01, 0x7e15]
+                    .into_iter()
+                    .flat_map(u16::to_le_bytes)
+                    .collect(),
+            ),
+        ] {
+            let descriptor = OperandDescriptor {
+                data_type: dtype,
+                shape: vec![Dimension::Static(4)],
+                pending_permutation: vec![],
+            };
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            let json = serde_json::json!({
+                "version": 1,
+                "sources": {"0": {"descriptor": descriptor, "data": encoded}},
+                "outputs": {"first": 0, "second": 0}
+            });
+            let aliases = HashMap::from([
+                ("first".into(), "physical".into()),
+                ("second".into(), "physical".into()),
+            ]);
+            let parse = |value: &serde_json::Value| {
+                parse_constant_copies(
+                    &value.to_string(),
+                    &aliases,
+                    &["physical".into()],
+                    &HashMap::new(),
+                )
+            };
+            let copies = parse(&json).unwrap();
+            let source = json["sources"]["0"].to_string();
+            for duplicated in [
+                format!(
+                    r#"{{"version":1,"sources":{{"0":{source},"0":{source}}},"outputs":{{"first":0}}}}"#
+                ),
+                format!(
+                    r#"{{"version":1,"sources":{{"0":{source}}},"outputs":{{"first":0,"first":0}}}}"#
+                ),
+            ] {
+                assert!(
+                    parse_constant_copies(
+                        &duplicated,
+                        &aliases,
+                        &["physical".into()],
+                        &HashMap::new()
+                    )
+                    .is_err()
+                );
+            }
+            assert!(Arc::ptr_eq(&copies["first"].bytes, &copies["second"].bytes));
+            let outputs = HashMap::from([
+                ("first".into(), descriptor.clone()),
+                ("second".into(), descriptor.clone()),
+            ]);
+            let mut snapshots = snapshot_byte_constant_copies(&copies, &outputs).unwrap();
+            assert_eq!(snapshots["first"], bytes);
+            snapshots.get_mut("first").unwrap()[0] ^= 0xff;
+            assert_eq!(snapshots["second"], bytes);
+            assert_eq!(copies["first"].bytes.as_ref(), bytes);
+            assert!(snapshot_byte_constant_copies(&copies, &HashMap::new()).is_err());
+            let mut wrong_outputs = outputs.clone();
+            wrong_outputs.get_mut("first").unwrap().pending_permutation = vec![0];
+            assert!(snapshot_byte_constant_copies(&copies, &wrong_outputs).is_err());
+            wrong_outputs.get_mut("first").unwrap().data_type = DataType::Uint8;
+            assert!(snapshot_byte_constant_copies(&copies, &wrong_outputs).is_err());
+
+            for changed in ["version", "source", "data", "shape", "unknown"] {
+                let mut invalid = json.clone();
+                match changed {
+                    "version" => invalid["version"] = 2.into(),
+                    "source" => invalid["outputs"]["first"] = 1.into(),
+                    "data" => invalid["sources"]["0"]["data"] = "AAAA".into(),
+                    "shape" => {
+                        invalid["sources"]["0"]["descriptor"]["shape"] =
+                            serde_json::json!([4294967295u32, 4294967295u32, 4294967295u32])
+                    }
+                    "unknown" => invalid["extra"] = true.into(),
+                    _ => unreachable!(),
+                }
+                assert!(parse(&invalid).is_err(), "{changed}");
+            }
+            let input_copy = HashMap::from([(
+                "first".into(),
+                CoremlPassthrough {
+                    input: "input".into(),
+                    descriptor,
+                },
+            )]);
+            assert!(
+                parse_constant_copies(
+                    &json.to_string(),
+                    &aliases,
+                    &["physical".into()],
+                    &input_copy
+                )
+                .is_err()
+            );
+            assert!(
+                parse_constant_copies(&json.to_string(), &aliases, &[], &HashMap::new()).is_err()
+            );
+        }
+    }
 
     #[test]
     fn proven_input_copy_metadata_rejects_missing_and_undeclared_bindings() {
