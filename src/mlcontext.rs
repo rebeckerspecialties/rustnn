@@ -769,9 +769,10 @@ impl<'context> MLContext<'context> {
             .write_tensor(tensor, bytemuck::cast_slice(array))
     }
 
-    /// Change the active shape of a tensor without reallocating (rustnn extension for
-    /// graphs built with the `dynamic-inputs` feature). The new shape must fit the capacity
-    /// reserved with [`Self::rustnn_set_tensor_capacity`].
+    /// Change the active shape of a tensor (rustnn extension for graphs built with
+    /// the `dynamic-inputs` feature). Resizing within the capacity reserved with
+    /// [`Self::rustnn_set_tensor_capacity`] avoids reallocation; supported backends
+    /// may grow storage when the new shape exceeds that capacity.
     pub fn rustnn_resize_tensor(&mut self, tensor: &mut MLTensor, new_shape: &[u64]) -> Result<()> {
         self.backend.rustnn_resize_tensor(tensor, new_shape)
     }

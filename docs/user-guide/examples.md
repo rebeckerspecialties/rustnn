@@ -171,8 +171,12 @@ Run `make benchmark-coreml-kv` on macOS without downloading a model or applying
 other patches. The default workload builds fixed-window FP32 attention using
 slice/concat, two matmuls and softmax. Each mode checks all 256 steps against an
 independent f64 attention oracle and exact cache contents, then measures a second
-pass without oracle computation or cache inspection. Its JSON includes per-mode
-timings and host/native copy counters. This is a storage benchmark, not language-model
+pass without oracle computation or cache inspection. Every mode binds the previous
+KV outputs directly as the next inputs; the baseline reports its backend copies
+without adding an application-level read/write round trip. Regressions check that
+the measured pass reads only the attention output and writes only the new tokens.
+Its JSON includes per-mode timings and host/native copy counters. This is a storage
+benchmark, not language-model
 token throughput, model-quality qualification or an accelerator-placement measurement.
 `make test-coreml-kv-benchmark` runs the numerical gates as regressions in macOS CI.
 

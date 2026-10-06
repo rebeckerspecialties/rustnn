@@ -111,14 +111,6 @@ fn run_mode(mode: &str) -> Result<Value> {
         tensor(&mut context, &cache_shape)?,
         tensor(&mut context, &cache_shape)?,
     ];
-    let host_caches = if mode == "baseline" {
-        Some([
-            tensor(&mut context, &cache_shape)?,
-            tensor(&mut context, &cache_shape)?,
-        ])
-    } else {
-        None
-    };
     let new_key = tensor(&mut context, &token_shape)?;
     let new_value = tensor(&mut context, &token_shape)?;
     let q = tensor(&mut context, &token_shape)?;
@@ -156,18 +148,12 @@ fn run_mode(mode: &str) -> Result<Value> {
             let start = Instant::now();
             context.write_tensor(&new_key, &key_token)?;
             context.write_tensor(&new_value, &value_token)?;
-            let (past_key, past_value) = if let Some([host_key, host_value]) = &host_caches {
-                context.read_tensor(&keys[previous], &mut scratch)?;
-                context.write_tensor(host_key, &scratch)?;
-                context.read_tensor(&values[previous], &mut scratch)?;
-                context.write_tensor(host_value, &scratch)?;
-                (host_key, host_value)
-            } else {
-                (&keys[previous], &values[previous])
-            };
+            // Bind the previous outputs directly in every storage mode. The
+            // baseline's backend copies are reported separately, not inflated
+            // by an additional application-level cache read/write round trip.
             let inputs = MLNamedTensors::from([
-                ("past_key", past_key),
-                ("past_value", past_value),
+                ("past_key", &keys[previous]),
+                ("past_value", &values[previous]),
                 ("new_key", &new_key),
                 ("new_value", &new_value),
                 ("query", &q),
@@ -211,19 +197,31 @@ fn run_mode(mode: &str) -> Result<Value> {
         if !verify {
             let attention_bytes = (STEPS * HEADS * WIDTH * 4) as u64;
             let token_bytes = 2 * attention_bytes;
-            let round_trip_bytes = if mode == "baseline" {
-                (STEPS * 2 * CACHE_ELEMENTS * 4) as u64
+            ensure!(
+                io.host_read_bytes == attention_bytes,
+                "cache chaining must not read KV tensors to the host"
+            );
+            ensure!(
+                io.host_write_bytes == token_bytes,
+                "cache chaining must not rewrite KV tensors from the host"
+            );
+            if mode == "baseline" {
+                let cache_bytes = (STEPS * 2 * CACHE_ELEMENTS * 4) as u64;
+                ensure!(
+                    io.input_copy_bytes == cache_bytes + 3 * attention_bytes,
+                    "baseline must report backend input copies"
+                );
+                ensure!(
+                    io.native_input_bindings == 0,
+                    "baseline bound native inputs"
+                );
             } else {
-                0
-            };
-            ensure!(
-                io.host_read_bytes == attention_bytes + round_trip_bytes,
-                "unexpected host reads"
-            );
-            ensure!(
-                io.host_write_bytes == token_bytes + round_trip_bytes,
-                "unexpected host writes"
-            );
+                ensure!(io.input_copy_bytes == 0, "retained inputs were copied");
+                ensure!(
+                    io.native_input_bindings == (STEPS * 5) as u64,
+                    "retained tensors must bind directly on every dispatch"
+                );
+            }
         }
         runs.push(json!({"phase":if verify {"verification"} else {"measured"},
             "steps":STEPS,"seconds":seconds,"steps_per_second":STEPS as f64/seconds,
@@ -241,7 +239,7 @@ pub(super) fn run() -> Result<Value> {
     Ok(
         json!({"workload":"synthetic fixed-window FP32 attention, not a language model",
         "policy":"cpuOnly","cache_shape":[1,HEADS,WINDOW,WIDTH],
-        "timing":"input updates, cache round trips if baseline, dispatch and attended output read; excludes oracle/cache validation and model compilation",
+        "timing":"token input updates, dispatch and attended output read; previous KV outputs bind directly in every mode; excludes oracle/cache validation and model compilation",
         "reference":"independent f64 attention and exact sliding-cache checks at every step",
         "results":results}),
     )
@@ -256,6 +254,15 @@ mod tests {
     fn all_storage_modes_preserve_attention_and_cache_contents() {
         let report = run().unwrap();
         assert_eq!(report["results"].as_array().unwrap().len(), 3);
+        for result in report["results"].as_array().unwrap() {
+            let measured = &result["runs"][1];
+            assert_eq!(measured["phase"], "measured");
+            assert_eq!(measured["io"]["host_read_bytes"], STEPS * HEADS * WIDTH * 4);
+            assert_eq!(
+                measured["io"]["host_write_bytes"],
+                STEPS * HEADS * WIDTH * 4 * 2
+            );
+        }
     }
 
     #[test]
