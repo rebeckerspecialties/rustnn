@@ -142,6 +142,64 @@ fn strict_atol_keeps_source_precision_and_does_not_preround_expected_half() {
 
 #[test]
 fn strict_nonfinite_gate_cannot_be_overridden_by_large_budget() {
+    // This is a RustNN model-validation requirement pending agreement on WPT's
+    // nonfinite classification rules, not an additional upstream ULP budget.
+    // WPT's raw metric puts maximum finite and same-sign infinity one ULP apart;
+    // accepting that transition can poison all subsequent recurrent state.
+    // Keep this local until classification is agreed, then contribute the reduced
+    // comparator case rather than imposing a model's final-output tolerance.
+    for float16 in [false, true] {
+        let maximum = if float16 {
+            half::f16::MAX.to_f32()
+        } else {
+            f32::MAX
+        };
+        let adjacent = if float16 {
+            half::f16::from_bits(half::f16::MAX.to_bits() - 1).to_f32()
+        } else {
+            f32::from_bits(f32::MAX.to_bits() - 1)
+        };
+        for sign in [-1.0, 1.0] {
+            for (actual, expected) in [
+                (sign * maximum, f64::from(sign * f32::INFINITY)),
+                (sign * f32::INFINITY, f64::from(sign * maximum)),
+            ] {
+                assert_eq!(
+                    tolerance::upstream_ulp_distance(actual, expected, float16),
+                    1
+                );
+                for budget in [1, u64::MAX] {
+                    let (passed, diagnostic) = tolerance::validate_upstream_result(
+                        &[actual],
+                        &[expected],
+                        ToleranceKind::Ulp,
+                        budget,
+                        float16,
+                    );
+                    assert!(!passed, "{actual} versus {expected}, float16={float16}");
+                    assert!(diagnostic.unwrap().contains("nonfinite classification"));
+                }
+                let metrics = tolerance::upstream_float_error_metrics(
+                    &[actual],
+                    &[expected],
+                    float16,
+                    ToleranceKind::Ulp,
+                );
+                assert_eq!(metrics.nonfinite_mismatches, 1);
+            }
+            // Adjacent finite values remain eligible for the source ULP budget.
+            assert!(
+                tolerance::validate_upstream_result(
+                    &[sign * adjacent],
+                    &[f64::from(sign * maximum)],
+                    ToleranceKind::Ulp,
+                    1,
+                    float16,
+                )
+                .0
+            );
+        }
+    }
     for kind in [ToleranceKind::Ulp, ToleranceKind::Atol] {
         let budget = if kind == ToleranceKind::Ulp {
             u64::MAX
