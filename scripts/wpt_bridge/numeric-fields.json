@@ -1,0 +1,4 @@
+{
+  "tensorData": ["data"],
+  "floatOptions": ["alpha", "beta", "epsilon", "value", "minValue", "maxValue"]
+}
