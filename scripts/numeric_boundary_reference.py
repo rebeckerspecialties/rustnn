@@ -8,6 +8,7 @@ compares two working precisions and the checked-in, once-rounded bit patterns.
 import argparse
 import decimal
 import json
+import math
 from fractions import Fraction
 from pathlib import Path
 
@@ -93,6 +94,45 @@ def reference(op, value):
     return value * (1 + erf) / 2
 
 
+def softmax_reference(bits, shape, axis):
+    """Stable, axis-aware finite reference, rounded once to binary32."""
+    assert shape and all(size > 0 for size in shape)
+    assert 0 <= axis < len(shape) and math.prod(shape) == len(bits)
+    values = [decode(value, 32) for value in bits]
+    assert all(value.is_finite() for value in values)
+    inner = math.prod(shape[axis + 1:])
+    width = shape[axis]
+    output = [None] * len(bits)
+    for outer in range(math.prod(shape[:axis])):
+        for offset in range(inner):
+            indexes = [(outer * width + i) * inner + offset for i in range(width)]
+            maximum = max(values[i] for i in indexes)
+            exponentials = [(values[i] - maximum).exp() for i in indexes]
+            denominator = sum(exponentials)
+            for index, exponential in zip(indexes, exponentials):
+                output[index] = encode(exponential / denominator, 32)
+    return output
+
+
+def softmax_cases():
+    number = lambda x: encode(decimal.Decimal(x), 32)
+    cases = [
+        ([4, 2], 1, [number(x) for n in [3, 7, 15, 31]
+                      for x in [decimal.Decimal(n) * decimal.Decimal(2) ** -23, 0]]),
+        ([3, 2], 0, [number(x) for x in [0, 0, 1, -1, 2, -2]]),
+        ([2, 3, 2], 1, [number(x) for x in [0, 2, 1, 0, -1, -2, 3, -3, 2, -2, 1, -1]]),
+        ([2, 1, 3], 1, [number(x) for x in [-90, -1, 0, 1, 2, 90]]),
+        ([3, 2], 1, [number(x) for x in [0, -90, 0, -103, 0, -104]]),
+        ([2, 4], 1, [number(x) for x in [0, 1, -10000, -10000] + [-10000] * 4]),
+        ([2, 3], 1, [0, 1, 0x80000001] + [number(1)] * 3),
+    ]
+    return [{"op": "softmax", "width": 32, "shape": shape, "axis": axis,
+             # This is the pinned/current WPT helper, not a model-error contract.
+             "ulp_budget": 3 * shape[axis] + 3, "input_bits": bits,
+             "expected_bits": softmax_reference(bits, shape, axis)}
+            for shape, axis, bits in cases]
+
+
 def generate(precision):
     with decimal.localcontext() as ctx:
         ctx.prec = precision
@@ -112,7 +152,7 @@ def generate(precision):
                 rows.append({"op": op, "width": width, "ulp_budget": budget,
                              "input_bits": inputs,
                              "expected_bits": [encode(reference(op, decode(x, width)), width) for x in inputs]})
-        return rows
+        return rows + softmax_cases()
 
 
 def main():

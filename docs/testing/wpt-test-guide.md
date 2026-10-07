@@ -9,13 +9,24 @@ oracle. `make diagnose-coreml-boundaries` runs the reduced corpus through
 `NUMERIC_BOUNDARY_REPORT` to preserve multiple runs).
 
 The inventory covers deep Half/Float32 Exp tails, Sqrt zero/subnormal/extreme and
-domain boundaries, and Float32 GELU tails. Unary checks use the upstream standalone
-budgets (Exp 1/32 ULP, Sqrt 1 ULP, GELU 18 ULP) with independently rounded values.
+domain boundaries, Float32 GELU tails, and finite Float32 Softmax. Unary checks
+use the upstream standalone budgets (Exp 1/32 ULP, Sqrt 1 ULP, GELU 18 ULP) with
+independently rounded values.
 No-flush and zero-sign fields are separate fidelity properties, not silently
 tighter WPT requirements. Mul/Div controls scale the actual isolated Exp output
 by an exact power of two, then compare direct and composed graphs separately.
 A failed composed comparison can indicate changed producer arithmetic as well as
 a consumer defect; the direct control isolates consumption of known stored bits.
+
+Softmax cases cover first/middle/last/singleton axes, finite masks, tiny inputs,
+subnormal probabilities and near-midpoint rounding. Their independent stable
+Decimal reference is checked at 100 and 140 digits. Standalone comparisons use
+WPT's `3 * axis extent + 3` ULP allowance. Reference-bit mismatches, maximum
+absolute error and binary64 row sums are recorded separately as observations,
+not additional pass criteria. Even the correctly rounded probabilities need
+not sum to exactly one after rounding. These cases were motivated by SmolLM2
+attention amplifying locally permitted variation; they contain no checkpoint
+or model-specific lowering and do not reproduce a complete model's logit gate.
 
 This is a diagnostic report, not a passing-test total: every raw input, expected
 and actual output bit pattern and failed comparison is retained. Execution errors
