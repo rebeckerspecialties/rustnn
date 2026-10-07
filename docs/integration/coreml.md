@@ -11,7 +11,7 @@ dispatch. The Objective-C bridge lives in `src/executors/coreml.rs` and `src/exe
   validation has also been done on iOS 18 and watchOS 11 builds of rustnn).
 - The `coreml-runtime` Cargo feature. On Linux and Windows the feature compiles to shims whose
   calls always fail, so `cargo check --features coreml-runtime` works everywhere but the backend
-  is never selected off macOS.
+  is never selected on non-Apple targets.
 - Xcode command line tools for the Objective-C++ shim (`build.rs` compiles it with `cc`).
 
 ## Selection and devices
@@ -50,8 +50,11 @@ establishes placement, energy savings or prediction-time fallback; use separate 
    Real precision boundaries are materialized as native Pipeline children where needed.
    The children expose live values only and reuse the original weight storage; the public
    WebNN graph, types and shapes are unchanged.
-3. `MLGraphBuilder::build` compiles the model with `MLModel` and keeps the compiled model;
-   `dispatch` binds `MLMultiArray`s over the tensor storage and runs a prediction.
+3. `MLGraphBuilder::build` prepares the model for repeated dispatch. A standalone native
+   model retains its `MLModel`. A precision Pipeline validates child features and their
+   dependencies, compiles children lazily, and retains at most one loaded child model.
+   Returned typed arrays remain live until their last consumer; compiled URLs are reused
+   on later predictions and removed when the graph is dropped.
 4. The legacy CLI path (`--convert coreml --run-coreml`) tries the compute-unit configurations in
    turn and reports each attempt; `--coreml-compiled-output <dir>` stores the compiled
    `.mlmodelc` for reuse.
@@ -60,6 +63,29 @@ Host-side numeric conversions into float16 use direct round-to-nearest, ties-to-
 from the source value, preserving subnormals and signed zero independently of hardware
 half-conversion support. Matching storage types are copied bit-for-bit, including NaN
 payloads. This boundary conversion does not change CoreML's internal arithmetic policy.
+
+## Bounded precision pipelines
+
+The executor reads original Pipeline child protobuf bytes without reconstructing unknown
+fields. It checks unique feature names, dependency order, native types, declared bounds
+and actual shapes. Output aliases and original input/constant copy proofs remain intact.
+An immutable, graph-owned weight mapping is shared between children; each derived native
+child contains only its referenced weight entries. Unsupported future weight layouts
+retain the original source route with diagnostics; malformed references are rejected.
+
+A complete, source-proven Float32-to-Half or Half-to-Float32 Cast child uses integer-bit
+conversion rather than a native cast that may flush subnormals or erase a rounding
+boundary. The proof checks the entire known-wire program and its feature descriptors,
+not a node name or observed value. Other children still execute through CoreML under the
+requested compute-unit permissions. A host-only graph reports the `TypedHost` route and
+`NOT_APPLICABLE` loaded compute units, not an accelerator policy or fallback.
+
+Run `make test-coreml-pipeline` for source-validation, weight-repacking, exhaustive Half
+encoding/midpoint and retained grow/shrink dispatch regressions. Bounded loading is a
+correctness/resource-lifetime mechanism; persistent tensor reuse is a separate path.
+Apple's source-model compilation and specification-data asset APIs are unavailable on
+watchOS. This executor rejects those routes explicitly rather than invoking unavailable
+selectors; offline compiled-child loading still requires separate integration.
 
 ## Tensor names
 

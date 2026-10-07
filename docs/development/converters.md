@@ -149,6 +149,9 @@ Rules that hold for every converter:
   carry live results only; constants are rematerialized from the shared weight blob rather
   than carried through every stage. Public descriptors and the backend-independent graph
   remain unchanged. Private scalar and Boolean interfaces use explicit rank/type adapters.
+  The bounded executor retains original child bytes and typed outputs until their last
+  consumer, with one loaded native child and shared source weights. Complete known-wire
+  float Cast children use exact host narrowing/widening; arithmetic children remain native.
 - Affected Half widening layouts use compact private features. Original high-rank inputs
   declare `rustnn.webnn.compact_input_views`; contiguous storage is viewed with its owner
   retained, while padded storage is copied as raw Half bytes. Dynamic restoration uses

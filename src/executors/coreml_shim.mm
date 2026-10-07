@@ -18,6 +18,7 @@
 
 #import <CoreML/CoreML.h>
 #import <Foundation/Foundation.h>
+#import <TargetConditionals.h>
 #include <stddef.h>
 #include <stdio.h>
 
@@ -44,6 +45,14 @@ static void rustnn_copy_err(char *buf, size_t len, NSString *msg) {
 // hand the caller an already-deallocated object in optimized builds.
 int rustnn_coreml_compile(void *model_url, void **out_url, char *err, size_t err_len) {
     *out_url = NULL;
+#if TARGET_OS_WATCH
+    // watchOS provides the compiled-model loader, but not Apple's URL or
+    // specification-data compiler. An offline exporter must supply this route.
+    (void)model_url;
+    rustnn_copy_err(err, err_len,
+                    @"Apple's source-model compilation route is unavailable on watchOS; use an offline-generated compiled model");
+    return 1;
+#else
     @try {
         NSError *nserr = nil;
         NSURL *compiled = [MLModel compileModelAtURL:(__bridge NSURL *)model_url error:&nserr];
@@ -62,6 +71,7 @@ int rustnn_coreml_compile(void *model_url, void **out_url, char *err, size_t err
         rustnn_copy_err(err, err_len, @"caught non-Objective-C exception during CoreML compile");
         return 3;
     }
+#endif
 }
 
 // Load an MLModel from a compiled URL with the given configuration. On success

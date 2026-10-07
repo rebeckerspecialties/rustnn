@@ -209,6 +209,15 @@ test-coreml-gelu:
 test-coreml-precision:
 	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_precision_pipeline -- $(TEST_FILTER) --test-threads=1
 
+.PHONY: test-coreml-pipeline
+test-coreml-pipeline:
+	$(CARGO) test --lib --no-default-features --features $(COREML_FEATURES) -- coreml::float_cast --test-threads=1
+	$(CARGO) test --lib --no-default-features --features $(COREML_FEATURES) -- coreml::pipeline --test-threads=1
+
+.PHONY: lint-coreml
+lint-coreml:
+	$(CARGO) clippy --all-targets --no-default-features --features $(COREML_FEATURES) -- -D warnings
+
 .PHONY: test-coreml-quantized-dynamic-shapes
 test-coreml-quantized-dynamic-shapes:
 	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_quantized_dynamic_shapes -- $(TEST_FILTER) --test-threads=1

@@ -19,10 +19,8 @@ use objc::runtime::{Class, Object};
 use objc::{class, msg_send, sel, sel_impl};
 
 use super::coreml_dtype::{ArrayLayout, NativeType, boundary_error, from_native, to_native};
-#[cfg(any(target_os = "macos", test))]
 use crate::converters::CoremlConstantCopies;
 use crate::converters::{CoremlPassthrough, coreml_names};
-#[cfg(target_os = "macos")]
 use crate::converters::{
     INPUT_ALIASES_METADATA_KEY, OUTPUT_ALIASES_METADATA_KEY, OUTPUT_CONSTANT_COPIES_METADATA_KEY,
     OUTPUT_PASSTHROUGHS_METADATA_KEY,
@@ -37,6 +35,10 @@ pub(crate) mod input_views;
 mod load;
 use load::LoadTrace;
 pub use load::{CoremlLoadDiagnostics, CoremlLoadFailure, CoremlLoadRoute};
+#[path = "coreml_float_cast.rs"]
+mod float_cast;
+#[path = "coreml_pipeline.rs"]
+mod pipeline;
 
 // Link against the system frameworks we use.
 #[cfg(target_vendor = "apple")]
@@ -50,7 +52,7 @@ unsafe extern "C" {
 
 // Objective-C++ exception firewall (src/executors/coreml_shim.mm).
 // Return codes: 0 = success, 1 = NSError, 2 = NSException, 3 = C++ exception.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 unsafe extern "C" {
     fn rustnn_coreml_compile(
         model_url: *mut Object,
@@ -76,7 +78,7 @@ unsafe extern "C" {
 
 // Shims to check compilation on Linux
 /// Always-failing stand-in for the CoreML shim; only exists off macOS so the feature compiles.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(target_vendor = "apple"))]
 pub unsafe extern "C" fn rustnn_coreml_compile(
     _model_url: *mut Object,
     _out_url: *mut *mut Object,
@@ -86,7 +88,7 @@ pub unsafe extern "C" fn rustnn_coreml_compile(
     1
 }
 /// Always-failing stand-in for the CoreML shim; only exists off macOS so the feature compiles.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(target_vendor = "apple"))]
 pub unsafe extern "C" fn rustnn_coreml_load(
     _compiled_url: *mut Object,
     _configuration: *mut Object,
@@ -97,7 +99,7 @@ pub unsafe extern "C" fn rustnn_coreml_load(
     1
 }
 /// Always-failing stand-in for the CoreML shim; only exists off macOS so the feature compiles.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(target_vendor = "apple"))]
 pub unsafe extern "C" fn rustnn_coreml_predict(
     _model: *mut Object,
     _features: *mut Object,
@@ -272,7 +274,12 @@ pub fn run_coreml_with_inputs_checked(
 /// Owns a retained `MLModel` and the in-memory CoreML asset backing it. All are
 /// released when the value is dropped. This type is intentionally not `Send`/`Sync`:
 /// `MLGraph`/`MLContext` are single-threaded, matching CoreML's usage model.
-pub(crate) struct CompiledCoremlModel {
+pub(crate) enum CompiledCoremlModel {
+    Native(NativeCoremlModel),
+    Pipeline(Box<pipeline::PipelineModel>),
+}
+
+pub(crate) struct NativeCoremlModel {
     /// Retained `MLModel` Objective-C object.
     model: *mut Object,
     /// Compute unit the model was successfully loaded with (diagnostic only).
@@ -313,7 +320,7 @@ enum CoremlModelBacking {
     },
 }
 
-impl std::fmt::Debug for CompiledCoremlModel {
+impl std::fmt::Debug for NativeCoremlModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CompiledCoremlModel")
             .field("compute_unit", &self.compute_unit)
@@ -322,7 +329,7 @@ impl std::fmt::Debug for CompiledCoremlModel {
     }
 }
 
-impl Drop for CompiledCoremlModel {
+impl Drop for NativeCoremlModel {
     fn drop(&mut self) {
         if !self.model.is_null() {
             unsafe {
@@ -357,8 +364,20 @@ pub(crate) struct CoremlByteInput<'a> {
 }
 
 impl CompiledCoremlModel {
-    pub(crate) fn load_diagnostics(&self) -> &CoremlLoadDiagnostics {
-        &self.diagnostics
+    pub(crate) fn load_diagnostics(&self) -> CoremlLoadDiagnostics {
+        match self {
+            Self::Native(model) => model.diagnostics.clone(),
+            Self::Pipeline(model) => model.diagnostics(),
+        }
+    }
+}
+
+impl std::fmt::Debug for CompiledCoremlModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Native(model) => model.fmt(f),
+            Self::Pipeline(model) => model.fmt(f),
+        }
     }
 }
 
@@ -370,29 +389,38 @@ pub(crate) fn compile_model(
     device_type: crate::backend_selection::DeviceType,
     use_in_memory_asset: bool,
 ) -> Result<CompiledCoremlModel, GraphError> {
+    if let Some(plan) = pipeline::SourcePlan::parse(&model_bytes)? {
+        return pipeline::PipelineModel::compile(plan, weights_data.as_deref(), device_type)
+            .map(|model| CompiledCoremlModel::Pipeline(Box::new(model)));
+    }
     // Owned so the in-memory path can hand the buffers to NSData without
     // copying (weight blobs reach hundreds of MB); the Arcs keep them valid
     // for the URL fallback below even after the NSData objects are released.
     let model_bytes = Arc::new(model_bytes);
     let weights_data = weights_data.map(Arc::new);
     let mut trace = LoadTrace::new(device_type);
-    trace.routes(use_in_memory_asset, |trace, route| match route {
-        CoremlLoadRoute::InMemoryAsset => {
-            compile_model_from_asset(&model_bytes, weights_data.as_ref(), trace)
-        }
-        CoremlLoadRoute::CompiledUrl => compile_model_from_url(
-            &model_bytes,
-            weights_data.as_deref().map(Vec::as_slice),
-            trace,
-        ),
-    })
+    trace
+        .routes(use_in_memory_asset, |trace, route| match route {
+            CoremlLoadRoute::InMemoryAsset => {
+                compile_model_from_asset(&model_bytes, weights_data.as_ref(), trace)
+            }
+            CoremlLoadRoute::CompiledUrl => compile_model_from_url(
+                &model_bytes,
+                weights_data.as_deref().map(Vec::as_slice),
+                trace,
+            ),
+            CoremlLoadRoute::TypedHost => Err(boundary_error(
+                "typed host preparation requires a proven source plan",
+            )),
+        })
+        .map(CompiledCoremlModel::Native)
 }
 
 fn compile_model_from_asset(
     model_bytes: &Arc<Vec<u8>>,
     weights_data: Option<&Arc<Vec<u8>>>,
     trace: &mut LoadTrace,
-) -> Result<CompiledCoremlModel, GraphError> {
+) -> Result<NativeCoremlModel, GraphError> {
     let route = CoremlLoadRoute::InMemoryAsset;
     autoreleasepool(|| unsafe {
         let (asset, specification_data, retained_weights_data) = trace.prepare(route, || {
@@ -417,7 +445,7 @@ fn compile_model_from_asset(
                     return Err(error);
                 }
             };
-            return Ok(CompiledCoremlModel {
+            return Ok(NativeCoremlModel {
                 model,
                 compute_unit: name,
                 diagnostics: trace.finish(route, name),
@@ -443,7 +471,7 @@ fn compile_model_from_url(
     model_bytes: &[u8],
     weights_data: Option<&[u8]>,
     trace: &mut LoadTrace,
-) -> Result<CompiledCoremlModel, GraphError> {
+) -> Result<NativeCoremlModel, GraphError> {
     let route = CoremlLoadRoute::CompiledUrl;
     autoreleasepool(|| unsafe {
         let (compiled_url, compiled_dir, temp_model) = trace.prepare(route, || {
@@ -483,7 +511,7 @@ fn compile_model_from_url(
                     return Err(error);
                 }
             };
-            return Ok(CompiledCoremlModel {
+            return Ok(NativeCoremlModel {
                 model,
                 compute_unit: name,
                 diagnostics: trace.finish(route, name),
@@ -538,6 +566,11 @@ unsafe fn create_in_memory_model_asset(
     model_bytes: &Arc<Vec<u8>>,
     weights: Option<&Arc<Vec<u8>>>,
 ) -> Result<(*mut Object, *mut Object, Option<*mut Object>), GraphError> {
+    if cfg!(target_os = "watchos") {
+        return Err(boundary_error(
+            "CoreML specification-data assets are unavailable on watchOS; use an offline-generated compiled model",
+        ));
+    }
     let Some(asset_class) = Class::get("MLModelAsset") else {
         return Err(GraphError::CoremlRuntimeFailed {
             reason: "in-memory CoreML model loading requires macOS 15 or newer".to_string(),
@@ -624,6 +657,17 @@ unsafe fn load_model_asset(
 /// Run a compiled CoreML model with raw-byte inputs, returning raw-byte outputs by name.
 pub(crate) fn run_coreml_bytes(
     model: &CompiledCoremlModel,
+    inputs: &HashMap<String, CoremlByteInput<'_>>,
+    output_descriptors: &HashMap<String, OperandDescriptor>,
+) -> Result<HashMap<String, Vec<u8>>, GraphError> {
+    autoreleasepool(|| match model {
+        CompiledCoremlModel::Native(model) => run_native_bytes(model, inputs, output_descriptors),
+        CompiledCoremlModel::Pipeline(model) => model.predict(inputs, output_descriptors),
+    })
+}
+
+fn run_native_bytes(
+    model: &NativeCoremlModel,
     inputs: &HashMap<String, CoremlByteInput<'_>>,
     output_descriptors: &HashMap<String, OperandDescriptor>,
 ) -> Result<HashMap<String, Vec<u8>>, GraphError> {
@@ -1394,7 +1438,6 @@ unsafe fn nsarray_to_strings(array: *mut Object) -> Vec<String> {
         .collect()
 }
 
-#[cfg(any(target_os = "macos", test))]
 fn parse_output_aliases(
     json: &str,
     declared_outputs: &[String],
@@ -1402,7 +1445,6 @@ fn parse_output_aliases(
     parse_feature_aliases(json, declared_outputs, "output", true)
 }
 
-#[cfg(any(target_os = "macos", test))]
 fn parse_feature_aliases(
     json: &str,
     declared: &[String],
@@ -1454,7 +1496,6 @@ unsafe fn model_aliases(model: *mut Object) -> Result<CoremlFeatureAliases, Grap
     })
 }
 
-#[cfg(any(target_os = "macos", test))]
 fn parse_constant_copies(
     json: &str,
     outputs: &HashMap<String, String>,
@@ -1590,7 +1631,7 @@ unsafe fn model_passthroughs(
     inputs: &HashMap<String, String>,
     outputs: &HashMap<String, String>,
 ) -> Result<HashMap<String, CoremlPassthrough>, GraphError> {
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     {
         let description: *mut Object = msg_send![model, modelDescription];
         let Some(json) =
@@ -1610,7 +1651,7 @@ unsafe fn model_passthroughs(
             &unsafe { nsarray_to_strings(output_keys) },
         )
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(target_vendor = "apple"))]
     {
         let _ = (model, inputs, outputs);
         Ok(HashMap::new())
@@ -1644,7 +1685,7 @@ unsafe fn model_feature_aliases(
     model: *mut Object,
     input: bool,
 ) -> Result<HashMap<String, String>, GraphError> {
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     {
         let description: *mut Object = msg_send![model, modelDescription];
         let json = unsafe {
@@ -1686,7 +1727,7 @@ unsafe fn model_feature_aliases(
             parse_output_aliases(&json, &declared)
         }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(target_vendor = "apple"))]
     {
         let _ = (model, input);
         Ok(HashMap::new())

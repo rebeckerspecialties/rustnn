@@ -65,7 +65,7 @@ pub(crate) struct CoremlGraph {
 }
 
 impl CoremlGraph {
-    pub(crate) fn load_diagnostics(&self) -> &crate::executors::coreml::CoremlLoadDiagnostics {
+    pub(crate) fn load_diagnostics(&self) -> crate::executors::coreml::CoremlLoadDiagnostics {
         self.model.load_diagnostics()
     }
 }

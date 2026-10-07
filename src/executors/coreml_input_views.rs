@@ -1,6 +1,5 @@
 //! Bind converter-private flat Half views without changing public WebNN inputs.
 
-#[cfg(any(target_vendor = "apple", test))]
 use std::collections::HashSet;
 use std::ffi::c_void;
 use std::ptr;
@@ -20,7 +19,6 @@ use crate::error::GraphError;
 #[cfg(target_vendor = "apple")]
 use super::nsarray_to_strings;
 
-#[cfg(target_vendor = "apple")]
 pub(crate) const METADATA_KEY: &str = "rustnn.webnn.compact_input_views";
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -30,8 +28,7 @@ pub(crate) struct Binding {
     pub(crate) view: String,
 }
 
-#[cfg(any(target_vendor = "apple", test))]
-fn parse(json: &str, declared_inputs: &[String]) -> Result<Vec<Binding>, GraphError> {
+pub(super) fn parse(json: &str, declared_inputs: &[String]) -> Result<Vec<Binding>, GraphError> {
     let bindings: Vec<Binding> = serde_json::from_str(json).map_err(|error| {
         boundary_error(format!("invalid CoreML compact-input metadata: {error}"))
     })?;
@@ -121,12 +118,12 @@ unsafe fn declared_half_input(
 /// deallocator block additionally retains the source array until the view itself
 /// dies, including if CoreML retains it beyond the caller's dictionary lifetime.
 pub(crate) struct OwnedView {
-    array: ReleaseOnDrop,
+    pub(super) array: ReleaseOnDrop,
     #[cfg(all(test, target_vendor = "apple"))]
     copied: bool,
 }
 
-unsafe fn flat_view(source: *mut Object) -> Result<OwnedView, GraphError> {
+pub(super) unsafe fn flat_view(source: *mut Object) -> Result<OwnedView, GraphError> {
     if source.is_null() {
         return Err(boundary_error("compact input source has no native array"));
     }
@@ -388,9 +385,13 @@ mod tests {
                 false,
             )
             .unwrap();
-            assert_eq!(compiled.aliases.compact_input_views.len(), 1);
-            assert_eq!(compiled.aliases.passthroughs.len(), 1);
-            assert_eq!(compiled.aliases.constant_copies.len(), 1);
+            let aliases = match &compiled {
+                super::super::CompiledCoremlModel::Native(native) => &native.aliases,
+                super::super::CompiledCoremlModel::Pipeline(pipeline) => pipeline.feature_aliases(),
+            };
+            assert_eq!(aliases.compact_input_views.len(), 1);
+            assert_eq!(aliases.passthroughs.len(), 1);
+            assert_eq!(aliases.constant_copies.len(), 1);
             for &rows in rows {
                 let actual = descriptor(
                     DataType::Float16,

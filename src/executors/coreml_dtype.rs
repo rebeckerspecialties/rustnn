@@ -252,8 +252,8 @@ fn convert(
 /// Validated positive element strides. The native array owns the storage; this
 /// checks its metadata before any pointer arithmetic at the FFI boundary.
 pub(super) struct ArrayLayout {
-    shape: Vec<usize>,
-    strides: Vec<usize>,
+    pub(super) shape: Vec<usize>,
+    pub(super) strides: Vec<usize>,
     pub(super) count: usize,
     pub(super) byte_length: usize,
     pub(super) contiguous: bool,

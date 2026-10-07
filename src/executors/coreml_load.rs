@@ -10,6 +10,8 @@ pub enum CoremlLoadRoute {
     InMemoryAsset,
     /// Compile a source URL and load the resulting `.mlmodelc`.
     CompiledUrl,
+    /// Exact typed host stages, without an MLModel load or accelerator policy.
+    TypedHost,
 }
 
 /// An unsuccessful attempt preceding a successful model load.
@@ -23,7 +25,7 @@ pub struct CoremlLoadFailure {
     pub reason: String,
 }
 
-/// Why and how a graph was successfully loaded by CoreML.
+/// Why and how a graph was prepared for execution.
 ///
 /// Compute units are permissions, not measured CPU/GPU/Neural Engine placement.
 /// An accelerator-enabled load can still schedule every operation on the CPU.
@@ -31,7 +33,7 @@ pub struct CoremlLoadFailure {
 pub struct CoremlLoadDiagnostics {
     /// Policy selected for the requested backend device before any fallback.
     pub requested_compute_units: &'static str,
-    /// Policy of the successful load.
+    /// Policy of the successful load; `NOT_APPLICABLE` for typed-only plans.
     pub loaded_compute_units: &'static str,
     /// Route of the successful load.
     pub route: CoremlLoadRoute,

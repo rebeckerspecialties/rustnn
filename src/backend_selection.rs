@@ -172,7 +172,7 @@ pub(crate) fn select_backend(options: &MLContextOptions) -> Result<BackendDevice
     let have_onnx = cfg!(feature = "onnx-runtime");
     let want_onnx = options.backend_hint.is_none() || options.backend_hint == Some(Backend::Onnx);
 
-    let have_coreml = cfg!(all(target_os = "macos", feature = "coreml-runtime"));
+    let have_coreml = cfg!(all(target_vendor = "apple", feature = "coreml-runtime"));
     let want_coreml =
         options.backend_hint.is_none() || options.backend_hint == Some(Backend::Coreml);
 
