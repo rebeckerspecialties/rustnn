@@ -114,6 +114,10 @@ Rules that hold for every converter:
   A scalar result keeps the `[1]` CoreML boundary representation without changing the WebNN rank.
 - Float16 weights go to the weight blob written by `weight_file_builder.rs` and returned as
   `weights_data`.
+- MIL protobuf maps, user-defined metadata and constant emission use stable ordering, so
+  converting the same `GraphInfo` with the same converter revision produces identical model
+  and weight bytes across processes. This does not canonicalize equivalent graphs with
+  different operand identities or promise portable compiled caches across CoreML/OS versions.
 - The internal `shape` extension lowers to MIL `shape`, retaining its native int32 result
   inside CoreML and widening the public int64 result at readback. Imported shape tensors
   retain their type and rank through the shared `unsqueeze` inference path.

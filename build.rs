@@ -62,6 +62,12 @@ fn build_tflite_schema() {
 fn build_coreml_protos() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = prost_build::Config::new();
     config.bytes(["."]); // Fix clippy::needless_borrows_for_generic_args
+    // MIL maps and logical feature-binding metadata need stable encoding across
+    // processes. Other protobuf fields and formats retain their map types.
+    config.btree_map([
+        ".CoreML.Specification.MILSpec",
+        ".CoreML.Specification.Metadata.userDefined",
+    ]);
 
     let coreml_dir = "protos/coreml";
     let mut coreml_files = collect_protos(coreml_dir);
