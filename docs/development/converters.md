@@ -102,10 +102,6 @@ Rules that hold for every converter:
 
 ### CoreML
 
-- WebNN operand names are reversibly escaped when they are not valid MIL identifiers or are
-  reserved words. The model carries an explicit name-encoding metadata marker; runtime binding
-  translation is enabled only for marked models. See the
-  [tensor-name contract](https://rustnn.github.io/rustnn/integration/coreml/#tensor-names).
 - MIL has no rank-0 tensors at the boundary, no dilation in pooling, no `edge`/`reflection`
   padding above two dimensions and no tensors of rank 6 and above; integer arithmetic runs in
   float32.
@@ -121,7 +117,9 @@ Rules that hold for every converter:
 - WebNN names need not be MIL identifiers, and its input/output namespaces are independent.
   Unsafe or colliding names receive unique physical identifiers. Creator-defined
   `rustnn.webnn.input_aliases` and `rustnn.webnn.output_aliases` JSON mappings preserve
-  logical bindings in both execution paths and standalone exports.
+  logical bindings in byte-buffer, retained-tensor and one-shot execution, and standalone
+  exports. Older marked exports use reversible escaping; unmarked models keep literal names.
+  See the [tensor-name contract](https://rustnn.github.io/rustnn/integration/coreml/#tensor-names).
   Source-proven copies with identical type, shape and pending layout share one
   physical result: CoreML can omit duplicate scalar/dynamic copy features from prediction.
   Logical tensors still receive independent results. Unequal computations and real dtype
