@@ -1,5 +1,31 @@
 # WPT Test Guide
 
+## Reduced numerical-boundary diagnostics
+
+`make test-numeric-boundaries` checks an independent Decimal reference at two
+working precisions and tests the bit-level classifier and producer/consumer
+oracle. `make diagnose-coreml-boundaries` runs the reduced corpus through
+`MLContext` on macOS, writing `target/coreml-numeric-boundaries.json` (override
+`NUMERIC_BOUNDARY_REPORT` to preserve multiple runs).
+
+The inventory covers deep Half/Float32 Exp tails, Sqrt zero/subnormal/extreme and
+domain boundaries, and Float32 GELU tails. Unary checks use the upstream standalone
+budgets (Exp 1/32 ULP, Sqrt 1 ULP, GELU 18 ULP) with independently rounded values.
+No-flush and zero-sign fields are separate fidelity properties, not silently
+tighter WPT requirements. Mul/Div controls scale the actual isolated Exp output
+by an exact power of two, then compare direct and composed graphs separately.
+A failed composed comparison can indicate changed producer arithmetic as well as
+a consumer defect; the direct control isolates consumption of known stored bits.
+
+This is a diagnostic report, not a passing-test total: every raw input, expected
+and actual output bit pattern and failed comparison is retained. Execution errors
+return nonzero; numerical discrepancies stay visible in the report. CPU/GPU/NPU
+are requested policies, not measured placement. The target is intentionally
+separate from CI conformance and does not change the WPT pin or expected failures.
+Its stronger model-fidelity checks remain in RustNN while the
+[composed-reference discussion](https://github.com/webmachinelearning/webnn/issues/950)
+is unresolved. It does not assign a generic budget to arbitrary Exp/Sqrt/Div chains.
+
 The in-repo WPT harness runs upstream [WebNN conformance tests](https://github.com/web-platform-tests/wpt/tree/master/webnn/conformance_tests) against rustnn's WebNN API (`MLGraphBuilder` + `MLContext::dispatch`). Tests are loaded live from `.https.any.js` files via a Node.js bridge — there is no checked-in JSON dump of the corpus.
 
 **Entry point:** `tests/run_wpt_conformance.rs`  

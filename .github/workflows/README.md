@@ -1,5 +1,10 @@
 # GitHub Actions Workflows
 
+The local `make diagnose-coreml-boundaries` inventory is separate from CI and WPT
+pass rates. Its independent reference and classifier are checked with
+`make test-numeric-boundaries`; numerical discrepancies remain explicit in the
+native JSON report rather than being added to WPT expected failures.
+
 | Workflow | Trigger | What it does |
 |---|---|---|
 | `ci.yml` | push, pull request | Cargo.lock consistency, `cargo fmt --check`, `cargo check` per feature (ONNX Runtime, TensorRT, LiteRT, CANN, CoreML on macOS, wasm32 with `webnn-runtime`), `cargo test --lib` on Linux and macOS plus the CANN mock, rustdoc with warnings denied (`make docs-api`), operator report drift check (`make docs-backend-ops-check`) with the generator's unit tests, MkDocs strict build, version check on release tags |

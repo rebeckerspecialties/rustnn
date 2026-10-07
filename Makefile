@@ -7,6 +7,7 @@ ONNX_PATH ?= target/graph.onnx
 COREML_PATH ?= target/graph.mlmodel
 COREMLC_PATH ?= target/graph.mlmodelc
 COREML_FEATURES ?= coreml-runtime,dynamic-inputs
+NUMERIC_BOUNDARY_REPORT ?= target/coreml-numeric-boundaries.json
 TEST_FILTER ?=
 LITERT_PATH ?= target/graph.tflite
 CANN_PATH ?= target/graph.cann
@@ -209,6 +210,17 @@ test-coreml-gather:
 .PHONY: test-coreml-dtypes
 test-coreml-dtypes:
 	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_dtypes -- $(TEST_FILTER) --test-threads=1
+
+.PHONY: test-numeric-boundaries diagnose-coreml-boundaries
+test-numeric-boundaries:
+	python3 scripts/numeric_boundary_reference.py --check
+	$(CARGO) test --example coreml_numeric_boundaries
+
+# Numerical discrepancies remain in the JSON; execution errors return nonzero.
+# This inventory target does not contribute to the WPT conformance pass count.
+diagnose-coreml-boundaries: test-numeric-boundaries
+	@mkdir -p "$(dir $(NUMERIC_BOUNDARY_REPORT))"
+	$(CARGO) run --no-default-features --features $(COREML_FEATURES) --example coreml_numeric_boundaries > "$(NUMERIC_BOUNDARY_REPORT)"
 
 # Build every target, including examples and the separately run WPT harness.
 build-coreml:

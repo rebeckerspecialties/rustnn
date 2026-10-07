@@ -1,5 +1,10 @@
 # Setup and Workflow
 
+For reduced arithmetic-inventory checks, use `make test-numeric-boundaries`.
+On macOS, `make diagnose-coreml-boundaries` records native results without
+changing the conformance baseline. See the [WPT test guide](../testing/wpt-test-guide.md#reduced-numerical-boundary-diagnostics)
+for the distinction between standalone budgets and stronger model-fidelity checks.
+
 ## Toolchain
 
 | Tool | Notes |
