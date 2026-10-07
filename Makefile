@@ -7,6 +7,7 @@ ONNX_PATH ?= target/graph.onnx
 COREML_PATH ?= target/graph.mlmodel
 COREMLC_PATH ?= target/graph.mlmodelc
 COREML_FEATURES ?= coreml-runtime,dynamic-inputs
+NUMERIC_BOUNDARY_REPORT ?= target/coreml-numeric-boundaries.json
 TEST_FILTER ?=
 LITERT_PATH ?= target/graph.tflite
 CANN_PATH ?= target/graph.cann
@@ -178,6 +179,7 @@ test-webnn-wpt-chrome-headless: require-wpt-cache webnn-chromedriver
 # WPT conformance (requires Node.js, WPT cache; set WPT_BACKEND=onnx|trtx to pick backend)
 test-wpt: onnxruntime-download
 	$(ORT_ENV_VARS) $(CARGO) test --test run_wpt_conformance --features onnx-runtime -- --test-threads 1
+	$(MAKE) test-wpt-tolerance-parity
 
 test-wpt-trtx: onnxruntime-download trtxruntime-download
 	$(ORT_ENV_VARS) $(TRT_ENV_VARS) $(CARGO) test --test run_wpt_conformance --features "onnx-runtime,trtx-runtime" -- trtx --test-threads 1
@@ -191,7 +193,15 @@ test-wpt-litert:
 	$(CARGO) test --test run_wpt_conformance --features "litert-runtime" -- litert --test-threads=1
 
 test-wpt-coreml:
-	$(CARGO) test --test run_wpt_conformance --features coreml-runtime -- coreml --test-threads 1
+	WPT_BACKEND=coreml $(CARGO) test --test run_wpt_conformance --features coreml-runtime -- $(if $(TEST_FILTER),$(TEST_FILTER),coreml) --test-threads 1
+	$(MAKE) test-wpt-tolerance-parity
+
+.PHONY: test-wpt-tolerance test-wpt-tolerance-parity
+test-wpt-tolerance:
+	$(CARGO) test --test test_wpt_tolerance
+
+test-wpt-tolerance-parity: require-wpt-cache
+	$(CARGO) test --test test_wpt_tolerance strict_comparator_matches_upstream_javascript -- --ignored
 
 .PHONY: test-coreml-gather
 test-coreml-gather:
@@ -200,6 +210,17 @@ test-coreml-gather:
 .PHONY: test-coreml-dtypes
 test-coreml-dtypes:
 	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_dtypes -- $(TEST_FILTER) --test-threads=1
+
+.PHONY: test-numeric-boundaries diagnose-coreml-boundaries
+test-numeric-boundaries:
+	python3 scripts/numeric_boundary_reference.py --check
+	$(CARGO) test --example coreml_numeric_boundaries
+
+# Numerical discrepancies remain in the JSON; execution errors return nonzero.
+# This inventory target does not contribute to the WPT conformance pass count.
+diagnose-coreml-boundaries: test-numeric-boundaries
+	@mkdir -p "$(dir $(NUMERIC_BOUNDARY_REPORT))"
+	$(CARGO) run --no-default-features --features $(COREML_FEATURES) --example coreml_numeric_boundaries > "$(NUMERIC_BOUNDARY_REPORT)"
 
 # Build every target, including examples and the separately run WPT harness.
 build-coreml:
@@ -213,6 +234,7 @@ test-coreml:
 test-wpt-coreml-report:
 	@mkdir -p reports
 	WPT_REPORT_JSON=reports/wpt-conformance.json $(CARGO) test --test run_wpt_conformance --features coreml-runtime -- coreml --test-threads 1
+	$(MAKE) test-wpt-tolerance-parity
 
 test-wpt-cann: require-wpt-cache validate-cann-env
 	@mkdir -p reports
@@ -229,6 +251,7 @@ WPT_BACKEND ?= onnx
 # Full WPT run with JSON/HTML reports; exits 0 even if trials fail (for nightly pages).
 test-wpt-report: fetch-wpt onnxruntime-download
 	@mkdir -p reports
+	$(MAKE) test-wpt-tolerance-parity
 	@HOST_TRIPLE=$$(rustc -vV 2>/dev/null | grep host: | cut -d' ' -f2); \
 	LITERT_LIB_DIR="$${HOME}/.cache/litert-sys/v0.10.2/$${HOST_TRIPLE}"; \
 	LD_LIBRARY_PATH="$$LITERT_LIB_DIR:$$LD_LIBRARY_PATH" \

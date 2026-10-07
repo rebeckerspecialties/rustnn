@@ -1,5 +1,10 @@
 # GitHub Actions Workflows
 
+The local `make diagnose-coreml-boundaries` inventory is separate from CI and WPT
+pass rates. Its independent reference and classifier are checked with
+`make test-numeric-boundaries`; numerical discrepancies remain explicit in the
+native JSON report rather than being added to WPT expected failures.
+
 | Workflow | Trigger | What it does |
 |---|---|---|
 | `ci.yml` | push, pull request | Cargo.lock consistency, `cargo fmt --check`, `cargo check` per feature (ONNX Runtime, TensorRT, LiteRT, CANN, CoreML on macOS, wasm32 with `webnn-runtime`), `cargo test --lib` on Linux and macOS plus the CANN mock, rustdoc with warnings denied (`make docs-api`), operator report drift check (`make docs-backend-ops-check`) with the generator's unit tests, MkDocs strict build, version check on release tags |
@@ -22,6 +27,8 @@
   It also builds and tests CoreML with and without dynamic inputs using `make build-coreml`
   and `make test-coreml`. `make test-coreml-gather` also runs the focused gather bounds and
   scalar-index shape regressions; numerical checks remain strict.
+- Linux and macOS CI explicitly run `make test-wpt-tolerance`; WPT jobs also check
+  strict comparator parity against the pinned upstream JavaScript helpers.
 - The documentation site combines three generated parts: MkDocs pages from `docs/`, rustdoc from
   `make docs-api`, and the WPT dashboard cached by the nightly workflow. Test a docs change
   locally with `make ci-docs` and `make docs-api`.

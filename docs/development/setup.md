@@ -1,5 +1,10 @@
 # Setup and Workflow
 
+For reduced arithmetic-inventory checks, use `make test-numeric-boundaries`.
+On macOS, `make diagnose-coreml-boundaries` records native results without
+changing the conformance baseline. See the [WPT test guide](../testing/wpt-test-guide.md#reduced-numerical-boundary-diagnostics)
+for the distinction between standalone budgets and stronger model-fidelity checks.
+
 ## Toolchain
 
 | Tool | Notes |
@@ -57,6 +62,7 @@ Use the Makefile targets; they set feature flags and environment variables consi
 | `validate-all-env` | Build, unit tests, ONNX and CoreML validation in one run |
 | `fetch-wpt` | Download the pinned WPT corpus into the cache (`WPT_DIR` overrides) |
 | `test-wpt` | WPT conformance on ONNX Runtime CPU |
+| `test-wpt-tolerance`, `test-wpt-tolerance-parity` | Backend-independent comparison regressions and direct upstream JavaScript-helper parity; the latter requires Node.js and a fetched WPT corpus and also runs after successful full ONNX/CoreML WPT targets |
 | `test-wpt-op OP=relu` | One operation; `WPT_BACKEND=onnx|trtx|litert|coreml` selects the backend |
 | `test-wpt-trtx`, `test-wpt-litert`, `test-wpt-coreml`, `test-wpt-cann` | Per-backend WPT runs (CANN cross-compiles and runs on the device over `hdc`); `test-wpt-report` and `test-wpt-coreml-report` also write the JSON report |
 | `wpt-sync-onnx`, `wpt-sync-trtx`, `wpt-sync-litert`, `wpt-sync-coreml`, `wpt-sync-cann` | Regenerate snapshots and expected-failure lists |

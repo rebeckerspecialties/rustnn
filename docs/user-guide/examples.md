@@ -1,5 +1,10 @@
 # Examples
 
+`coreml_numeric_boundaries` is a small arithmetic diagnostic, independent of any
+model checkpoint. Use `make diagnose-coreml-boundaries` on macOS to record Exp
+producer/consumer and Sqrt/GELU boundary results. The [test guide](../testing/wpt-test-guide.md#reduced-numerical-boundary-diagnostics)
+explains its raw-bit output and separate fidelity properties.
+
 ## Example programs
 
 The `examples/` directory contains complete programs. Build them with the features they need;
