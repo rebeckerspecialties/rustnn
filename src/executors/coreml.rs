@@ -1,4 +1,4 @@
-//! Minimal CoreML execution bridge for macOS.
+//! Minimal CoreML execution bridge for macOS and iOS.
 //! Loads a `.mlmodel`, compiles it if needed, and runs a zeroed inference
 //! using CoreML's Objective-C API.
 
@@ -19,10 +19,10 @@ use objc::runtime::{Class, Object};
 use objc::{class, msg_send, sel, sel_impl};
 
 use super::coreml_dtype::{ArrayLayout, NativeType, boundary_error, from_native, to_native};
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "ios", test))]
 use crate::converters::CoremlConstantCopies;
 use crate::converters::{CoremlPassthrough, coreml_names};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 use crate::converters::{
     INPUT_ALIASES_METADATA_KEY, OUTPUT_ALIASES_METADATA_KEY, OUTPUT_CONSTANT_COPIES_METADATA_KEY,
     OUTPUT_PASSTHROUGHS_METADATA_KEY,
@@ -33,16 +33,25 @@ use crate::runtime_checks::{RuntimeShapeState, TensorKind, validate_shape_data_l
 
 #[path = "coreml_input_views.rs"]
 pub(crate) mod input_views;
+#[path = "coreml_tensor.rs"]
+mod tensor_storage;
+pub(crate) use tensor_storage::{CoremlTensorBinding, CoremlTensorStorage, run_coreml_tensors};
+
+impl CompiledCoremlModel {
+    pub(crate) fn compute_unit(&self) -> &'static str {
+        self.compute_unit
+    }
+}
 #[path = "coreml_load.rs"]
 mod load;
 use load::LoadTrace;
 pub use load::{CoremlLoadDiagnostics, CoremlLoadFailure, CoremlLoadRoute};
 
 // Link against the system frameworks we use.
-#[cfg(target_vendor = "apple")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[link(name = "Foundation", kind = "framework")]
 unsafe extern "C" {}
-#[cfg(target_vendor = "apple")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[link(name = "CoreML", kind = "framework")]
 unsafe extern "C" {
     static MLModelCreatorDefinedKey: *mut Object;
@@ -50,7 +59,7 @@ unsafe extern "C" {
 
 // Objective-C++ exception firewall (src/executors/coreml_shim.mm).
 // Return codes: 0 = success, 1 = NSError, 2 = NSException, 3 = C++ exception.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 unsafe extern "C" {
     fn rustnn_coreml_compile(
         model_url: *mut Object,
@@ -75,8 +84,12 @@ unsafe extern "C" {
 }
 
 // Shims to check compilation on Linux
-/// Always-failing stand-in for the CoreML shim; only exists off macOS so the feature compiles.
-#[cfg(not(target_os = "macos"))]
+/// Always-failing stand-in for targets without the native CoreML shim.
+///
+/// # Safety
+/// This stand-in does not dereference its pointer arguments. Its unsafe signature
+/// mirrors the native shim; no output pointers are initialized on failure.
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 pub unsafe extern "C" fn rustnn_coreml_compile(
     _model_url: *mut Object,
     _out_url: *mut *mut Object,
@@ -85,8 +98,12 @@ pub unsafe extern "C" fn rustnn_coreml_compile(
 ) -> i32 {
     1
 }
-/// Always-failing stand-in for the CoreML shim; only exists off macOS so the feature compiles.
-#[cfg(not(target_os = "macos"))]
+/// Always-failing stand-in for targets without the native CoreML shim.
+///
+/// # Safety
+/// This stand-in does not dereference its pointer arguments. Its unsafe signature
+/// mirrors the native shim; no output pointers are initialized on failure.
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 pub unsafe extern "C" fn rustnn_coreml_load(
     _compiled_url: *mut Object,
     _configuration: *mut Object,
@@ -96,8 +113,12 @@ pub unsafe extern "C" fn rustnn_coreml_load(
 ) -> i32 {
     1
 }
-/// Always-failing stand-in for the CoreML shim; only exists off macOS so the feature compiles.
-#[cfg(not(target_os = "macos"))]
+/// Always-failing stand-in for targets without the native CoreML shim.
+///
+/// # Safety
+/// This stand-in does not dereference its pointer arguments. Its unsafe signature
+/// mirrors the native shim; no output pointers are initialized on failure.
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 pub unsafe extern "C" fn rustnn_coreml_predict(
     _model: *mut Object,
     _features: *mut Object,
@@ -752,7 +773,6 @@ fn snapshot_byte_passthroughs(
         })?;
         if input.descriptor.data_type != proof.descriptor.data_type
             || output.data_type != proof.descriptor.data_type
-            || output.shape != proof.descriptor.shape
             || output.pending_permutation != proof.descriptor.pending_permutation
             || input.descriptor.pending_permutation != proof.descriptor.pending_permutation
         {
@@ -1395,7 +1415,7 @@ unsafe fn nsarray_to_strings(array: *mut Object) -> Vec<String> {
         .collect()
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "ios", test))]
 fn parse_output_aliases(
     json: &str,
     declared_outputs: &[String],
@@ -1403,7 +1423,7 @@ fn parse_output_aliases(
     parse_feature_aliases(json, declared_outputs, "output", true)
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "ios", test))]
 fn parse_feature_aliases(
     json: &str,
     declared: &[String],
@@ -1455,7 +1475,7 @@ unsafe fn model_aliases(model: *mut Object) -> Result<CoremlFeatureAliases, Grap
     })
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "ios", test))]
 fn parse_constant_copies(
     json: &str,
     outputs: &HashMap<String, String>,
@@ -1536,7 +1556,7 @@ unsafe fn model_constant_copies(
     outputs: &HashMap<String, String>,
     input_copies: &HashMap<String, CoremlPassthrough>,
 ) -> Result<HashMap<String, CoremlConstantCopy>, GraphError> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         let Some(json) =
             (unsafe { model_metadata_value(model, OUTPUT_CONSTANT_COPIES_METADATA_KEY)? })
@@ -1553,7 +1573,7 @@ unsafe fn model_constant_copies(
             input_copies,
         )
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     {
         let _ = (model, outputs, input_copies);
         Ok(HashMap::new())
@@ -1591,7 +1611,7 @@ unsafe fn model_passthroughs(
     inputs: &HashMap<String, String>,
     outputs: &HashMap<String, String>,
 ) -> Result<HashMap<String, CoremlPassthrough>, GraphError> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         let description: *mut Object = msg_send![model, modelDescription];
         let Some(json) =
@@ -1611,14 +1631,14 @@ unsafe fn model_passthroughs(
             &unsafe { nsarray_to_strings(output_keys) },
         )
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     {
         let _ = (model, inputs, outputs);
         Ok(HashMap::new())
     }
 }
 
-#[cfg(target_vendor = "apple")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 unsafe fn model_metadata_value(
     model: *mut Object,
     key: &str,
@@ -1645,7 +1665,7 @@ unsafe fn model_feature_aliases(
     model: *mut Object,
     input: bool,
 ) -> Result<HashMap<String, String>, GraphError> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         let description: *mut Object = msg_send![model, modelDescription];
         let json = unsafe {
@@ -1687,7 +1707,7 @@ unsafe fn model_feature_aliases(
             parse_output_aliases(&json, &declared)
         }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     {
         let _ = (model, input);
         Ok(HashMap::new())
@@ -1816,7 +1836,6 @@ unsafe fn snapshot_provider_passthroughs(
                 ))
             })?;
             if descriptor.data_type != proof.descriptor.data_type
-                || descriptor.shape != proof.descriptor.shape
                 || descriptor.pending_permutation != proof.descriptor.pending_permutation
             {
                 return Err(boundary_error(format!(
@@ -1860,6 +1879,9 @@ unsafe fn snapshot_provider_passthroughs(
             })
             .collect::<Result<_, _>>()?;
         shapes.validate_shape(&proof.input, &actual, &proof.descriptor, TensorKind::Input)?;
+        if let Some(descriptor) = expected.and_then(|outputs| outputs.get(&output)) {
+            shapes.validate_shape(&output, &actual, descriptor, TensorKind::Output)?;
+        }
         let data = unsafe { extract_mlmultiarray_data(array)? };
         validate_shape_data_length(&proof.input, &actual, data.len())?;
         result.insert(
@@ -2620,7 +2642,13 @@ mod checked_attempt_tests {
             )]);
             assert!(snapshot_byte_passthroughs(&proofs, &wrong_type, &outputs).is_err());
             let wrong_output = HashMap::from([
-                ("first".into(), actual.clone()),
+                (
+                    "first".into(),
+                    OperandDescriptor {
+                        shape: vec![Dimension::Static(3)],
+                        ..actual.clone()
+                    },
+                ),
                 ("second".into(), descriptor),
             ]);
             assert!(snapshot_byte_passthroughs(&proofs, &inputs, &wrong_output).is_err());
