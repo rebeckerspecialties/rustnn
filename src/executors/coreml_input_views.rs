@@ -1,6 +1,6 @@
 //! Bind converter-private flat Half views without changing public WebNN inputs.
 
-#[cfg(any(target_vendor = "apple", test))]
+#[cfg(any(target_os = "macos", target_os = "ios", test))]
 use std::collections::HashSet;
 use std::ffi::c_void;
 use std::ptr;
@@ -17,10 +17,10 @@ use super::{
 };
 use crate::error::GraphError;
 
-#[cfg(target_vendor = "apple")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 use super::nsarray_to_strings;
 
-#[cfg(target_vendor = "apple")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub(crate) const METADATA_KEY: &str = "rustnn.webnn.compact_input_views";
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -30,7 +30,7 @@ pub(crate) struct Binding {
     pub(crate) view: String,
 }
 
-#[cfg(any(target_vendor = "apple", test))]
+#[cfg(any(target_os = "macos", target_os = "ios", test))]
 fn parse(json: &str, declared_inputs: &[String]) -> Result<Vec<Binding>, GraphError> {
     let bindings: Vec<Binding> = serde_json::from_str(json).map_err(|error| {
         boundary_error(format!("invalid CoreML compact-input metadata: {error}"))
@@ -59,7 +59,7 @@ fn parse(json: &str, declared_inputs: &[String]) -> Result<Vec<Binding>, GraphEr
 }
 
 pub(crate) unsafe fn from_model(model: *mut Object) -> Result<Vec<Binding>, GraphError> {
-    #[cfg(target_vendor = "apple")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         let Some(json) = (unsafe { super::model_metadata_value(model, METADATA_KEY)? }) else {
             return Ok(Vec::new());
@@ -75,7 +75,7 @@ pub(crate) unsafe fn from_model(model: *mut Object) -> Result<Vec<Binding>, Grap
         }
         Ok(bindings)
     }
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     {
         let _ = model;
         Ok(Vec::new())
@@ -208,6 +208,9 @@ pub(crate) unsafe fn bind(
     dictionary: *mut Object,
     bindings: &[Binding],
 ) -> Result<Vec<OwnedView>, GraphError> {
+    if bindings.is_empty() {
+        return Ok(Vec::new());
+    }
     let description: *mut Object = msg_send![model, modelDescription];
     let descriptions: *mut Object = msg_send![description, inputDescriptionsByName];
     let mut result = Vec::with_capacity(bindings.len());
@@ -253,6 +256,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn empty_bindings_need_no_native_model() {
+        let views = unsafe { bind(ptr::null_mut(), ptr::null_mut(), &[]) }.unwrap();
+        assert!(views.is_empty());
+    }
+
+    #[test]
     fn compact_metadata_requires_distinct_declared_one_level_bindings() {
         let declared = vec!["x".into(), "x_view".into(), "y".into(), "y_view".into()];
         assert_eq!(
@@ -277,7 +286,7 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
-    fn mixed_views_and_copy_outputs(rows: &[u32], dynamic: bool) {
+    fn mixed_views_and_copy_outputs(rows: &[u32], dynamic: bool, native: bool) {
         use crate::backend_selection::DeviceType;
         use crate::converters::{CoremlMlProgramConverter, GraphConverter, coreml_names};
         use crate::graph::{
@@ -391,7 +400,28 @@ mod tests {
             assert_eq!(compiled.aliases.compact_input_views.len(), 1);
             assert_eq!(compiled.aliases.passthroughs.len(), 1);
             assert_eq!(compiled.aliases.constant_copies.len(), 1);
-            for &rows in rows {
+            let mut input_storage = super::super::CoremlTensorStorage::new(
+                DataType::Float16,
+                maximum as usize * 4,
+                true,
+            )
+            .unwrap();
+            let mut source_output = super::super::CoremlTensorStorage::new(
+                DataType::Float16,
+                maximum as usize * 4,
+                true,
+            )
+            .unwrap();
+            let constant_output =
+                super::super::CoremlTensorStorage::new(DataType::Int32, constant_bytes.len(), true)
+                    .unwrap();
+            let arithmetic_output = super::super::CoremlTensorStorage::new(
+                DataType::Float16,
+                maximum as usize * 4,
+                true,
+            )
+            .unwrap();
+            for (iteration, &rows) in rows.iter().enumerate() {
                 let actual = descriptor(
                     DataType::Float16,
                     vec![Dimension::Static(rows), Dimension::Static(2)],
@@ -399,6 +429,7 @@ mod tests {
                 let original: Vec<_> = [0x3c00u16, 0x4000, 0x4200, 0x4400, 0x4500, 0x4600]
                     .into_iter()
                     .take(rows as usize * 2)
+                    .map(|bits| bits + iteration as u16 * 0x10)
                     .flat_map(u16::to_le_bytes)
                     .collect();
                 let negated: Vec<_> = original
@@ -417,6 +448,85 @@ mod tests {
                         descriptor(DataType::Float16, vec![Dimension::Static(rows * 2)]),
                     ),
                 ]);
+                if native {
+                    let active_outputs: HashMap<String, OperandDescriptor> = HashMap::from([
+                        ("copy.source".into(), actual.clone()),
+                        ("copy.constant".into(), constant.clone()),
+                        (
+                            "negated.view".into(),
+                            descriptor(DataType::Float16, vec![Dimension::Static(rows * 2)]),
+                        ),
+                    ]);
+                    // Retain the same allocations across actual 1 -> 3 -> 1
+                    // shapes. Both backing modes must bind the private view.
+                    for output_backings in [false, true] {
+                        input_storage.write(&original).unwrap();
+                        let mut statistics =
+                            crate::mlcontextoptions::CoremlTensorStatistics::default();
+                        let result = super::super::run_coreml_tensors(
+                            &compiled,
+                            &HashMap::from([(
+                                "tensor".into(),
+                                super::super::CoremlTensorBinding {
+                                    storage: &input_storage,
+                                    descriptor: &actual,
+                                },
+                            )]),
+                            &HashMap::from([
+                                (
+                                    "copy.source".into(),
+                                    super::super::CoremlTensorBinding {
+                                        storage: &source_output,
+                                        descriptor: &active_outputs["copy.source"],
+                                    },
+                                ),
+                                (
+                                    "copy.constant".into(),
+                                    super::super::CoremlTensorBinding {
+                                        storage: &constant_output,
+                                        descriptor: &active_outputs["copy.constant"],
+                                    },
+                                ),
+                                (
+                                    "negated.view".into(),
+                                    super::super::CoremlTensorBinding {
+                                        storage: &arithmetic_output,
+                                        descriptor: &active_outputs["negated.view"],
+                                    },
+                                ),
+                            ]),
+                            output_backings,
+                            &mut statistics,
+                        )
+                        .unwrap();
+                        assert!(result.is_empty());
+                        assert_eq!(statistics.native_input_bindings, 1);
+                        let mut input_after = vec![0; original.len()];
+                        input_storage.read(&mut input_after).unwrap();
+                        assert_eq!(
+                            input_after, original,
+                            "native input changed during prediction"
+                        );
+                        input_storage.write(&vec![0; original.len()]).unwrap();
+                        for (storage, expected) in [
+                            (&source_output, &original),
+                            (&constant_output, &constant_bytes),
+                            (&arithmetic_output, &negated),
+                        ] {
+                            let mut bytes = vec![0; expected.len()];
+                            storage.read(&mut bytes).unwrap();
+                            assert_eq!(&bytes, expected, "{policy:?}, rows={rows}");
+                        }
+                        source_output.write(&vec![0; original.len()]).unwrap();
+                        let mut constant_result = vec![0; constant_bytes.len()];
+                        constant_output.read(&mut constant_result).unwrap();
+                        assert_eq!(constant_result, constant_bytes);
+                        let mut arithmetic_result = vec![0; negated.len()];
+                        arithmetic_output.read(&mut arithmetic_result).unwrap();
+                        assert_eq!(arithmetic_result, negated);
+                    }
+                    continue;
+                }
                 let mut bytes = original.clone();
                 let mut result = super::super::run_coreml_bytes(
                     &compiled,
@@ -444,13 +554,25 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn compact_views_coexist_with_proven_input_and_constant_outputs() {
-        mixed_views_and_copy_outputs(&[3, 3], false);
+        mixed_views_and_copy_outputs(&[3, 3], false, false);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_reuse_binds_compact_views_with_proven_outputs_and_backing_modes() {
+        mixed_views_and_copy_outputs(&[3, 3], false, true);
     }
 
     #[cfg(all(target_os = "macos", feature = "dynamic-inputs"))]
     #[test]
     fn compact_views_and_proven_outputs_keep_actual_grow_shrink_extents() {
-        mixed_views_and_copy_outputs(&[1, 3, 1], true);
+        mixed_views_and_copy_outputs(&[1, 3, 1], true, false);
+    }
+
+    #[cfg(all(target_os = "macos", feature = "dynamic-inputs"))]
+    #[test]
+    fn native_reuse_compact_views_keep_actual_grow_shrink_extents() {
+        mixed_views_and_copy_outputs(&[1, 3, 1], true, true);
     }
 
     #[cfg(target_vendor = "apple")]

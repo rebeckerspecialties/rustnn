@@ -21,15 +21,22 @@
 - macOS CI explicitly runs `make test-coreml-dtypes` with and without dynamic inputs.
   `make test-coreml-gelu` covers exact GELU precision, shapes, and compositions under
   both feature configurations, including all FP16 encodings under CPU/GPU/NPU requests.
+  `make test-coreml-tensor-reuse` also runs in both configurations to check retained
+  storage ownership, conversion, aliasing and resizing.
   It also builds and tests CoreML with and without dynamic inputs using `make build-coreml`
   and `make test-coreml`. `make test-coreml-gather` also runs the focused gather bounds and
   scalar-index shape regressions; numerical checks remain strict.
 - `make test-coreml-precision` qualifies explicit float16 rounding in native Pipeline
   stages, including scalar/dynamic interfaces, fanout, masks, shared weights and special values.
   These ordinary integration tests also run through `make test-coreml`.
+- Linux and macOS CI explicitly run `make test-wpt-tolerance`; WPT jobs also check
+  strict comparator parity against the pinned upstream JavaScript helpers.
 - The documentation site combines three generated parts: MkDocs pages from `docs/`, rustdoc from
   `make docs-api`, and the WPT dashboard cached by the nightly workflow. Test a docs change
   locally with `make ci-docs` and `make docs-api`.
+- `benchmark-coreml-kv` runs self-contained attention/cache chaining by default; an external
+  model/reference fixture is optional. macOS CI runs its numerical and cache-content gates
+  via `make test-coreml-kv-benchmark`, without asserting a performance threshold.
 
 ## Pages deployment
 

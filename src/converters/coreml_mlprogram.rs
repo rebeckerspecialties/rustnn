@@ -234,6 +234,46 @@ fn constant_copies(graph: &GraphInfo) -> CoremlConstantCopies {
     copies
 }
 
+impl CoremlMlProgramConverter {
+    /// Data-free URL compilation can crash BNNS for a constant identity transpose.
+    /// Only source-proven copies may use the asset route: arithmetic and real
+    /// typed boundaries must retain the precision-preserving URL route.
+    #[cfg(any(feature = "coreml-runtime", test))]
+    pub(crate) fn constant_copy_asset_eligible(graph: &GraphInfo, model_bytes: &[u8]) -> bool {
+        use prost::Message;
+        if !graph.input_operands.is_empty() || graph.output_operands.is_empty() {
+            return false;
+        }
+        let origins = copy_origins(graph);
+        let is_constant_copy = |id: u32| {
+            origins
+                .get(id as usize)
+                .copied()
+                .flatten()
+                .and_then(|origin| graph.operand(origin))
+                .is_some_and(|operand| operand.kind == OperandKind::Constant)
+        };
+        graph.output_operands.iter().all(|&id| {
+            graph
+                .operand(id)
+                .is_some_and(|operand| operand.kind == OperandKind::Output)
+                && is_constant_copy(id)
+        }) && graph.operations.iter().all(|operation| {
+            !operation.output_operands().is_empty()
+                && operation
+                    .output_operands()
+                    .iter()
+                    .copied()
+                    .all(is_constant_copy)
+        }) && Model::decode(model_bytes).is_ok_and(|model| {
+            matches!(
+                model.r#type,
+                Some(crate::protos::coreml::specification::model::Type::MlProgram(_))
+            )
+        })
+    }
+}
+
 // Public WebNN names need not be MIL identifiers. Keep logical names outside
 // the converter and serialize their physical feature bindings in metadata.
 fn operand_name(graph: &GraphInfo, id: u32) -> String {
@@ -12188,6 +12228,174 @@ mod tests {
 
     fn s(shape: &[u32]) -> Vec<crate::graph::Dimension> {
         crate::graph::to_dimension_vector(shape)
+    }
+
+    fn constant_copy_asset_graph() -> GraphInfo {
+        let descriptor = OperandDescriptor {
+            data_type: DataType::Float32,
+            shape: s(&[2]),
+            pending_permutation: vec![],
+        };
+        GraphInfo {
+            operands: (0..=5)
+                .map(|id| Operand {
+                    kind: match id {
+                        0 => OperandKind::Constant,
+                        5 => OperandKind::Output,
+                        _ => OperandKind::Intermediate,
+                    },
+                    name: Some(format!("copy{id}")),
+                    descriptor: descriptor.clone(),
+                })
+                .collect(),
+            output_operands: vec![5],
+            constant_operand_ids_to_handles: HashMap::from([(
+                0,
+                ConstantData {
+                    data: [1.0003f32, -0.0]
+                        .into_iter()
+                        .flat_map(f32::to_le_bytes)
+                        .collect(),
+                    label: None,
+                },
+            )]),
+            operations: vec![
+                Operation::Identity {
+                    input: 0,
+                    options: None,
+                    outputs: vec![1],
+                },
+                Operation::Transpose {
+                    input: 1,
+                    options: None,
+                    outputs: vec![2],
+                },
+                Operation::Cast {
+                    input: 2,
+                    data_type: MLOperandDataType::Float32,
+                    options: None,
+                    outputs: vec![3],
+                },
+                Operation::Slice {
+                    input: 3,
+                    starts: vec![0],
+                    sizes: vec![MLDimension::Static(2)],
+                    options: None,
+                    outputs: vec![4],
+                },
+                Operation::Reshape {
+                    input: 4,
+                    new_shape: vec![MLDimension::Static(2)],
+                    options: None,
+                    outputs: vec![5],
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn constant_copy_asset_accepts_only_source_proven_public_copies() {
+        let graph = constant_copy_asset_graph();
+        let model = CoremlMlProgramConverter.convert(&graph).unwrap().data;
+        assert!(CoremlMlProgramConverter::constant_copy_asset_eligible(
+            &graph, &model,
+        ));
+
+        let mut no_outputs = graph.clone();
+        no_outputs.output_operands.clear();
+        let mut nonpublic_output = graph.clone();
+        nonpublic_output.operands[5].kind = OperandKind::Intermediate;
+        let mut runtime_input = graph.clone();
+        runtime_input.operands[0].kind = OperandKind::Input;
+        runtime_input.input_operands.push(0);
+        runtime_input.constant_operand_ids_to_handles.clear();
+        let mut malformed_constant = graph.clone();
+        malformed_constant
+            .constant_operand_ids_to_handles
+            .get_mut(&0)
+            .unwrap()
+            .data
+            .pop();
+        for (label, rejected) in [
+            ("empty outputs", no_outputs),
+            ("nonpublic output", nonpublic_output),
+            ("runtime input", runtime_input),
+            ("malformed constant length", malformed_constant),
+        ] {
+            assert!(
+                !CoremlMlProgramConverter::constant_copy_asset_eligible(&rejected, &model),
+                "{label}",
+            );
+        }
+    }
+
+    #[test]
+    fn constant_copy_asset_rejects_dead_arithmetic_and_typed_boundaries() {
+        let graph = constant_copy_asset_graph();
+        let model = CoremlMlProgramConverter.convert(&graph).unwrap().data;
+        for narrowing in [false, true] {
+            let mut rejected = graph.clone();
+            let mut dead = rejected.operands[1].clone();
+            dead.name = Some("dead".into());
+            if narrowing {
+                dead.descriptor.data_type = DataType::Float16;
+            }
+            rejected.operands.push(dead);
+            rejected.operations.push(if narrowing {
+                Operation::Cast {
+                    input: 0,
+                    data_type: MLOperandDataType::Float16,
+                    options: None,
+                    outputs: vec![6],
+                }
+            } else {
+                Operation::Neg {
+                    input: 0,
+                    options: None,
+                    outputs: vec![6],
+                }
+            });
+            assert!(
+                !CoremlMlProgramConverter::constant_copy_asset_eligible(&rejected, &model),
+                "dead narrowing={narrowing}",
+            );
+        }
+    }
+
+    #[test]
+    fn constant_copy_asset_rejects_mixed_computed_outputs() {
+        let mut graph = constant_copy_asset_graph();
+        let model = CoremlMlProgramConverter.convert(&graph).unwrap().data;
+        let mut computed = graph.operands[5].clone();
+        computed.name = Some("computed".into());
+        graph.operands.push(computed);
+        graph.output_operands.push(6);
+        graph.operations.push(Operation::Neg {
+            input: 0,
+            options: None,
+            outputs: vec![6],
+        });
+        assert!(!CoremlMlProgramConverter::constant_copy_asset_eligible(
+            &graph, &model,
+        ));
+    }
+
+    #[test]
+    fn constant_copy_asset_requires_decodable_mlprogram() {
+        let graph = constant_copy_asset_graph();
+        let pipeline = Model {
+            r#type: Some(crate::protos::coreml::specification::model::Type::Pipeline(
+                Default::default(),
+            )),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        for rejected in [pipeline, Model::default().encode_to_vec(), vec![0xff]] {
+            assert!(!CoremlMlProgramConverter::constant_copy_asset_eligible(
+                &graph, &rejected,
+            ));
+        }
     }
 
     #[test]
