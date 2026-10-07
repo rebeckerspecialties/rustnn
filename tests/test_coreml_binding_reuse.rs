@@ -120,6 +120,7 @@ fn exact_input_and_constant_copies_keep_names_payloads_and_independent_ownership
                     };
                     assert_eq!(stats.output_backings_requested, 0);
                     assert_eq!(stats.output_backings_accepted, 0);
+                    assert_eq!(stats.proven_copy_outputs, 4);
                 }
             }
         }
@@ -146,6 +147,21 @@ fn arithmetic_alias_fanout_uses_native_results_not_original_input_bytes() {
                     ("0copy", copied),
                 ]))
                 .unwrap();
+            let mut builder = MLGraphBuilder::new(&mut context).unwrap();
+            let source = builder
+                .input(
+                    "fp32",
+                    &MLOperandDescriptor::new(MLOperandDataType::Float32, vec![4]),
+                )
+                .unwrap();
+            let negated = builder.neg(source).unwrap();
+            let source_copy = builder.identity(source).unwrap();
+            let mut mixed_graph = builder
+                .build(&MLNamedOperands::from([
+                    ("program", negated),
+                    ("source_copy", source_copy),
+                ]))
+                .unwrap();
             let input = tensor(&mut context, MLOperandDataType::Float32, &[4]);
             let first = tensor(&mut context, MLOperandDataType::Float32, &[4]);
             let second = tensor(&mut context, MLOperandDataType::Float32, &[4]);
@@ -160,8 +176,204 @@ fn arithmetic_alias_fanout_uses_native_results_not_original_input_bytes() {
             let expected = bytemuck::cast_slice::<f32, u8>(&[-1., 2., -3., 4.]);
             assert_eq!(read(&mut context, &first), expected);
             assert_eq!(read(&mut context, &second), expected);
+            let Some(BackendStatistics::Coreml(stats)) = context.rustnn_backend_statistics() else {
+                panic!("missing CoreML statistics");
+            };
+            assert_eq!(stats.proven_copy_outputs, 0);
             context.write_tensor(&first, &[0f32; 4]).unwrap();
             assert_eq!(read(&mut context, &second), expected);
+
+            context
+                .dispatch(
+                    &mut mixed_graph,
+                    &MLNamedTensors::from([("fp32", &input)]),
+                    &MLNamedTensors::from([("program", &first), ("source_copy", &second)]),
+                )
+                .unwrap();
+            assert_eq!(read(&mut context, &first), expected);
+            assert_eq!(
+                read(&mut context, &second),
+                bytemuck::cast_slice::<f32, u8>(&[1., -2., 3., -4.])
+            );
+            let Some(BackendStatistics::Coreml(before_failure)) =
+                context.rustnn_backend_statistics()
+            else {
+                panic!("missing CoreML statistics");
+            };
+            assert_eq!(before_failure.proven_copy_outputs, 1);
+            assert!(
+                context
+                    .dispatch(
+                        &mut mixed_graph,
+                        &MLNamedTensors::new(),
+                        &MLNamedTensors::from([("program", &first), ("source_copy", &second)]),
+                    )
+                    .is_err()
+            );
+            let Some(BackendStatistics::Coreml(after_failure)) =
+                context.rustnn_backend_statistics()
+            else {
+                panic!("missing CoreML statistics");
+            };
+            assert_eq!(
+                after_failure.proven_copy_outputs - before_failure.proven_copy_outputs,
+                0
+            );
+        }
+    }
+}
+
+#[test]
+fn typed_pipeline_counts_only_public_copies_after_successful_dispatch() {
+    use prost::Message;
+    use rustnn::converters::{CoremlMlProgramConverter, GraphConverter};
+    use rustnn::error::{Error, GraphError};
+    use rustnn::graph::{
+        ConstantData, DataType, GraphInfo, Operand, OperandDescriptor, OperandKind,
+    };
+    use rustnn::operators::Operation;
+    use rustnn::protos::coreml::specification::{Model, model};
+
+    let constant_bytes: Vec<_> = [1u32, 0x8000_0000, 0x3f80_0001, 0x7fc1_2345]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect();
+    let operand = |name: &str, kind, data_type| Operand {
+        name: Some(name.into()),
+        kind,
+        descriptor: OperandDescriptor {
+            data_type,
+            shape: rustnn::graph::to_dimension_vector(&[4]),
+            pending_permutation: vec![],
+        },
+    };
+    let graph_info = GraphInfo {
+        operands: vec![
+            operand("source", OperandKind::Input, DataType::Float32),
+            operand("constant", OperandKind::Constant, DataType::Float32),
+            operand("input.copy", OperandKind::Output, DataType::Float32),
+            operand("constant.copy", OperandKind::Output, DataType::Float32),
+            operand("half", OperandKind::Intermediate, DataType::Float16),
+            operand("rounded", OperandKind::Output, DataType::Float32),
+        ],
+        input_operands: vec![0],
+        output_operands: vec![2, 3, 5],
+        operations: vec![
+            Operation::Identity {
+                input: 0,
+                options: None,
+                outputs: vec![2],
+            },
+            Operation::Cast {
+                input: 1,
+                data_type: MLOperandDataType::Float32,
+                options: None,
+                outputs: vec![3],
+            },
+            Operation::Cast {
+                input: 0,
+                data_type: MLOperandDataType::Float16,
+                options: None,
+                outputs: vec![4],
+            },
+            Operation::Cast {
+                input: 4,
+                data_type: MLOperandDataType::Float32,
+                options: None,
+                outputs: vec![5],
+            },
+        ],
+        constant_operand_ids_to_handles: [(
+            1,
+            ConstantData {
+                data: constant_bytes.clone(),
+                label: None,
+            },
+        )]
+        .into(),
+        ..Default::default()
+    };
+    let converted = CoremlMlProgramConverter.convert(&graph_info).unwrap();
+    assert!(matches!(
+        Model::decode(converted.data.as_slice()).unwrap().r#type,
+        Some(model::Type::Pipeline(_))
+    ));
+    let values = [1.0003f32, 1.0007, -0.0, 2f32.powi(-24)];
+    let input_bytes = bytemuck::cast_slice::<f32, u8>(&values);
+    let rounded_bytes: Vec<_> = values
+        .into_iter()
+        .flat_map(|value| half::f16::from_f32(value).to_f32().to_le_bytes())
+        .collect();
+    let copy_count = |context: &MLContext<'_>| {
+        let Some(BackendStatistics::Coreml(stats)) = context.rustnn_backend_statistics() else {
+            panic!("missing CoreML statistics");
+        };
+        stats.proven_copy_outputs
+    };
+
+    for (reuse, backings) in [(false, false), (true, false), (true, true)] {
+        let mut context = context(reuse, backings);
+        let mut graph = context.rustnn_build_graph(graph_info.clone()).unwrap();
+        let input = tensor(&mut context, MLOperandDataType::Float32, &[4]);
+        let input_copy = tensor(&mut context, MLOperandDataType::Float32, &[4]);
+        let constant_copy = tensor(&mut context, MLOperandDataType::Float32, &[4]);
+        let rounded = tensor(&mut context, MLOperandDataType::Float32, &[4]);
+        for completed in 1..=2 {
+            context.write_tensor(&input, input_bytes).unwrap();
+            context
+                .dispatch(
+                    &mut graph,
+                    &MLNamedTensors::from([("source", &input)]),
+                    &MLNamedTensors::from([
+                        ("input.copy", &input_copy),
+                        ("constant.copy", &constant_copy),
+                        ("rounded", &rounded),
+                    ]),
+                )
+                .unwrap();
+            assert_eq!(copy_count(&context), 2 * completed);
+            assert_eq!(read(&mut context, &input_copy), input_bytes);
+            assert_eq!(read(&mut context, &constant_copy), constant_bytes);
+            assert_eq!(read(&mut context, &rounded), rounded_bytes);
+            context.write_tensor(&input_copy, &[0f32; 4]).unwrap();
+            context.write_tensor(&input, &[0f32; 4]).unwrap();
+            assert_eq!(read(&mut context, &constant_copy), constant_bytes);
+            assert_eq!(read(&mut context, &rounded), rounded_bytes);
+
+            // The public binding now agrees with a deliberately changed expected
+            // descriptor, so the native prediction must run before the actual
+            // four-element result is rejected. This is not an API-only failure.
+            let descriptor = graph.output_descriptors["rounded"].clone();
+            graph.output_descriptors.get_mut("rounded").unwrap().shape =
+                rustnn::graph::to_dimension_vector(&[3]);
+            let short = tensor(&mut context, MLOperandDataType::Float32, &[3]);
+            let error = context
+                .dispatch(
+                    &mut graph,
+                    &MLNamedTensors::from([("source", &input)]),
+                    &MLNamedTensors::from([
+                        ("input.copy", &input_copy),
+                        ("constant.copy", &constant_copy),
+                        ("rounded", &short),
+                    ]),
+                )
+                .unwrap_err();
+            let Error::GraphDispatchError { source } = error else {
+                panic!("expected backend output validation failure: {error:?}");
+            };
+            assert!(
+                matches!(
+                    source.downcast_ref::<GraphError>(),
+                    Some(GraphError::RuntimeStaticDimensionMismatch {
+                        name, expected: 3, actual: 4, ..
+                    }) if name == "rounded"
+                ),
+                "{source:?}"
+            );
+            assert_eq!(copy_count(&context), 2 * completed);
+            graph
+                .output_descriptors
+                .insert("rounded".into(), descriptor);
         }
     }
 }
