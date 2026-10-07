@@ -218,6 +218,12 @@ test-coreml-pipeline:
 lint-coreml:
 	$(CARGO) clippy --all-targets --no-default-features --features $(COREML_FEATURES) -- -D warnings
 
+.PHONY: test-coreml-matmul
+test-coreml-matmul:
+	$(CARGO) test --lib --no-default-features --features $(COREML_FEATURES) -- exact_matmul --test-threads=1
+	$(CARGO) test --lib --no-default-features --features $(COREML_FEATURES) -- coreml::matmul --test-threads=1
+	$(CARGO) test --lib --no-default-features --features $(COREML_FEATURES) -- recurrent_cancellation_oracle --test-threads=1
+
 .PHONY: test-coreml-quantized-dynamic-shapes
 test-coreml-quantized-dynamic-shapes:
 	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_quantized_dynamic_shapes -- $(TEST_FILTER) --test-threads=1

@@ -35,10 +35,11 @@ struct Stage {
     execution: StageExecution,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 enum StageExecution {
     Native,
     FloatCast(float_cast::Direction),
+    ExactMatmul(Box<matmul::Plan>),
 }
 
 pub(super) struct SourcePlan {
@@ -314,6 +315,32 @@ impl SourcePlan {
     pub(super) fn parse(bytes: &[u8]) -> Result<Option<Self>, GraphError> {
         let model = Model::decode(bytes)
             .map_err(|error| boundary_error(format!("invalid CoreML source: {error}")))?;
+        if let Some(plan) = matmul::classify(&model, bytes)? {
+            let description = model
+                .description
+                .as_ref()
+                .expect("classifier checks description");
+            let inputs = arrays(&description.input)?;
+            let outputs = arrays(&description.output)?;
+            return Ok(Some(Self {
+                aliases: source_aliases(description)?,
+                stages: vec![Stage {
+                    source: bytes.to_vec(),
+                    inputs: description.input.clone(),
+                    outputs: description.output.clone(),
+                    release_after: inputs
+                        .keys()
+                        .filter(|name| !outputs.contains_key(*name))
+                        .cloned()
+                        .collect(),
+                    has_weights: matches!(plan.left.source, matmul::Source::Blob { .. })
+                        || matches!(plan.right.source, matmul::Source::Blob { .. }),
+                    execution: StageExecution::ExactMatmul(Box::new(plan)),
+                }],
+                inputs,
+                outputs,
+            }));
+        }
         if matches!(model.r#type, Some(model::Type::MlProgram(_)))
             && let Some(direction) = float_cast::classify(&model, bytes)
         {
@@ -416,8 +443,12 @@ impl SourcePlan {
                 outputs: child_description.output.clone(),
                 release_after: vec![],
                 has_weights: program_weights(program)?,
-                execution: float_cast::classify(child, wire)
-                    .map_or(StageExecution::Native, StageExecution::FloatCast),
+                execution: if let Some(plan) = matmul::classify(child, wire)? {
+                    StageExecution::ExactMatmul(Box::new(plan))
+                } else {
+                    float_cast::classify(child, wire)
+                        .map_or(StageExecution::Native, StageExecution::FloatCast)
+                },
             });
         }
         for (name, feature) in &outputs {
@@ -580,6 +611,7 @@ pub(crate) struct PipelineModel {
     source_root: tempfile::TempDir,
     device: DeviceType,
     weights: Option<MappedWeights>,
+    scratch: RefCell<matmul::kernel::certified::Scratch>,
 }
 
 impl std::fmt::Debug for PipelineModel {
@@ -640,6 +672,16 @@ impl PipelineModel {
         } else {
             None
         };
+        for stage in &plan.stages {
+            if let StageExecution::ExactMatmul(plan) = &stage.execution {
+                for operand in [&plan.left, &plan.right] {
+                    if !matches!(operand.source, matmul::Source::Input(_)) {
+                        // Reject every source span/view before any MLModel load.
+                        operand.constant(mapped.as_ref().map(MappedWeights::bytes))?;
+                    }
+                }
+            }
+        }
         let diagnostics = LoadTrace::new(device).finish(
             if first_native.is_some() {
                 CoremlLoadRoute::CompiledUrl
@@ -662,6 +704,7 @@ impl PipelineModel {
             source_root: root,
             device,
             weights: mapped,
+            scratch: RefCell::new(matmul::kernel::certified::Scratch::default()),
         };
         // Establish an actual successful load, without compiling the opaque
         // Pipeline or retaining all children. Later children remain lazy.
@@ -932,6 +975,13 @@ impl PipelineModel {
                     }
                     return Ok(());
                 }
+                if let StageExecution::ExactMatmul(plan) = &stage.execution {
+                    self.predict_matmul(stage, plan, &mut values)?;
+                    for name in &stage.release_after {
+                        values.remove(name);
+                    }
+                    return Ok(());
+                }
                 let model = self.load_child(index)?;
                 let dictionary: *mut Object = msg_send![class!(NSMutableDictionary), dictionary];
                 let description: *mut Object = msg_send![model, modelDescription];
@@ -1064,7 +1114,123 @@ impl PipelineModel {
         }
         Ok(())
     }
+
+    unsafe fn matmul_operand<'a>(
+        &'a self,
+        operand: &'a matmul::Operand,
+        values: &'a HashMap<String, ReleaseOnDrop>,
+    ) -> Result<matmul::kernel::TensorView<'a>, GraphError> {
+        let (data, shape, strides) = match &operand.source {
+            matmul::Source::Blob { .. } | matmul::Source::Immediate(_) => {
+                operand.constant(self.weights.as_ref().map(MappedWeights::bytes))?
+            }
+            matmul::Source::Input(name) => {
+                let feature = values.get(name).ok_or_else(|| {
+                    boundary_error(format!("exact matrix operand `{name}` is absent"))
+                })?;
+                let array: *mut Object = msg_send![feature.0, multiArrayValue];
+                let (kind, layout, pointer) = unsafe { multiarray_storage(array)? };
+                if kind != NativeType::Float32 {
+                    return Err(boundary_error("exact matrix operand is not native Float32"));
+                }
+                let span = layout
+                    .shape
+                    .iter()
+                    .zip(&layout.strides)
+                    .try_fold(0usize, |n, (&d, &s)| {
+                        d.saturating_sub(1)
+                            .checked_mul(s)
+                            .and_then(|x| n.checked_add(x))
+                    })
+                    .and_then(|x| x.checked_add(1))
+                    .ok_or_else(|| boundary_error("native matrix span overflow"))?;
+                if !(pointer as usize).is_multiple_of(4)
+                    || span
+                        .checked_mul(4)
+                        .is_none_or(|bytes| bytes > isize::MAX as usize)
+                {
+                    return Err(boundary_error("unaligned/overflow native matrix span"));
+                }
+                let (shape, strides) = operand.geometry(&layout.shape, &layout.strides)?;
+                // SAFETY: original native MLMultiArray owns the validated typed
+                // span and its feature remains live through this stage.
+                let data = unsafe { std::slice::from_raw_parts(pointer.cast::<f32>(), span) };
+                (data, shape, strides)
+            }
+        };
+        matmul::kernel::TensorView::strided(data, &shape, &strides)
+            .map_err(|e| boundary_error(e.to_string()))
+    }
+
+    unsafe fn predict_matmul(
+        &self,
+        stage: &Stage,
+        plan: &matmul::Plan,
+        values: &mut HashMap<String, ReleaseOnDrop>,
+    ) -> Result<(), GraphError> {
+        let shape: Vec<_> = plan
+            .output_shape
+            .iter()
+            .map(|&x| {
+                i64::try_from(x).map_err(|_| boundary_error("matrix output dimension overflows"))
+            })
+            .collect::<Result<_, _>>()?;
+        let output = unsafe { create_multi_array(&shape, NativeType::Float32.code())? };
+        let (kind, layout, pointer) = unsafe { multiarray_storage(output)? };
+        if kind != NativeType::Float32
+            || !layout.contiguous
+            || !(pointer as usize).is_multiple_of(4)
+        {
+            return Err(boundary_error("exact matrix output backing differs"));
+        }
+        unsafe { validate_source_feature(&stage.outputs[0], output)? };
+        {
+            let left = unsafe { self.matmul_operand(&plan.left, values)? };
+            let right = unsafe { self.matmul_operand(&plan.right, values)? };
+            let mut scratch = self
+                .scratch
+                .try_borrow_mut()
+                .map_err(|_| boundary_error("reentrant exact matrix execution"))?;
+            // SAFETY: new native output is disjoint from immutable inputs and
+            // weights; positive native shape/count/layout were checked above.
+            let result =
+                unsafe { std::slice::from_raw_parts_mut(pointer.cast::<f32>(), layout.count) };
+            let report = matmul::kernel::certified::matmul_into(
+                &left,
+                &right,
+                matmul::kernel::Options {
+                    transpose_a: plan.transpose_left,
+                    transpose_b: plan.transpose_right,
+                },
+                result,
+                &mut scratch,
+            )
+            .map_err(|e| boundary_error(e.to_string()))?;
+            if report.shape != plan.output_shape
+                || report.checked_outputs != layout.count
+                || report.integer_fallbacks > report.checked_outputs
+                || report.scratch_bytes > 65536
+            {
+                return Err(boundary_error("exact matrix execution report differs"));
+            }
+        }
+        let value: *mut Object =
+            msg_send![class!(MLFeatureValue),featureValueWithMultiArray:output];
+        let owned: *mut Object = msg_send![value, retain];
+        if owned.is_null()
+            || values
+                .insert(plan.output.clone(), ReleaseOnDrop(owned))
+                .is_some()
+        {
+            return Err(boundary_error("exact matrix output was not unique"));
+        }
+        Ok(())
+    }
 }
+
+#[cfg(test)]
+#[path = "coreml_matmul_integration_tests.rs"]
+mod integration_tests;
 
 unsafe fn validate_source_feature(
     feature: &FeatureDescription,

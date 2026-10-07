@@ -80,6 +80,103 @@ fn constant(operation: &MilOperation) -> bool {
     operation.r#type == "const" || operation.r#type.starts_with("constexpr_")
 }
 
+fn static_float32_shape(value: &NamedValueType) -> Option<Vec<usize>> {
+    let tensor = tensor(value)?;
+    if tensor.data_type != MilDataType::Float32 as i32 {
+        return None;
+    }
+    tensor
+        .dimensions
+        .iter()
+        .map(|dimension| match &dimension.dimension {
+            Some(crate::protos::coreml::mil_spec::dimension::Dimension::Constant(size)) => {
+                usize::try_from(size.size).ok().filter(|&size| size > 0)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn contiguous_matrix_strides(shape: &[usize]) -> Option<Vec<usize>> {
+    let mut stride = 1usize;
+    let mut strides = vec![0; shape.len()];
+    for axis in (0..shape.len()).rev() {
+        strides[axis] = stride;
+        stride = stride.checked_mul(shape[axis])?;
+    }
+    Some(strides)
+}
+
+/// Only borrow constants through lossless views supported by the typed executor.
+/// Unsupported arithmetic/constexpr closures keep the existing native route.
+fn exact_matrix_constant_views(
+    operations: &[MilOperation],
+    constant_operations: &HashSet<usize>,
+) -> HashSet<String> {
+    let mut views = HashMap::<String, (Vec<usize>, Vec<usize>)>::new();
+    for (index, operation) in operations.iter().enumerate() {
+        if !constant_operations.contains(&index) || operation.outputs.len() != 1 {
+            continue;
+        }
+        let output = &operation.outputs[0];
+        let Some(shape) = static_float32_shape(output) else {
+            continue;
+        };
+        let geometry = (|| {
+            if operation.r#type == "const" {
+                return Some((shape.clone(), contiguous_matrix_strides(&shape)?));
+            }
+            let (input_shape, input_strides) = views.get(named_input(operation, "x")?)?;
+            match operation.r#type.as_str() {
+                "identity" if *input_shape == shape => Some((shape.clone(), input_strides.clone())),
+                "transpose" => {
+                    let axes = integer_argument(operation, "perm")?
+                        .iter()
+                        .map(|&axis| usize::try_from(axis).ok())
+                        .collect::<Option<Vec<_>>>()?;
+                    if axes.len() != input_shape.len()
+                        || axes.iter().any(|&axis| axis >= axes.len())
+                        || axes.iter().copied().collect::<HashSet<_>>().len() != axes.len()
+                        || axes
+                            .iter()
+                            .map(|&axis| input_shape[axis])
+                            .collect::<Vec<_>>()
+                            != shape
+                    {
+                        return None;
+                    }
+                    Some((
+                        shape.clone(),
+                        axes.iter().map(|&axis| input_strides[axis]).collect(),
+                    ))
+                }
+                "reshape" => {
+                    let contiguous = contiguous_matrix_strides(input_shape)?;
+                    if input_shape
+                        .iter()
+                        .zip(input_strides)
+                        .zip(&contiguous)
+                        .any(|((&size, &stride), &expected)| size > 1 && stride != expected)
+                        || integer_argument(operation, "shape")?
+                            .iter()
+                            .map(|&size| usize::try_from(size).ok())
+                            .collect::<Option<Vec<_>>>()?
+                            != shape
+                    {
+                        return None;
+                    }
+                    Some((shape.clone(), contiguous_matrix_strides(&shape)?))
+                }
+                _ => None,
+            }
+        })();
+        if let Some(geometry) = geometry {
+            views.insert(output.name.clone(), geometry);
+        }
+    }
+    views.into_keys().collect()
+}
+
 fn constant_closure(operations: &[MilOperation]) -> HashSet<usize> {
     use crate::protos::coreml::mil_spec::{tensor_value, value};
     let exact_unit_transport = |operation: &MilOperation| {
@@ -1359,7 +1456,61 @@ impl CoremlMlProgramConverter {
             })
             .collect();
         let constant_operations = constant_closure(&block.operations);
+        let exact_constant_views =
+            exact_matrix_constant_views(&block.operations, &constant_operations);
         let mut cuts = BTreeSet::new();
+        let exact_matmul_results: HashSet<_> = graph
+            .operations
+            .iter()
+            .filter(|op| matches!(op, Operation::Matmul { .. } | Operation::Gemm { .. }))
+            .filter(|op| {
+                op.inputs()
+                    .into_iter()
+                    .chain(op.outputs().iter().copied())
+                    .all(|id| {
+                        graph.operand(id).is_some_and(|operand| {
+                            operand.descriptor.data_type == DataType::Float32
+                                && operand.descriptor.static_shape().is_some()
+                                && operand.descriptor.pending_permutation.is_empty()
+                        })
+                    })
+            })
+            .flat_map(|op| op.outputs())
+            .filter(|&&id| {
+                graph
+                    .operand(id)
+                    .is_some_and(|o| o.descriptor.data_type == DataType::Float32)
+            })
+            .flat_map(|&id| {
+                let name = operand_name(graph, id);
+                [
+                    name.clone(),
+                    crate::converters::coreml_names::encode(&name).into_owned(),
+                ]
+            })
+            .collect();
+        let exact_matmul_results: HashSet<_> = block
+            .operations
+            .iter()
+            .filter(|operation| {
+                operation.r#type == "matmul"
+                    && ["x", "y"].into_iter().all(|key| {
+                        named_input(operation, key).is_some_and(|name| {
+                            types.get(name).and_then(static_float32_shape).is_some()
+                                && producers.get(name).is_none_or(|producer| {
+                                    !constant_operations.contains(producer)
+                                        || exact_constant_views.contains(name)
+                                })
+                        })
+                    })
+            })
+            .flat_map(|operation| &operation.outputs)
+            .filter(|output| {
+                exact_matmul_results.contains(&output.name)
+                    && static_float32_shape(output).is_some()
+            })
+            .map(|output| output.name.clone())
+            .collect();
         let graph_outputs: HashSet<_> = block.outputs.iter().cloned().collect();
         let float32_affine_layer_norm_inputs: HashSet<_> = graph
             .operations
@@ -1409,6 +1560,20 @@ impl CoremlMlProgramConverter {
             cuts.insert(producers[last] + 1);
         }
         for (index, operation) in block.operations.iter().enumerate() {
+            if operation.r#type == "matmul"
+                && operation
+                    .outputs
+                    .iter()
+                    .any(|value| exact_matmul_results.contains(&value.name))
+                && operation.outputs.iter().all(|value| {
+                    tensor(value).is_some_and(|t| t.data_type == MilDataType::Float32 as i32)
+                })
+            {
+                // Keep a complete matrix product source-visible to the typed
+                // executor, including its original constant/view closure.
+                cuts.insert(index);
+                cuts.insert(index + 1);
+            }
             if !constant_operations.contains(&index)
                 && operation
                     .outputs
@@ -1529,6 +1694,22 @@ impl CoremlMlProgramConverter {
         cuts.remove(&0);
         cuts.remove(&block.operations.len());
         if cuts.is_empty() {
+            if block.operations.iter().any(|op| {
+                op.r#type == "matmul"
+                    && op
+                        .outputs
+                        .iter()
+                        .any(|v| exact_matmul_results.contains(&v.name))
+            }) {
+                model
+                    .description
+                    .as_mut()
+                    .unwrap()
+                    .metadata
+                    .get_or_insert_with(Default::default)
+                    .user_defined
+                    .insert("rustnn.webnn.exact_f32_matmul".into(), "1".into());
+            }
             return Ok(model);
         }
         let shapes = shape_bounds_seeded(graph, &types, &block.operations, &packed.shapes);
@@ -1576,6 +1757,12 @@ impl CoremlMlProgramConverter {
             }
             let mut required: HashSet<_> = block.operations[start..end]
                 .iter()
+                .enumerate()
+                // Constant/view closures are not emitted merely because they
+                // fall inside this cut. Start from actual work and live
+                // outputs, then inject only the constants they consume.
+                .filter(|(index, _)| !constant_operations.contains(&(start + index)))
+                .map(|(_, operation)| operation)
                 .flat_map(inputs)
                 .collect();
             required.extend(outputs.iter().cloned());
@@ -1701,6 +1888,23 @@ impl CoremlMlProgramConverter {
             stage_function
                 .block_specializations
                 .insert(function.opset.clone(), stage_block);
+            if stage_function.block_specializations[&function.opset]
+                .operations
+                .iter()
+                .any(|op| {
+                    op.r#type == "matmul"
+                        && op
+                            .outputs
+                            .iter()
+                            .any(|v| exact_matmul_results.contains(&v.name))
+                })
+            {
+                description
+                    .metadata
+                    .get_or_insert_with(Default::default)
+                    .user_defined
+                    .insert("rustnn.webnn.exact_f32_matmul".into(), "1".into());
+            }
             models.push(Model {
                 specification_version: model.specification_version,
                 description: Some(description),

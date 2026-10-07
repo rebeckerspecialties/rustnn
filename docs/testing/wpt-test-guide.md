@@ -79,6 +79,7 @@ trtx::clamp::clamp_uint64_1D_tensor_with_bigint_max
 | `make test-wpt-litert` | Full suite, LiteRT backend |
 | `make test-wpt-coreml` | Full suite, CoreML backend (macOS); `make test-wpt-coreml-report` also writes the JSON report |
 | `make test-coreml-pipeline` | Bounded native Pipeline, typed Cast and weight-repacking regressions |
+| `make test-coreml-matmul` | Exact matrix source proofs, arithmetic and signed 256-step own-carry regressions |
 | `make test-wpt-op OP=<name>` | Filter trials by operation (e.g. `OP=add`, `OP=dequantize`); `WPT_BACKEND=<backend>` selects the backend |
 | `make test-wpt-report` | Full run with JSON/HTML reports even on failures; `WPT_BACKEND=onnx|trtx|litert|coreml` picks the backend |
 
