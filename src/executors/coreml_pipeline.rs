@@ -609,7 +609,6 @@ impl Drop for PipelineModel {
 }
 
 impl PipelineModel {
-    #[cfg(test)]
     pub(super) fn feature_aliases(&self) -> &CoremlFeatureAliases {
         &self.plan.aliases
     }
@@ -881,6 +880,48 @@ impl PipelineModel {
                     return Err(boundary_error("duplicate bound Pipeline input"));
                 }
             }
+            Ok(())
+        })?;
+        let values = self.predict_features(values)?;
+        self.extract_outputs(&values, outputs, passthroughs)
+    }
+
+    pub(super) fn input_dtype(
+        &self,
+        name: &str,
+        descriptor: &OperandDescriptor,
+    ) -> Result<i32, GraphError> {
+        let physical = self
+            .plan
+            .aliases
+            .inputs
+            .get(name)
+            .map_or(name, String::as_str);
+        let feature =
+            self.plan.inputs.get(physical).ok_or_else(|| {
+                boundary_error(format!("Pipeline input `{name}` is not declared"))
+            })?;
+        let mut shape = descriptor
+            .static_shape()
+            .ok_or_else(|| boundary_error("Pipeline input requires its actual bound shape"))?
+            .into_iter()
+            .map(i64::from)
+            .collect::<Vec<_>>();
+        if shape.is_empty() {
+            shape.push(1);
+        }
+        let constraint = array_type(feature)?;
+        validate_feature_shape(constraint, &shape)?;
+        Ok(constraint.data_type)
+    }
+
+    /// Retained input features remain owned by the caller throughout prediction.
+    /// Only live stage values are kept; no public output backings enter children.
+    pub(super) fn predict_features(
+        &self,
+        mut values: HashMap<String, ReleaseOnDrop>,
+    ) -> Result<HashMap<String, ReleaseOnDrop>, GraphError> {
+        autoreleasepool(|| unsafe {
             for binding in &self.plan.aliases.compact_input_views {
                 let source = values
                     .get(&binding.source)
@@ -996,32 +1037,52 @@ impl PipelineModel {
                 Ok(())
             })?;
         }
+        Ok(values)
+    }
+
+    pub(super) unsafe fn output_array(
+        &self,
+        name: &str,
+        descriptor: &OperandDescriptor,
+        values: &HashMap<String, ReleaseOnDrop>,
+    ) -> Result<*mut Object, GraphError> {
+        let physical = self
+            .plan
+            .aliases
+            .outputs
+            .get(name)
+            .map_or(name, String::as_str);
+        let declared =
+            self.plan.outputs.get(physical).ok_or_else(|| {
+                boundary_error(format!("Pipeline output `{name}` is not declared"))
+            })?;
+        let value = values
+            .get(physical)
+            .ok_or_else(|| boundary_error(format!("Pipeline output `{name}` is absent")))?;
+        let array: *mut Object = msg_send![value.0, multiArrayValue];
+        unsafe { validate_source_feature(declared, array)? };
+        let (_, layout, _) = unsafe { multiarray_storage(array)? };
+        let mut actual = layout.shape.clone();
+        if descriptor.shape.is_empty() && actual == [1] {
+            actual.clear();
+        }
+        RuntimeShapeState::new().validate_shape(name, &actual, descriptor, TensorKind::Output)?;
+        Ok(array)
+    }
+
+    fn extract_outputs(
+        &self,
+        values: &HashMap<String, ReleaseOnDrop>,
+        outputs: &HashMap<String, OperandDescriptor>,
+        passthroughs: HashMap<String, Vec<u8>>,
+    ) -> Result<HashMap<String, Vec<u8>>, GraphError> {
         autoreleasepool(|| unsafe {
             let mut result = passthroughs;
             for (name, descriptor) in outputs {
                 if result.contains_key(name) {
                     continue;
                 }
-                let physical = self.plan.aliases.outputs.get(name).unwrap_or(name);
-                let declared = self.plan.outputs.get(physical).ok_or_else(|| {
-                    boundary_error(format!("Pipeline output `{name}` is not declared"))
-                })?;
-                let value = values
-                    .get(physical)
-                    .ok_or_else(|| boundary_error(format!("Pipeline output `{name}` is absent")))?;
-                let array: *mut Object = msg_send![value.0, multiArrayValue];
-                validate_source_feature(declared, array)?;
-                let (_, layout, _) = multiarray_storage(array)?;
-                let mut actual = layout.shape.clone();
-                if descriptor.shape.is_empty() && actual == [1] {
-                    actual.clear();
-                }
-                RuntimeShapeState::new().validate_shape(
-                    name,
-                    &actual,
-                    descriptor,
-                    TensorKind::Output,
-                )?;
+                let array = self.output_array(name, descriptor, values)?;
                 result.insert(name.clone(), extract_multiarray_bytes(array, descriptor)?);
             }
             Ok(result)

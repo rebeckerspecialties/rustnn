@@ -10,6 +10,13 @@ use rustnn::operator_options::{MLArgMinMaxOptions, MLGatherOptions, MLPadOptions
 use rustnn::operators::Operation;
 use rustnn::protos::coreml::specification::{self, Model, model};
 
+#[path = "common/half_reference.rs"]
+mod half_reference;
+
+fn reference_half(value: f32) -> half::f16 {
+    half::f16::from_bits(half_reference::reference_half_bits(f64::from(value)))
+}
+
 fn operand(name: &str, kind: OperandKind, dtype: DataType, shape: &[Dimension]) -> Operand {
     Operand {
         name: Some(name.into()),
@@ -128,10 +135,302 @@ fn precision_pipeline_binds_escaped_logical_names_without_losing_rounding() {
         for (&actual, &source) in result.data.iter().zip(&input) {
             assert_eq!(
                 actual.to_bits(),
-                half::f16::from_f32(source).to_f32().to_bits(),
+                reference_half(source).to_f32_const().to_bits(),
                 "{}",
                 attempt.compute_unit
             );
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "coreml-runtime"))]
+#[test]
+fn constant_transpose_uses_asset_without_policy_fallback() {
+    use rustnn::backend_selection::{BackendDevice, DeviceType};
+    use rustnn::executors::coreml::CoremlLoadRoute;
+    use rustnn::mlcontext::{
+        LoadDiagnostics, MLContext, MLContextOptions, MLNamedTensors, MLPowerPreference,
+        MLTensorDescriptor, RustNNOptions,
+    };
+
+    // Upstream WPT transpose_float32_1D_constant_tensor_default_options.
+    // Its data-free URL model crashes BNNS compilation under CPU+ANE on the
+    // affected stack. Keep the exact bits and independently verify route,
+    // requested policy and output bytes in all tensor-storage modes.
+    let values = [
+        0xc236b29e_u32,
+        0x4255d645,
+        0xc2707956,
+        0x421853b6,
+        0x429d48f2,
+        0xc28a81a9,
+        0x3febf673,
+        0x42b99edd,
+        0x4260667a,
+        0x429a1de4,
+        0x4265df50,
+        0xc2a97c76,
+        0x42398aa4,
+        0xc2a9cb98,
+        0x4262d14b,
+        0xc1cd8fa8,
+        0x40b3e8d9,
+        0xc1cd4d72,
+        0x42c6ecfa,
+        0xc2af2dac,
+        0xc282c17d,
+        0xc2840512,
+        0x4219de08,
+        0x400ccbca,
+    ];
+    let bytes: Vec<_> = values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    let shape = [Dimension::Static(values.len() as u32)];
+    let source = GraphInfo {
+        operands: vec![
+            operand("constant", OperandKind::Constant, DataType::Float32, &shape),
+            operand(
+                "transposeOutput",
+                OperandKind::Output,
+                DataType::Float32,
+                &shape,
+            ),
+        ],
+        output_operands: vec![1],
+        operations: vec![Operation::Transpose {
+            input: 0,
+            options: None,
+            outputs: vec![1],
+        }],
+        constant_operand_ids_to_handles: [(
+            0,
+            ConstantData {
+                data: bytes.clone(),
+                label: None,
+            },
+        )]
+        .into(),
+        ..Default::default()
+    };
+    for policy in [DeviceType::Cpu, DeviceType::Gpu, DeviceType::Npu] {
+        for (reuse, backings) in [(false, false), (true, false), (true, true)] {
+            let mut options = RustNNOptions::default();
+            options.coreml.reuse_tensor_storage = reuse;
+            options.coreml.output_backings = backings;
+            let mut context = MLContext::create(
+                &MLContextOptions::new(MLPowerPreference::Default, policy != DeviceType::Cpu)
+                    .with_rustnn_device_hint(BackendDevice::Coreml {
+                        device_type: policy,
+                    })
+                    .with_rustnn_options(options),
+            )
+            .unwrap();
+            let mut graph = context.rustnn_build_graph(source.clone()).unwrap();
+            let Some(LoadDiagnostics::Coreml(load)) = graph.rustnn_load_diagnostics() else {
+                panic!("missing CoreML load diagnostics");
+            };
+            assert_eq!(load.route, CoremlLoadRoute::InMemoryAsset);
+            assert_eq!(load.requested_compute_units, load.loaded_compute_units);
+            assert!(load.failures.is_empty(), "{load:?}");
+            let output = context
+                .create_tensor(
+                    &MLTensorDescriptor::new(MLOperandDataType::Float32, vec![24]).to_readable(),
+                )
+                .unwrap();
+            context
+                .dispatch(
+                    &mut graph,
+                    &MLNamedTensors::new(),
+                    &MLNamedTensors::from([("transposeOutput", &output)]),
+                )
+                .unwrap();
+            let mut actual = vec![0u8; bytes.len()];
+            context.read_tensor(&output, &mut actual).unwrap();
+            assert_eq!(
+                actual, bytes,
+                "{policy:?}, reuse={reuse}, backings={backings}"
+            );
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "coreml-runtime"))]
+#[test]
+fn precision_pipeline_preserves_typed_boundaries_with_retained_tensor_storage() {
+    // Bitwise preservation of signed zero and represented subnormals is a
+    // recurrent-state fidelity check beyond WPT's numeric comparator. Keep it
+    // local rather than inventing a composed-graph WebNN tolerance.
+    use rustnn::backend_selection::{BackendDevice, DeviceType};
+    use rustnn::mlcontext::{
+        BackendStatistics, MLContext, MLContextOptions, MLNamedTensors, MLPowerPreference,
+        MLTensorDescriptor, RustNNOptions,
+    };
+
+    for policy in [DeviceType::Cpu, DeviceType::Gpu, DeviceType::Npu] {
+        for (reuse, backings) in [(false, false), (true, false), (true, true)] {
+            for half_input in [false, true] {
+                for shape in [
+                    vec![Dimension::Static(4)],
+                    #[cfg(feature = "dynamic-inputs")]
+                    vec![Dimension::Dynamic(rustnn::graph::DynamicDimension {
+                        name: "length".into(),
+                        max_size: 4,
+                    })],
+                ] {
+                    let dynamic = shape.iter().any(|d| !matches!(d, Dimension::Static(_)));
+                    let mut options = RustNNOptions::default();
+                    options.coreml.reuse_tensor_storage = reuse;
+                    options.coreml.output_backings = backings;
+                    let mut context = MLContext::create(
+                        &MLContextOptions::new(
+                            MLPowerPreference::Default,
+                            policy != DeviceType::Cpu,
+                        )
+                        .with_rustnn_device_hint(BackendDevice::Coreml {
+                            device_type: policy,
+                        })
+                        .with_rustnn_options(options),
+                    )
+                    .unwrap();
+                    let mut source = if half_input {
+                        direct_half_widening(&shape)
+                    } else {
+                        pair(&shape)
+                    };
+                    source.operands[0].name = Some("state input".into());
+                    let last = *source.output_operands.first().unwrap() as usize;
+                    source.operands[last].name = Some("state result".into());
+                    let converted = CoremlMlProgramConverter.convert(&source).unwrap();
+                    let is_pipeline = matches!(
+                        Model::decode(converted.data.as_slice()).unwrap().r#type,
+                        Some(model::Type::Pipeline(_))
+                    );
+                    if !half_input {
+                        assert!(
+                            is_pipeline,
+                            "narrow/widen must exercise the native Pipeline guard"
+                        );
+                    }
+                    let mut graph = context.rustnn_build_graph(source).unwrap();
+                    let Some(rustnn::mlcontext::LoadDiagnostics::Coreml(load)) =
+                        graph.rustnn_load_diagnostics()
+                    else {
+                        panic!("missing CoreML load diagnostics");
+                    };
+                    // Source-proven Cast-only plans execute exact typed host
+                    // conversion; other plans must honor the requested native
+                    // permission. A host stage is not native CPU placement.
+                    match load.route {
+                        rustnn::executors::coreml::CoremlLoadRoute::TypedHost => {
+                            assert_eq!(load.loaded_compute_units, "NOT_APPLICABLE");
+                        }
+                        rustnn::executors::coreml::CoremlLoadRoute::CompiledUrl => {
+                            assert_eq!(load.requested_compute_units, load.loaded_compute_units);
+                        }
+                        _ => panic!("typed boundaries bypassed the precision path: {load:?}"),
+                    }
+                    assert!(load.failures.is_empty(), "{load:?}");
+                    let input_type = if half_input {
+                        MLOperandDataType::Float16
+                    } else {
+                        MLOperandDataType::Float32
+                    };
+                    let mut input = context
+                        .create_tensor(
+                            &MLTensorDescriptor::new(input_type, vec![4])
+                                .to_readable()
+                                .to_writable(),
+                        )
+                        .unwrap();
+                    let mut output = context
+                        .create_tensor(
+                            &MLTensorDescriptor::new(MLOperandDataType::Float32, vec![4])
+                                .to_readable(),
+                        )
+                        .unwrap();
+                    // Reuse the same model and storage with changing contents, including
+                    // values that vanish if the Half boundary or compact view is lost.
+                    for (iteration, reverse) in [false, true, false].into_iter().enumerate() {
+                        let count = if dynamic {
+                            [1usize, 4, 2][iteration]
+                        } else {
+                            4
+                        };
+                        context
+                            .rustnn_resize_tensor(&mut input, &[count as u64])
+                            .unwrap();
+                        context
+                            .rustnn_resize_tensor(&mut output, &[count as u64])
+                            .unwrap();
+                        let mut half_bits = [0x8000u16, 1, 0x8001, 0x7bff];
+                        let mut values = if half_input {
+                            half_bits.map(|b| half::f16::from_bits(b).to_f32_const())
+                        } else {
+                            [1.0003, 1.0007, -0.0, -2f32.powi(-25)]
+                        };
+                        if reverse {
+                            values.reverse();
+                            half_bits.reverse();
+                        }
+                        let values = &values[..count];
+                        let bytes: Vec<u8> = if half_input {
+                            half_bits[..count]
+                                .iter()
+                                .flat_map(|b| b.to_le_bytes())
+                                .collect()
+                        } else {
+                            values.iter().flat_map(|v| v.to_le_bytes()).collect()
+                        };
+                        context.write_tensor(&input, &bytes).unwrap();
+                        context
+                            .dispatch(
+                                &mut graph,
+                                &MLNamedTensors::from([("state input", &input)]),
+                                &MLNamedTensors::from([("state result", &output)]),
+                            )
+                            .unwrap_or_else(|error| {
+                                panic!("{policy:?}, reuse={reuse}, backings={backings}, half_input={half_input}, dynamic={dynamic}, iteration={iteration}: {error}")
+                            });
+                        let mut result = vec![0f32; count];
+                        context.read_tensor(&output, &mut result).unwrap();
+                        for (&actual, &source) in result.iter().zip(values) {
+                            assert_eq!(
+                                actual.to_bits(),
+                                reference_half(source).to_f32_const().to_bits(),
+                                "{policy:?}, reuse={reuse}, backings={backings}, half_input={half_input}"
+                            );
+                        }
+                        let mut unchanged = vec![0u8; bytes.len()];
+                        context.read_tensor(&input, &mut unchanged).unwrap();
+                        assert_eq!(unchanged, bytes, "native output must not alias its input");
+                    }
+                    let Some(BackendStatistics::Coreml(statistics)) =
+                        context.rustnn_backend_statistics()
+                    else {
+                        panic!("missing CoreML storage statistics");
+                    };
+                    if reuse {
+                        assert_eq!(statistics.native_input_bindings, 3);
+                        assert_eq!(statistics.input_copy_bytes, 0);
+                    } else {
+                        assert_eq!(statistics.native_input_bindings, 0);
+                        assert_eq!(
+                            statistics.input_copy_bytes,
+                            (if half_input { 2 } else { 4 }) * (if dynamic { 7 } else { 12 })
+                        );
+                    }
+                    if is_pipeline {
+                        assert_eq!(statistics.output_backings_requested, 0);
+                        assert_eq!(statistics.output_backings_accepted, 0);
+                        assert_eq!(
+                            statistics.output_copy_bytes,
+                            4 * (if dynamic { 7 } else { 12 })
+                        );
+                    }
+                }
+            }
         }
     }
 }
@@ -292,7 +591,7 @@ fn precision_pipeline_dynamic_prelu_retains_binary_broadcast_provenance() {
             ConstantData {
                 data: [0.25f32, 0.5, 0.125, 0.75]
                     .iter()
-                    .flat_map(|&value| half::f16::from_f32(value).to_bits().to_le_bytes())
+                    .flat_map(|&value| reference_half(value).to_bits().to_le_bytes())
                     .collect(),
                 label: None,
             },
@@ -340,7 +639,7 @@ fn precision_pipeline_materializes_dynamic_float32_prelu_before_explicit_half_ca
             &MLOperandDescriptor::new(MLOperandDataType::Float16, vec![4]),
             [0.25f32, 0.5, 0.125, 0.75]
                 .iter()
-                .flat_map(|&x| half::f16::from_f32(x).to_bits().to_le_bytes())
+                .flat_map(|&x| reference_half(x).to_bits().to_le_bytes())
                 .collect(),
         )
         .unwrap();
@@ -490,7 +789,7 @@ fn precision_pipeline_materializes_widening_before_signed_zero_sensitive_math() 
 fn precision_pipeline_signed_zero_sensitive_half_math_preserves_all_encodings() {
     use rustnn::executors::coreml::{CoremlInput, run_coreml_with_inputs_with_weights};
     let values: Vec<_> = (0..=u16::MAX)
-        .map(|bits| half::f16::from_bits(bits).to_f32())
+        .map(|bits| half::f16::from_bits(bits).to_f32_const())
         .collect();
     for kind in ["reciprocal", "roundEven", "neg"] {
         let converted = CoremlMlProgramConverter
@@ -513,12 +812,12 @@ fn precision_pipeline_signed_zero_sensitive_half_math_preserves_all_encodings() 
                 .find(|output| output.name == "result")
                 .unwrap();
             for (index, (&actual, &input)) in result.data.iter().zip(&values).enumerate() {
-                let expected = half::f16::from_f32(match kind {
+                let expected = reference_half(match kind {
                     "reciprocal" => 1.0 / input,
                     "neg" => -input,
                     _ => input.round_ties_even(),
                 })
-                .to_f32();
+                .to_f32_const();
                 if expected.is_nan() {
                     assert!(
                         actual.is_nan(),
@@ -764,7 +1063,7 @@ fn precision_pipeline_packed_half_widening_preserves_special_value_bits() {
     ];
     let values: Vec<_> = bits
         .iter()
-        .map(|&bits| half::f16::from_bits(bits).to_f32())
+        .map(|&bits| half::f16::from_bits(bits).to_f32_const())
         .collect();
     let shape = [1, 16, 1, 1];
     let graph = direct_half_widening(&shape.map(Dimension::Static));
@@ -821,7 +1120,9 @@ fn precision_pipeline_packed_half_widening_restores_actual_dynamic_shape() {
     let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
     for length in [1usize, 3] {
         let expected: Vec<_> = (0..16 * length)
-            .map(|index| half::f16::from_bits(if index % 2 == 0 { 1 } else { 0x8000 }).to_f32())
+            .map(|index| {
+                half::f16::from_bits(if index % 2 == 0 { 1 } else { 0x8000 }).to_f32_const()
+            })
             .collect();
         let attempts = run_coreml_with_inputs_with_weights(
             &converted.data,
@@ -1517,7 +1818,7 @@ fn half_add_then_widen() -> GraphInfo {
                     -2.0f32.powi(-11),
                 ]
                 .iter()
-                .flat_map(|&x| half::f16::from_f32(x).to_bits().to_le_bytes())
+                .flat_map(|&x| reference_half(x).to_bits().to_le_bytes())
                 .collect(),
                 label: None,
             },
@@ -1997,7 +2298,7 @@ fn precision_pipeline_rounds_nonfolded_constant_transpose_casts() {
         .unwrap();
     let expected: Vec<_> = [1.0003f32, 1.0007, -1.0003, -1.0007]
         .iter()
-        .map(|&x| half::f16::from_f32(x).to_f32().to_bits())
+        .map(|&x| reference_half(x).to_f32_const().to_bits())
         .collect();
     for attempt in run_coreml_with_inputs_with_weights(
         &converted.data,
@@ -2025,7 +2326,7 @@ fn precision_pipeline_rounds_nonfolded_constant_transpose_casts() {
 fn precision_pipeline_half_select_shared_condition_preserves_all_encodings() {
     use rustnn::executors::coreml::{CoremlInput, run_coreml_with_inputs_with_weights};
     let values: Vec<f32> = (0..=u16::MAX)
-        .map(|bits| half::f16::from_bits(bits).to_f32())
+        .map(|bits| half::f16::from_bits(bits).to_f32_const())
         .collect();
     for graph in [
         half_where(&[Dimension::Static(65536)]),
@@ -2265,7 +2566,7 @@ fn precision_pipeline_rounds_constant_casts_without_runtime_inputs() {
                 let output = outputs.iter().find(|output| output.name == name).unwrap();
                 assert_eq!(output.data.len(), values.len());
                 for (index, (&actual, &value)) in output.data.iter().zip(&values).enumerate() {
-                    let expected = half::f16::from_f32(value).to_f32();
+                    let expected = reference_half(value).to_f32_const();
                     if expected.is_nan() {
                         assert!(
                             actual.is_nan(),
@@ -2319,7 +2620,7 @@ fn precision_pipeline_constant_identity_preserves_every_half_encoding() {
             .unwrap();
         assert_eq!(output.data.len(), bits.len());
         for (&actual, &bits) in output.data.iter().zip(&bits) {
-            let expected = half::f16::from_bits(bits).to_f32();
+            let expected = half::f16::from_bits(bits).to_f32_const();
             if expected.is_nan() {
                 assert!(actual.is_nan(), "{} {bits:04x}", attempt.compute_unit);
             } else {
@@ -2413,7 +2714,7 @@ fn precision_pipeline_dynamic_bounds_do_not_guess_graph_suffix_names() {
         constant_operand_ids_to_handles: [(
             3,
             ConstantData {
-                data: half::f16::from_f32(0.0007).to_bits().to_le_bytes().to_vec(),
+                data: reference_half(0.0007).to_bits().to_le_bytes().to_vec(),
                 label: None,
             },
         )]
@@ -2500,7 +2801,7 @@ fn precision_pipeline_rounds_ties_subnormals_overflow_and_signed_zero() {
             .unwrap();
         assert_eq!(result.data.len(), values.len());
         for (index, (&actual, &value)) in result.data.iter().zip(&values).enumerate() {
-            let expected = half::f16::from_f32(value).to_f32();
+            let expected = reference_half(value).to_f32_const();
             if expected.is_nan() {
                 assert!(
                     actual.is_nan(),
@@ -2564,7 +2865,7 @@ fn precision_pipeline_successive_exposed_casts_preserve_every_logical_output() {
             let output = outputs.iter().find(|output| output.name == name).unwrap();
             assert_eq!(output.shape, [values.len() as i64]);
             for (index, (&actual, &value)) in output.data.iter().zip(&values).enumerate() {
-                let expected = half::f16::from_f32(value).to_f32();
+                let expected = reference_half(value).to_f32_const();
                 if expected.is_nan() {
                     assert!(
                         actual.is_nan(),
@@ -2623,7 +2924,7 @@ fn precision_pipeline_predicts_actual_dynamic_lengths() {
             );
             assert_eq!(
                 output.data,
-                vec![half::f16::from_f32(1.0003).to_f32(); length]
+                vec![reference_half(1.0003).to_f32_const(); length]
             );
         }
     }
@@ -2681,7 +2982,7 @@ fn precision_pipeline_weighted_and_masked_compositions_predict_exact_values() {
             input
                 .iter()
                 .zip(weights)
-                .map(|(&x, w)| half::f16::from_f32(x + w).to_f32() + w)
+                .map(|(&x, w)| reference_half(x + w).to_f32_const() + w)
                 .collect::<Vec<_>>(),
         ),
         (
@@ -2690,7 +2991,7 @@ fn precision_pipeline_weighted_and_masked_compositions_predict_exact_values() {
                 .iter()
                 .map(|&x| {
                     if x > 0.0 {
-                        half::f16::from_f32(x).to_f32()
+                        reference_half(x).to_f32_const()
                     } else {
                         x
                     }
@@ -2700,7 +3001,7 @@ fn precision_pipeline_weighted_and_masked_compositions_predict_exact_values() {
         (
             indexed(),
             [input[0], input[0], input[2], input[2]]
-                .map(|x| half::f16::from_f32(x).to_f32())
+                .map(|x| reference_half(x).to_f32_const())
                 .to_vec(),
         ),
     ] {
@@ -2734,7 +3035,7 @@ fn precision_pipeline_weighted_and_masked_compositions_predict_exact_values() {
                     input
                         .iter()
                         .zip(weights)
-                        .map(|(&x, w)| half::f16::from_f32(x + w).to_f32())
+                        .map(|(&x, w)| reference_half(x + w).to_f32_const())
                         .collect::<Vec<_>>()
                 );
             }

@@ -1,4 +1,4 @@
-//! Minimal CoreML execution bridge for macOS.
+//! Minimal CoreML execution bridge for macOS and iOS.
 //! Loads a `.mlmodel`, compiles it if needed, and runs a zeroed inference
 //! using CoreML's Objective-C API.
 
@@ -31,6 +31,18 @@ use crate::runtime_checks::{RuntimeShapeState, TensorKind, validate_shape_data_l
 
 #[path = "coreml_input_views.rs"]
 pub(crate) mod input_views;
+#[path = "coreml_tensor.rs"]
+mod tensor_storage;
+pub(crate) use tensor_storage::{CoremlTensorBinding, CoremlTensorStorage, run_coreml_tensors};
+
+impl CompiledCoremlModel {
+    pub(crate) fn compute_unit(&self) -> &'static str {
+        match self {
+            Self::Native(model) => model.compute_unit,
+            Self::Pipeline(model) => model.diagnostics().loaded_compute_units,
+        }
+    }
+}
 #[path = "coreml_load.rs"]
 mod load;
 use load::LoadTrace;
@@ -41,10 +53,10 @@ mod float_cast;
 mod pipeline;
 
 // Link against the system frameworks we use.
-#[cfg(target_vendor = "apple")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[link(name = "Foundation", kind = "framework")]
 unsafe extern "C" {}
-#[cfg(target_vendor = "apple")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[link(name = "CoreML", kind = "framework")]
 unsafe extern "C" {
     static MLModelCreatorDefinedKey: *mut Object;
@@ -52,7 +64,7 @@ unsafe extern "C" {
 
 // Objective-C++ exception firewall (src/executors/coreml_shim.mm).
 // Return codes: 0 = success, 1 = NSError, 2 = NSException, 3 = C++ exception.
-#[cfg(target_vendor = "apple")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 unsafe extern "C" {
     fn rustnn_coreml_compile(
         model_url: *mut Object,
@@ -77,8 +89,12 @@ unsafe extern "C" {
 }
 
 // Shims to check compilation on Linux
-/// Always-failing stand-in for the CoreML shim; only exists off macOS so the feature compiles.
-#[cfg(not(target_vendor = "apple"))]
+/// Always-failing stand-in for targets without the native CoreML shim.
+///
+/// # Safety
+/// This stand-in does not dereference its pointer arguments. Its unsafe signature
+/// mirrors the native shim; no output pointers are initialized on failure.
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 pub unsafe extern "C" fn rustnn_coreml_compile(
     _model_url: *mut Object,
     _out_url: *mut *mut Object,
@@ -87,8 +103,12 @@ pub unsafe extern "C" fn rustnn_coreml_compile(
 ) -> i32 {
     1
 }
-/// Always-failing stand-in for the CoreML shim; only exists off macOS so the feature compiles.
-#[cfg(not(target_vendor = "apple"))]
+/// Always-failing stand-in for targets without the native CoreML shim.
+///
+/// # Safety
+/// This stand-in does not dereference its pointer arguments. Its unsafe signature
+/// mirrors the native shim; no output pointers are initialized on failure.
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 pub unsafe extern "C" fn rustnn_coreml_load(
     _compiled_url: *mut Object,
     _configuration: *mut Object,
@@ -98,8 +118,12 @@ pub unsafe extern "C" fn rustnn_coreml_load(
 ) -> i32 {
     1
 }
-/// Always-failing stand-in for the CoreML shim; only exists off macOS so the feature compiles.
-#[cfg(not(target_vendor = "apple"))]
+/// Always-failing stand-in for targets without the native CoreML shim.
+///
+/// # Safety
+/// This stand-in does not dereference its pointer arguments. Its unsafe signature
+/// mirrors the native shim; no output pointers are initialized on failure.
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 pub unsafe extern "C" fn rustnn_coreml_predict(
     _model: *mut Object,
     _features: *mut Object,
@@ -286,6 +310,7 @@ pub(crate) struct NativeCoremlModel {
     compute_unit: &'static str,
     diagnostics: CoremlLoadDiagnostics,
     aliases: Box<CoremlFeatureAliases>,
+    has_single_program_output_scope: bool,
     backing: CoremlModelBacking,
 }
 
@@ -381,6 +406,43 @@ impl std::fmt::Debug for CompiledCoremlModel {
     }
 }
 
+fn has_single_program_output_scope(data: &[u8]) -> bool {
+    use crate::protos::coreml::specification::{Model, model};
+    use prost::Message;
+    // Pipeline prediction applies the outer backing names to earlier children,
+    // which reject final outputs absent from their own feature descriptions.
+    // Retain native input storage but copy the returned Pipeline outputs. Checking
+    // only the source graph's static shapes cannot establish this native scope.
+    matches!(
+        Model::decode(data).ok().and_then(|model| model.r#type),
+        Some(model::Type::MlProgram(_))
+    )
+}
+
+#[cfg(test)]
+mod output_backing_scope_tests {
+    #[test]
+    fn output_backings_require_a_single_native_program() {
+        use crate::protos::coreml::specification::{Model, model};
+        use prost::Message;
+        for (kind, expected) in [
+            (model::Type::MlProgram(Default::default()), true),
+            (model::Type::Pipeline(Default::default()), false),
+        ] {
+            let model = Model {
+                r#type: Some(kind),
+                ..Default::default()
+            };
+            assert_eq!(
+                super::has_single_program_output_scope(&model.encode_to_vec()),
+                expected
+            );
+        }
+        assert!(!super::has_single_program_output_scope(&[]));
+        assert!(!super::has_single_program_output_scope(&[0xff]));
+    }
+}
+
 /// Load a CoreML model directly from protobuf bytes and retain it for repeated
 /// dispatch, falling back to CPU-only if the preferred compute units fail.
 pub(crate) fn compile_model(
@@ -450,6 +512,7 @@ fn compile_model_from_asset(
                 compute_unit: name,
                 diagnostics: trace.finish(route, name),
                 aliases: Box::new(aliases),
+                has_single_program_output_scope: has_single_program_output_scope(model_bytes),
                 backing: CoremlModelBacking::InMemory {
                     asset,
                     specification_data,
@@ -516,6 +579,7 @@ fn compile_model_from_url(
                 compute_unit: name,
                 diagnostics: trace.finish(route, name),
                 aliases: Box::new(aliases),
+                has_single_program_output_scope: has_single_program_output_scope(model_bytes),
                 backing: CoremlModelBacking::OnDisk {
                     compiled_dir,
                     temp_model,
@@ -1438,6 +1502,7 @@ unsafe fn nsarray_to_strings(array: *mut Object) -> Vec<String> {
         .collect()
 }
 
+#[cfg(any(target_os = "macos", target_os = "ios", test))]
 fn parse_output_aliases(
     json: &str,
     declared_outputs: &[String],
@@ -1576,7 +1641,7 @@ unsafe fn model_constant_copies(
     outputs: &HashMap<String, String>,
     input_copies: &HashMap<String, CoremlPassthrough>,
 ) -> Result<HashMap<String, CoremlConstantCopy>, GraphError> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         let Some(json) =
             (unsafe { model_metadata_value(model, OUTPUT_CONSTANT_COPIES_METADATA_KEY)? })
@@ -1593,7 +1658,7 @@ unsafe fn model_constant_copies(
             input_copies,
         )
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     {
         let _ = (model, outputs, input_copies);
         Ok(HashMap::new())
@@ -1631,7 +1696,7 @@ unsafe fn model_passthroughs(
     inputs: &HashMap<String, String>,
     outputs: &HashMap<String, String>,
 ) -> Result<HashMap<String, CoremlPassthrough>, GraphError> {
-    #[cfg(target_vendor = "apple")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         let description: *mut Object = msg_send![model, modelDescription];
         let Some(json) =
@@ -1651,14 +1716,14 @@ unsafe fn model_passthroughs(
             &unsafe { nsarray_to_strings(output_keys) },
         )
     }
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     {
         let _ = (model, inputs, outputs);
         Ok(HashMap::new())
     }
 }
 
-#[cfg(target_vendor = "apple")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 unsafe fn model_metadata_value(
     model: *mut Object,
     key: &str,
@@ -1685,7 +1750,7 @@ unsafe fn model_feature_aliases(
     model: *mut Object,
     input: bool,
 ) -> Result<HashMap<String, String>, GraphError> {
-    #[cfg(target_vendor = "apple")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         let description: *mut Object = msg_send![model, modelDescription];
         let json = unsafe {
@@ -1727,7 +1792,7 @@ unsafe fn model_feature_aliases(
             parse_output_aliases(&json, &declared)
         }
     }
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     {
         let _ = (model, input);
         Ok(HashMap::new())

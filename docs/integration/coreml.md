@@ -1,18 +1,27 @@
 # CoreML Backend
 
-The `coreml` backend runs WebNN graphs through Apple CoreML on macOS. The converter
+The `coreml` backend runs WebNN graphs through Apple CoreML on macOS and iOS. The converter
 (`src/converters/coreml_mlprogram.rs`) emits an MLProgram, the MIL-based model format, and the
 backend (`src/backends/coreml.rs`) compiles it once and keeps the compiled model for repeated
 dispatch. The Objective-C bridge lives in `src/executors/coreml.rs` and `src/executors/coreml_shim.mm`.
 
 ## Requirements
 
-- macOS with a CoreML version that accepts MLProgram models (macOS 13 or newer; on-device
-  validation has also been done on iOS 18 and watchOS 11 builds of rustnn).
+- A CoreML version that accepts MLProgram models (macOS 13 or newer). The native Rust
+  backend also supports iOS; mobile validation uses iOS 18 as its deployment target.
+- tvOS is not enabled: the published `objc` dependency selects the wrong message ABI
+  there. watchOS execution is not enabled by these target gates either.
 - The `coreml-runtime` Cargo feature. On Linux and Windows the feature compiles to shims whose
   calls always fail, so `cargo check --features coreml-runtime` works everywhere but the backend
-  is never selected on non-Apple targets.
+  is never selected on those platforms.
 - Xcode command line tools for the Objective-C++ shim (`build.rs` compiles it with `cc`).
+
+Retained tensor storage also applies to source-proven bounded Pipelines. Native
+input allocations remain locked through every child prediction; final outputs
+are copied directly into independent destination storage. Public output backings
+are not passed to Pipeline children. Source-proven host arithmetic is reported
+separately from native compute permissions, and dispatch statistics reflect lazy
+child loading completed during the latest prediction.
 
 ## Selection and devices
 
@@ -44,9 +53,12 @@ establishes placement, energy savings or prediction-time fallback; use separate 
    model boundary, comparison and logical results are produced as `uint8`, and reductions with
    empty axes, `resample2d` on arbitrary axis pairs and the stable `reduceLogSumExp` form are
    lowered explicitly because MIL has no direct equivalent.
-2. Float16 weights remain a separate shared blob (`ConvertedGraph::weights_data`). MLProgram
-   graphs compile locally from a URL: the in-memory route changes represented values on
-   multiple tested CoreML stacks. This does not force CPU-only execution.
+2. Float16 weights remain a separate shared blob (`ConvertedGraph::weights_data`). Arithmetic
+   and typed boundaries compile locally from a URL: the in-memory route changes represented
+   values on multiple tested CoreML stacks. Input-free single programs consisting entirely of
+   proven constant copies prefer the in-memory asset route to avoid a BNNS URL constant-fold
+   crash. Narrowing, arithmetic and mixed computed outputs cannot take this exception.
+   Neither route forces CPU-only execution.
    Real precision boundaries are materialized as native Pipeline children where needed.
    The children expose live values only and reuse the original weight storage; the public
    WebNN graph, types and shapes are unchanged.
@@ -118,6 +130,67 @@ output-reachable source and independent output bindings. Consumers must validate
 descriptor and encoded/decoded byte lengths. This adds approximately four encoded bytes
 per three source bytes, once per referenced constant, not once per output or for all weights.
 The native graph still runs; these proofs do not replace arithmetic-derived results.
+The same checked bindings apply with retained tensor storage enabled. Proven copies
+are snapshotted before prediction and written into independently owned outputs;
+they do not propose native output backings. Coalesced arithmetic outputs use the
+returned physical result, with at most one backing proposed per physical feature.
+
+## Reusing tensor storage
+
+With `RustNNOptions::coreml.reuse_tensor_storage` enabled, CoreML contexts keep float32,
+float16 and int32 tensors in owned storage with
+retained `MLMultiArray` views. Dispatch binds compatible input arrays directly. An output can
+become the next graph's input without `read_tensor`/`write_tensor` or a temporary input array;
+for KV caches, alternate two distinct tensor sets. A dispatch cannot bind one tensor as both
+input and output.
+
+Buffers of at least 16 KiB are page-aligned for CoreML's output-backing performance
+recommendation; smaller scalar and index buffers use 16-byte alignment.
+
+When supported, `outputBackings` proposes the destination array to CoreML. Only a returned
+array with the same object identity counts as accepted. Backings require a fully static
+graph (including intermediate operands) and a fixed output feature. A fixed-size output
+alone is not sufficient when the graph has dynamic dimensions. Ineligible outputs,
+declined backings, strided results and dtype conversions are copied
+into the destination's owned storage. Returned arrays are never adopted as tensor storage,
+because CoreML may alias them to an input or another output. This is not a guarantee of zero
+copies inside CoreML, GPU or Neural Engine drivers.
+
+Both host and retained-storage paths use the same checked numeric conversion and array
+layout rules. Equal element widths do not imply equal types (for example int32 and
+float32). Same-type copies preserve integer bits and float16 storage widths; overlapping
+strided views are gathered before writing the destination.
+
+Numeric conversions into float16 round directly from the source value using integer
+round-to-nearest, ties-to-even, retaining all discarded bits. This preserves subnormals
+and signed zero independently of hardware half-conversion support. Matching storage
+types are copied bit-for-bit, including NaN payloads; CoreML's internal arithmetic policy
+is unchanged.
+
+`RustNNOptions::coreml` controls this experimental path. `reuse_tensor_storage` defaults to
+`false`, preserving the byte-buffer reference implementation until an application measures
+a benefit on its workload. `output_backings` defaults to `true` when reuse is enabled and
+can be disabled independently to measure persistent input storage alone. The
+WebNN API and compute-unit selection are unchanged. Other data types retain host storage and
+the existing conversion path. Zero-extent prediction remains unsupported.
+
+With `dynamic-inputs`, reserve the maximum capacity before a decode loop and resize the
+active shape between dispatches. Shape changes rebuild the array view, but do not allocate
+another data buffer while they fit the reserved capacity. Reserve replaces storage with
+zeroed bytes; growth during resize preserves the existing prefix.
+
+`MLContext::rustnn_backend_statistics()` returns `Some(BackendStatistics::Coreml(...))`
+for this backend; backends that do not report statistics return `None`.
+The CoreML variant reports cumulative host reads/writes, native allocations, direct input
+bindings, proposed/accepted backings and logical copied payloads.
+These count rustnn-side work, not total memory traffic or internal CoreML allocations. The
+reported compute-unit policy includes load fallback but does not measure accelerator
+placement. Take counter differences around the decode loop to exclude prefill and setup.
+
+Native precision Pipelines retain input tensor storage but copy returned outputs.
+CoreML applies the outer output-backing names while evaluating earlier children,
+which reject final features absent from their own descriptions. Backings are therefore
+proposed only for a single MLProgram, even when a Pipeline's source graph is static.
 
 ## Converter-private input views
 
@@ -134,6 +207,8 @@ signed zero and NaN bits without a Float32 round trip. The original feature rema
 bound for actual-shape queries and other consumers. Metadata, native dtype, shape
 constraints and storage layout are checked before prediction; standalone consumers
 of these exports must supply the same private bindings.
+Persistent `MLTensor` dispatch uses these bindings with output backings enabled or
+disabled, retaining the tensor storage and private view owners through prediction.
 
 ## Testing
 
@@ -141,7 +216,9 @@ of these exports must supply the same private bindings.
 make test-wpt-coreml              # full WPT suite, expected failures are non-fatal
 make test-wpt-coreml-report       # same, plus the JSON report
 make wpt-sync-coreml              # regenerate tests/wpt_conformance/coreml_expected_failures.txt
-make test-coreml                  # ordinary native unit and integration tests
+make test-coreml                  # unit and integration tests
+WPT_COREML_TENSOR_MODE=persistent make test-wpt-coreml
+WPT_COREML_TENSOR_MODE=backings make test-wpt-coreml
 ```
 
 CoreML has no PASS snapshots; failing trials are listed in
