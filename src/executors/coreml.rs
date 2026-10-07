@@ -2624,6 +2624,95 @@ mod checked_attempt_tests {
     }
 
     #[test]
+    fn narrow_proven_copies_accept_actual_shapes_and_reject_invalid_bindings() {
+        let bounded = OperandDescriptor {
+            data_type: DataType::Uint8,
+            shape: vec![Dimension::Dynamic(DynamicDimension {
+                name: "length".into(),
+                max_size: 256,
+            })],
+            pending_permutation: vec![],
+        };
+        let proofs = HashMap::from([(
+            "copy".into(),
+            CoremlPassthrough {
+                input: "source".into(),
+                descriptor: bounded.clone(),
+            },
+        )]);
+        for length in [1, 256, 3, 1] {
+            let actual = OperandDescriptor {
+                shape: vec![Dimension::Static(length)],
+                ..bounded.clone()
+            };
+            let bytes = (0..length).map(|value| value as u8).collect::<Vec<_>>();
+            let inputs = HashMap::from([(
+                "source".into(),
+                CoremlByteInput {
+                    data: &bytes,
+                    descriptor: &actual,
+                },
+            )]);
+            for output in [&bounded, &actual] {
+                let outputs = HashMap::from([("copy".into(), output.clone())]);
+                assert_eq!(
+                    snapshot_byte_passthroughs(&proofs, &inputs, &outputs).unwrap()["copy"],
+                    bytes
+                );
+            }
+            for invalid_shape in [vec![Dimension::Static(length + 1)], vec![]] {
+                let invalid = OperandDescriptor {
+                    shape: invalid_shape,
+                    ..actual.clone()
+                };
+                assert!(
+                    snapshot_byte_passthroughs(
+                        &proofs,
+                        &inputs,
+                        &HashMap::from([("copy".into(), invalid)])
+                    )
+                    .is_err()
+                );
+            }
+            let short = HashMap::from([(
+                "source".into(),
+                CoremlByteInput {
+                    data: &bytes[..bytes.len() - 1],
+                    descriptor: &actual,
+                },
+            )]);
+            assert!(
+                snapshot_byte_passthroughs(
+                    &proofs,
+                    &short,
+                    &HashMap::from([("copy".into(), actual.clone())])
+                )
+                .is_err()
+            );
+        }
+        let too_large = OperandDescriptor {
+            shape: vec![Dimension::Static(257)],
+            ..bounded.clone()
+        };
+        let bytes = vec![0; 257];
+        let inputs = HashMap::from([(
+            "source".into(),
+            CoremlByteInput {
+                data: &bytes,
+                descriptor: &too_large,
+            },
+        )]);
+        assert!(
+            snapshot_byte_passthroughs(
+                &proofs,
+                &inputs,
+                &HashMap::from([("copy".into(), too_large.clone())])
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn feature_alias_metadata_validates_declared_bindings_and_shared_outputs() {
         let declared = ["physical".into(), "other".into()];
         assert_eq!(
