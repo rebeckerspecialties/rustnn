@@ -13,6 +13,9 @@ mod wpt_backend;
 #[path = "wpt_conformance/wpt_config.rs"]
 mod wpt_config;
 #[allow(dead_code)]
+#[path = "wpt_conformance/wpt_execute_graph.rs"]
+mod wpt_execute_graph;
+#[allow(dead_code)]
 #[path = "wpt_conformance/wpt_js_loader.rs"]
 mod wpt_js_loader;
 #[allow(dead_code)]
@@ -310,6 +313,181 @@ fn strict_expected_values_preserve_numbers_and_reject_malformed_data() {
         serde_json::json!(["invalid"]),
     ] {
         assert!(wpt_tensor::expected_output_to_f64(&spec(invalid)).is_err());
+    }
+}
+
+#[test]
+fn javascript_fixture_bridge_preserves_signed_zero_in_tensors_and_options() {
+    if !wpt_js_loader::node_available() {
+        eprintln!("[SKIP] signed-zero fixture bridge requires Node.js");
+        return;
+    }
+    let fixture_root = wpt_js_loader::repo_root().join("tests/fixtures/wpt_signed_zero");
+    let fixture = fixture_root.join("webnn/conformance_tests/signed-zero.https.any.js");
+    let utils = fixture_root.join("webnn/resources/utils.js");
+    for (script, without_native_float16) in [
+        ("dump_tests.mjs", false),
+        ("dump_corpus.mjs", false),
+        ("dump_tests.mjs", true),
+        ("dump_corpus.mjs", true),
+    ] {
+        let mut command = std::process::Command::new("node");
+        if without_native_float16 {
+            command
+                .arg("--import")
+                .arg(fixture_root.join("without-native-float16.mjs"));
+        }
+        command.arg(wpt_js_loader::bridge_dir().join(script));
+        if script == "dump_tests.mjs" {
+            command.arg(&fixture).arg("--utils").arg(&utils);
+        } else {
+            command.arg("--wpt-dir").arg(&fixture_root);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{script}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let cases = payload[if script == "dump_tests.mjs" {
+            "tests"
+        } else {
+            "cases"
+        }]
+        .as_array()
+        .unwrap();
+        assert_eq!(cases.len(), 23);
+        for case in &cases[..20] {
+            let test: wpt_types::WptTestCase = serde_json::from_value(case.clone()).unwrap();
+            let input = &test.graph.inputs["input"];
+            let expected = &test.graph.expected_outputs["output"];
+            let source = if test.name.ends_with("scalar") {
+                vec![-0.0f64]
+            } else if test.name.ends_with("vector") {
+                vec![0.0, -0.0, 2.0f64.powi(-24), -2.0f64.powi(-24)]
+            } else if test.name.ends_with("negative-fill") {
+                vec![-0.0; 3]
+            } else if test.name.ends_with("positive-fill") {
+                vec![0.0; 3]
+            } else {
+                vec![0.0, -0.0, f64::INFINITY, f64::NEG_INFINITY, f64::NAN]
+            };
+            let expected_f64 = wpt_tensor::expected_output_to_f64(expected).unwrap();
+            assert_eq!(expected_f64.len(), source.len());
+            for (actual, wanted) in expected_f64.iter().zip(&source) {
+                if wanted.is_nan() {
+                    assert!(actual.is_nan(), "{script}: {}", test.name);
+                } else {
+                    assert_eq!(
+                        actual.to_bits(),
+                        wanted.to_bits(),
+                        "{script}: {}",
+                        test.name
+                    );
+                }
+            }
+            for strict in [false, true] {
+                let bytes = wpt_tensor::tensor_spec_to_bytes_with_mode(input, strict).unwrap();
+                if input.data_type() == "float16" {
+                    let bits = wpt_tensor::tensor_f16_bits_with_mode(input, strict);
+                    assert_eq!(bits.len(), source.len());
+                    assert_eq!(
+                        bytes,
+                        bits.iter()
+                            .flat_map(|bits| bits.to_ne_bytes())
+                            .collect::<Vec<_>>()
+                    );
+                    for (actual, wanted) in bits.iter().zip(&source) {
+                        let actual = half::f16::from_bits(*actual).to_f64();
+                        if wanted.is_nan() {
+                            assert!(actual.is_nan(), "{script}: {}", test.name);
+                        } else {
+                            assert_eq!(
+                                actual.to_bits(),
+                                wanted.to_bits(),
+                                "{script}: {}",
+                                test.name
+                            );
+                        }
+                    }
+                } else {
+                    let values = wpt_tensor::tensor_f32_values(input);
+                    assert_eq!(values.len(), source.len());
+                    assert_eq!(
+                        bytes,
+                        values
+                            .iter()
+                            .flat_map(|value| value.to_ne_bytes())
+                            .collect::<Vec<_>>()
+                    );
+                    for (actual, wanted) in values.iter().zip(&source) {
+                        if wanted.is_nan() {
+                            assert!(actual.is_nan(), "{script}: {}", test.name);
+                        } else {
+                            assert_eq!(
+                                actual.to_bits(),
+                                (*wanted as f32).to_bits(),
+                                "{script}: {}",
+                                test.name
+                            );
+                        }
+                    }
+                }
+            }
+            assert_eq!(tolerance::upstream_ulp_distance(-0.0, 0.0, true), 0);
+            assert_eq!(tolerance::upstream_ulp_distance(-0.0, 0.0, false), 0);
+        }
+        let test: wpt_types::WptTestCase = serde_json::from_value(cases[20].clone()).unwrap();
+        let mut operator = test.graph.operators[0].clone();
+        operator.arguments.as_array_mut().unwrap().remove(0);
+        let call = wpt_execute_graph::build_method_args(
+            "hardSigmoid",
+            &operator,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
+        )
+        .unwrap();
+        let options: rustnn::operator_options::MLHardSigmoidOptions =
+            serde_json::from_value(serde_json::Value::Object(call.options)).unwrap();
+        assert_eq!(
+            options.alpha.to_bits(),
+            (-0.0f64).to_bits(),
+            "{script}: option alpha"
+        );
+        assert_eq!(
+            options.beta.to_bits(),
+            0.0f64.to_bits(),
+            "{script}: option beta"
+        );
+        assert_eq!(options.label, "-0");
+        for (index, key) in [(21, "axis"), (22, "axes")] {
+            let test: wpt_types::WptTestCase =
+                serde_json::from_value(cases[index].clone()).unwrap();
+            let mut operator = test.graph.operators[0].clone();
+            operator.arguments.as_array_mut().unwrap().remove(0);
+            let call = wpt_execute_graph::build_method_args(
+                &operator.name,
+                &operator,
+                &std::collections::HashMap::new(),
+                &std::collections::HashMap::new(),
+                &std::collections::HashSet::new(),
+            )
+            .unwrap();
+            if key == "axis" {
+                assert_eq!(
+                    serde_json::from_value::<u32>(call.options[key].clone()).unwrap(),
+                    0
+                );
+            } else {
+                assert_eq!(
+                    serde_json::from_value::<Vec<u32>>(call.options[key].clone()).unwrap(),
+                    [0]
+                );
+            }
+            assert_eq!(call.options["label"], "-0");
+        }
     }
 }
 
