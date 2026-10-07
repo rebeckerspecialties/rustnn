@@ -308,17 +308,13 @@ pub fn ulp_distance_f16(a: f32, b: f32) -> u32 {
     f16_bits_to_ordered(a_bits).abs_diff(f16_bits_to_ordered(b_bits))
 }
 
-/// The upstream ULP metric, including raw FP16 bits across opposite signs and
-/// the signed-zero exception. Expected values retain their original JS precision.
+/// The revised upstream ULP metric with numerical FP16 ordering across signs
+/// and zero. Expected values retain their original JS precision.
 pub fn upstream_ulp_distance(actual: f32, expected: f64, float16: bool) -> u32 {
     if float16 {
         let actual = half::f16::from_f32(actual).to_bits();
         let expected = super::wpt_tensor::wpt_half_bits(expected);
-        if actual & 0x7fff == 0 && expected & 0x7fff == 0 {
-            0
-        } else {
-            u32::from(actual.abs_diff(expected))
-        }
+        f16_bits_to_ordered(actual).abs_diff(f16_bits_to_ordered(expected))
     } else {
         let signed_bits = |value: f64| {
             let magnitude = i64::from((value.abs() as f32).to_bits());

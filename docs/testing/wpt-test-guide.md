@@ -136,8 +136,8 @@ Callbacks that require intermediate operands are reevaluated with shapes and
 types from the Rust builder, using Node.js and the fetched source file. No
 tolerance formula is reimplemented. An upstream callback that still returns
 an undefined or nonfinite budget remains a test failure.
-The strict finite-value comparator follows the upstream helpers: raw half-bit
-distance except signed zero, the helper's FP16 halfway rounding, and unrounded
+The strict finite-value comparator follows the revised upstream helpers: numerical
+half-bit ordering across signs and zero, direct binary64-to-FP16 nearest-even rounding, and unrounded
 JavaScript-number expected values for ATOL. Its audit uses the same comparator
 and applied budget. Nonfinite values use classification rules instead of the
 upstream bit-distance helper: NaN matches NaN regardless of payload, and
@@ -145,18 +145,26 @@ infinities must match in sign. A large budget cannot hide a class mismatch.
 ULP classification uses the expected value after conversion to the output
 dtype; ATOL retains the original source number, including at overflow boundaries.
 Strict FP16 runtime inputs and constants also use
-the upstream halfway-rounding helper; compatibility packing is unchanged.
+the revised upstream conversion without narrowing first to FP32; compatibility packing is unchanged.
 The JavaScript fixture bridge preserves negative zero in tensor data and floating-point
 options rather than losing its sign during JSON serialization. This source fidelity is
 separate from the ULP comparator, which continues to treat signed zeros as equal.
 The test-only JSON dependency enables round-trip binary64 parsing so finite source
 numbers also retain their original JavaScript precision. Production JSON parsing is unchanged.
 
+This follow-up is staged for WPT [#63150](https://github.com/web-platform-tests/wpt/pull/63150)
+and [#63151](https://github.com/web-platform-tests/wpt/pull/63151), which correct
+signed FP16 distance and binary64 rounding. They must land before the pinned
+corpus is updated and this follow-up is submitted upstream; the current fetch pin is unchanged.
+Use `WPT_DIR` to select the explicitly recorded revised source when validating this branch.
+The old pinned helpers are not interchangeable with the revised adapter: migrate the
+adapter and pin together. Do not run `fetch-wpt` against a prepared dependency checkout.
+
 `make test-wpt-tolerance` runs the comparator regressions without a backend.
-Fetch the corpus with `make fetch-wpt`, then, with Node.js available, run
+With the corresponding corpus prepared and Node.js available, run
 `make test-wpt-tolerance-parity` to compare finite ULP cases directly with the
 upstream JavaScript helpers across every finite FP16 encoding, opposite signs,
-zeros and adjacent halfway values, plus FP32 and ATOL boundary cases. Set
+zeros, halfway values and their immediate binary64 neighbors, plus FP32 and ATOL boundary cases. Set
 `WPT_TOLERANCE_PARITY_JSON=/path/to/parity.json` to save the vectors and checked
 distances for replay through the browser's upstream `testharness.js`/`utils.js`.
 The full ONNX and CoreML Make targets run this parity check after a successful

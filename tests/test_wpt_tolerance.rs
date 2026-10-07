@@ -87,25 +87,22 @@ fn strict_wpt_budget_rejects_missing_or_malformed_source_tolerance() {
 }
 
 #[test]
-fn strict_half_metric_matches_upstream_raw_bits_and_halfway_rounding() {
-    assert_eq!(tolerance::upstream_ulp_distance(-1.0, 1.0, true), 32768);
+fn strict_half_metric_matches_upstream_ordering_and_even_rounding() {
+    assert_eq!(tolerance::upstream_ulp_distance(-1.0, 1.0, true), 30720);
     assert_eq!(tolerance::upstream_ulp_distance(-0.0, 0.0, true), 0);
     assert_eq!(tolerance::upstream_ulp_distance(0.0, -0.0, true), 0);
-    // Upstream toHalf rounds this tie upward; IEEE ties-to-even would give 1.
+    // The revised upstream helper rounds this midpoint to the even encoding.
     assert_eq!(
         tolerance::upstream_ulp_distance(1.0, 1.00048828125, true),
-        1
+        0
     );
     assert_eq!(
         tolerance::upstream_ulp_distance(-1.0, -1.00048828125, true),
-        1
+        0
     );
     let subnormal = half::f16::from_bits(1).to_f32();
     assert_eq!(tolerance::upstream_ulp_distance(subnormal, 0.0, true), 1);
-    assert_eq!(
-        tolerance::upstream_ulp_distance(-subnormal, 0.0, true),
-        32769
-    );
+    assert_eq!(tolerance::upstream_ulp_distance(-subnormal, 0.0, true), 1);
 }
 
 #[test]
@@ -267,7 +264,7 @@ fn audit_uses_same_strict_half_metric_and_source_precision() {
         true,
         ToleranceKind::Ulp,
     );
-    assert_eq!(metrics.max_ulp, 32768);
+    assert_eq!(metrics.max_ulp, 30720);
     assert_eq!(metrics.max_abs, 2.0);
     let metrics = tolerance::upstream_float_error_metrics(
         &[1.0],
@@ -504,7 +501,7 @@ fn strict_half_inputs_and_constants_use_source_rounding_without_changing_default
         let compatibility = wpt_tensor::tensor_f16_bits_with_mode(&spec, false);
         let strict = wpt_tensor::tensor_f16_bits_with_mode(&spec, true);
         assert_eq!(compatibility, [0x3c00, 0xbc00]);
-        assert_eq!(strict, [0x3c01, 0xbc01]);
+        assert_eq!(strict, [0x3c00, 0xbc00]);
         assert_eq!(
             wpt_tensor::tensor_spec_to_bytes_with_mode(&spec, true).unwrap(),
             strict
@@ -520,6 +517,102 @@ fn strict_half_inputs_and_constants_use_source_rounding_without_changing_default
                 .collect::<Vec<_>>()
         );
     }
+}
+
+#[test]
+fn strict_half_conversion_retains_binary64_inputs_at_midpoint_boundaries() {
+    let midpoint = 1.00048828125;
+    let values = [
+        (midpoint - 2.0f64.powi(-40), 0x3c00),
+        (midpoint, 0x3c00),
+        (midpoint + 2.0f64.powi(-40), 0x3c01),
+        (-midpoint + 2.0f64.powi(-40), 0xbc00),
+        (-midpoint, 0xbc00),
+        (-midpoint - 2.0f64.powi(-40), 0xbc01),
+        (2.0f64.powi(-25), 0x0000),
+        (2.0f64.powi(-25) * (1.0 + 2.0f64.powi(-20)), 0x0001),
+        (2.0f64.powi(-25) * (1.0 - 2.0f64.powi(-20)), 0x0000),
+        (65520.0 - 2.0f64.powi(-20), 0x7bff),
+        (65520.0, 0x7c00),
+        (-65520.0 + 2.0f64.powi(-20), 0xfbff),
+        (-65520.0, 0xfc00),
+        (0.0, 0x0000),
+        (-0.0, 0x8000),
+    ];
+    for &(value, bits) in &values {
+        assert_eq!(wpt_tensor::wpt_half_bits(value), bits, "{value:?}");
+    }
+    for constant in [false, true] {
+        let spec = wpt_types::WptTensorSpec {
+            data: serde_json::json!(values.map(|(value, _)| value)),
+            shape: vec![values.len() as u32],
+            data_type: "float16".into(),
+            constant,
+            descriptor: None,
+        };
+        let expected: Vec<u16> = values.iter().map(|&(_, bits)| bits).collect();
+        assert_eq!(wpt_tensor::tensor_f16_bits_with_mode(&spec, true), expected);
+        assert_eq!(
+            wpt_tensor::tensor_spec_to_bytes_with_mode(&spec, true).unwrap(),
+            expected
+                .iter()
+                .flat_map(|bits| bits.to_ne_bytes())
+                .collect::<Vec<_>>()
+        );
+        let compatibility: Vec<_> = values
+            .iter()
+            .map(|&(value, _)| half::f16::from_f32(value as f32).to_bits())
+            .collect();
+        assert_eq!(
+            wpt_tensor::tensor_f16_bits_with_mode(&spec, false),
+            compatibility
+        );
+    }
+    let scalar = wpt_types::WptTensorSpec {
+        data: serde_json::json!(midpoint - 2.0f64.powi(-40)),
+        shape: vec![3],
+        data_type: "float16".into(),
+        constant: false,
+        descriptor: None,
+    };
+    assert_eq!(
+        wpt_tensor::tensor_f16_bits_with_mode(&scalar, true),
+        [0x3c00; 3]
+    );
+    assert_eq!(
+        wpt_tensor::tensor_spec_to_bytes_with_mode(&scalar, true).unwrap(),
+        [0x3c00u16; 3]
+            .iter()
+            .flat_map(|bits| bits.to_ne_bytes())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn strict_half_ulp_ordering_is_numerical_across_zero_and_sign() {
+    let minimum = half::f16::from_bits(1).to_f32();
+    assert_eq!(tolerance::upstream_ulp_distance(-minimum, 0.0, true), 1);
+    assert_eq!(
+        tolerance::upstream_ulp_distance(-minimum, minimum as f64, true),
+        2
+    );
+    assert_eq!(tolerance::upstream_ulp_distance(-1.0, 1.0, true), 30720);
+    for (actual, expected, budget) in [(-minimum, 0.0, 1), (-minimum, minimum as f64, 2)] {
+        assert!(
+            tolerance::validate_upstream_result(
+                &[actual],
+                &[expected],
+                ToleranceKind::Ulp,
+                budget,
+                true
+            )
+            .0
+        );
+    }
+    // The actual payload is decoded, never compared as a Uint16 against a JS Number.
+    assert!(
+        !tolerance::validate_upstream_result(&[minimum], &[1.0], ToleranceKind::Ulp, 0, true).0
+    );
 }
 
 #[test]
@@ -645,7 +738,7 @@ fn strict_comparator_matches_upstream_javascript() {
     ];
     // Every finite FP16 encoding, including both signs and the entire
     // subnormal range. Adjacent midpoints exercise the source toHalf helper's
-    // rounding; opposite signs exercise its raw-bit distance convention.
+    // rounding; opposite signs exercise numerical ordering across zero.
     for bits in 0..=u16::MAX {
         let value = half::f16::from_bits(bits);
         if !value.is_finite() {
@@ -656,7 +749,10 @@ fn strict_comparator_matches_upstream_javascript() {
         if let Some(next) = bits.checked_add(1).map(half::f16::from_bits)
             && next.is_finite()
         {
-            cases.push((value.to_f32(), (value.to_f64() + next.to_f64()) * 0.5, true));
+            let midpoint = (value.to_f64() + next.to_f64()) * 0.5;
+            cases.push((value.to_f32(), midpoint, true));
+            cases.push((value.to_f32(), midpoint.next_down(), true));
+            cases.push((value.to_f32(), midpoint.next_up(), true));
         }
     }
     let input: Vec<_> = cases.iter().map(|&(actual, expected, float16)| {
@@ -684,8 +780,9 @@ const result = vm.runInContext(`cases.map(c => {
  return Number(ulpDistance(actual, c.expected, c.float16 ? 'float16' : 'float32'));
 })`, context);
 // ATOL is applied by testharness.js, not utils.js: check JS Number arithmetic.
+const halfConversions = vm.runInContext(`cases.filter(c => c.float16).map(c => toHalf(c.expected))`, context);
 const atol = input.atol.map(c => Math.abs(c.actual - c.expected) <= c.budget);
-process.stdout.write(JSON.stringify({ulp: result, atol}));
+process.stdout.write(JSON.stringify({ulp: result, halfConversions, atol}));
 "#;
     let payload = serde_json::json!({"ulp": input, "atol": atol_input});
     let mut child = std::process::Command::new("node")
@@ -723,6 +820,18 @@ process.stdout.write(JSON.stringify({ulp: result, atol}));
         )
         .unwrap();
     }
+    let conversions: Vec<u16> = serde_json::from_value(results["halfConversions"].clone()).unwrap();
+    for ((_, expected, _), upstream) in cases.iter().filter(|case| case.2).zip(&conversions) {
+        assert_eq!(
+            wpt_tensor::wpt_half_bits(*expected),
+            *upstream,
+            "binary64 {expected:?}"
+        );
+    }
+    assert_eq!(
+        cases.iter().filter(|case| case.2).count(),
+        conversions.len()
+    );
     let distances: Vec<u32> = serde_json::from_value(results["ulp"].clone()).unwrap();
     assert_eq!(cases.len(), distances.len());
     for ((actual, expected, float16), upstream) in cases.into_iter().zip(distances) {
