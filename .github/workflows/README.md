@@ -27,6 +27,9 @@
 - `make test-coreml-precision` qualifies explicit float16 rounding in native Pipeline
   stages, including scalar/dynamic interfaces, fanout, masks, shared weights and special values.
   These ordinary integration tests also run through `make test-coreml`.
+- `make test-coreml-pipeline` focuses on the bounded child executor, source-proven Cast,
+  actual typed shapes, buffer lifetimes and shared-weight repacking. Its unit tests also run
+  through `make test-coreml`; `make lint-coreml` checks the CoreML feature surface strictly.
 - The documentation site combines three generated parts: MkDocs pages from `docs/`, rustdoc from
   `make docs-api`, and the WPT dashboard cached by the nightly workflow. Test a docs change
   locally with `make ci-docs` and `make docs-api`.

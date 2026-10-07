@@ -53,6 +53,8 @@ Use the Makefile targets; they set feature flags and environment variables consi
 | `test-coreml-gather` | Focused active-dimension gather regressions, including scalar indices; `TEST_FILTER` selects a test |
 | `test-coreml-dtypes` | Focused numeric boundary regressions for typed dispatch and the convenience API; CI runs with and without dynamic inputs |
 | `test-coreml-precision` | Native typed-boundary, Half layout, constant, fanout and bounded-dynamic regressions |
+| `test-coreml-pipeline` | Bounded child-runtime, exact Float32/Half Cast, typed-storage and shared-weight source-plan regressions |
+| `lint-coreml` | Strict Clippy for all CoreML targets with bounded dynamic inputs enabled |
 | `litert`, `cann` | LiteRT and CANN conversion of the sample graph |
 | `validate-cann-env`, `cann-build`, `cann-device-test` | OpenHarmony toolchain check, cross build, device test through `hdc`; see [CANN](../integration/cann.md) |
 | `validate-all-env` | Build, unit tests, ONNX and CoreML validation in one run |
