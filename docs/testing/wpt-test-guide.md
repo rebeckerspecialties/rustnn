@@ -159,6 +159,14 @@ ULP classification uses the expected value after conversion to the output
 dtype; ATOL retains the original source number, including at overflow boundaries.
 Strict FP16 runtime inputs and constants also use
 the upstream halfway-rounding helper; compatibility packing is unchanged.
+The JavaScript fixture bridge preserves negative zero in tensor data and floating-point
+options rather than losing its sign during JSON serialization. This source fidelity is
+separate from the ULP comparator, which continues to treat signed zeros as equal.
+Both dump paths use the same normalizer; `scripts/wpt_bridge/numeric-fields.json` defines
+the tensor-data and floating-option fields shared with Rust option parsing. Integer WebIDL
+fields retain their zero-conversion semantics, and string labels are unchanged.
+The test-only JSON dependency enables round-trip binary64 parsing so finite source
+numbers also retain their original JavaScript precision. Production JSON parsing is unchanged.
 
 `make test-wpt-tolerance` runs the comparator regressions without a backend.
 Fetch the corpus with `make fetch-wpt`, then, with Node.js available, run

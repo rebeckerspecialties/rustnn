@@ -180,7 +180,25 @@ fn is_operand_ref(value: &serde_json::Value, operand_names: &HashSet<String>) ->
     value.as_str().is_some_and(|s| operand_names.contains(s))
 }
 
+fn is_floating_option(key: &str) -> bool {
+    #[derive(serde::Deserialize)]
+    struct NumericFields {
+        #[serde(rename = "floatOptions")]
+        float_options: Vec<String>,
+    }
+    static FLOAT_OPTIONS: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
+        let fields: NumericFields =
+            serde_json::from_str(include_str!("../../scripts/wpt_bridge/numeric-fields.json"))
+                .expect("valid shared WPT numeric-field contract");
+        fields.float_options
+    });
+    FLOAT_OPTIONS.iter().any(|field| field == key)
+}
+
 fn normalize_option_value(op_name: &str, key: &str, value: serde_json::Value) -> serde_json::Value {
+    if is_floating_option(key) && value.as_str() == Some("-0") {
+        return serde_json::json!(-0.0f64);
+    }
     if op_name == "pad"
         && key == "mode"
         && let Some(arr) = value.as_array()
@@ -369,7 +387,10 @@ pub fn build_method_args(
 
         // Non-operand scalar method arguments (axis, steps, etc.) go into options for
         // OperationExtras extraction during invoke.
-        options.insert(option_json_key(op_name, &key), value);
+        options.insert(
+            option_json_key(op_name, &key),
+            normalize_option_value(op_name, &key, value),
+        );
     }
 
     if op_name == "pad" {
