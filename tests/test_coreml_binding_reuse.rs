@@ -120,6 +120,7 @@ fn exact_input_and_constant_copies_keep_names_payloads_and_independent_ownership
                     };
                     assert_eq!(stats.output_backings_requested, 0);
                     assert_eq!(stats.output_backings_accepted, 0);
+                    assert_eq!(stats.proven_copy_outputs, 4);
                 }
             }
         }
@@ -146,6 +147,21 @@ fn arithmetic_alias_fanout_uses_native_results_not_original_input_bytes() {
                     ("0copy", copied),
                 ]))
                 .unwrap();
+            let mut builder = MLGraphBuilder::new(&mut context).unwrap();
+            let source = builder
+                .input(
+                    "fp32",
+                    &MLOperandDescriptor::new(MLOperandDataType::Float32, vec![4]),
+                )
+                .unwrap();
+            let negated = builder.neg(source).unwrap();
+            let source_copy = builder.identity(source).unwrap();
+            let mut mixed_graph = builder
+                .build(&MLNamedOperands::from([
+                    ("program", negated),
+                    ("source_copy", source_copy),
+                ]))
+                .unwrap();
             let input = tensor(&mut context, MLOperandDataType::Float32, &[4]);
             let first = tensor(&mut context, MLOperandDataType::Float32, &[4]);
             let second = tensor(&mut context, MLOperandDataType::Float32, &[4]);
@@ -160,8 +176,49 @@ fn arithmetic_alias_fanout_uses_native_results_not_original_input_bytes() {
             let expected = bytemuck::cast_slice::<f32, u8>(&[-1., 2., -3., 4.]);
             assert_eq!(read(&mut context, &first), expected);
             assert_eq!(read(&mut context, &second), expected);
+            let Some(BackendStatistics::Coreml(stats)) = context.rustnn_backend_statistics() else {
+                panic!("missing CoreML statistics");
+            };
+            assert_eq!(stats.proven_copy_outputs, 0);
             context.write_tensor(&first, &[0f32; 4]).unwrap();
             assert_eq!(read(&mut context, &second), expected);
+
+            context
+                .dispatch(
+                    &mut mixed_graph,
+                    &MLNamedTensors::from([("fp32", &input)]),
+                    &MLNamedTensors::from([("program", &first), ("source_copy", &second)]),
+                )
+                .unwrap();
+            assert_eq!(read(&mut context, &first), expected);
+            assert_eq!(
+                read(&mut context, &second),
+                bytemuck::cast_slice::<f32, u8>(&[1., -2., 3., -4.])
+            );
+            let Some(BackendStatistics::Coreml(before_failure)) =
+                context.rustnn_backend_statistics()
+            else {
+                panic!("missing CoreML statistics");
+            };
+            assert_eq!(before_failure.proven_copy_outputs, 1);
+            assert!(
+                context
+                    .dispatch(
+                        &mut mixed_graph,
+                        &MLNamedTensors::new(),
+                        &MLNamedTensors::from([("program", &first), ("source_copy", &second)]),
+                    )
+                    .is_err()
+            );
+            let Some(BackendStatistics::Coreml(after_failure)) =
+                context.rustnn_backend_statistics()
+            else {
+                panic!("missing CoreML statistics");
+            };
+            assert_eq!(
+                after_failure.proven_copy_outputs - before_failure.proven_copy_outputs,
+                0
+            );
         }
     }
 }
