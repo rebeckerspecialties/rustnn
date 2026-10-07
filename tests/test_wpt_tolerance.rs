@@ -314,6 +314,87 @@ fn strict_expected_values_preserve_numbers_and_reject_malformed_data() {
 }
 
 #[test]
+fn fixture_numeric_fields_share_one_contract() {
+    if !wpt_js_loader::node_available() {
+        eprintln!("[SKIP] fixture field contract requires Node.js");
+        return;
+    }
+    let bridge = wpt_js_loader::bridge_dir();
+    let contract_path = bridge.join("numeric-fields.json");
+    let contract: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&contract_path).unwrap()).unwrap();
+    let floating_options = contract["floatOptions"].as_array().unwrap();
+    let tensor_fields = contract["tensorData"].as_array().unwrap();
+    let mut unique = std::collections::HashSet::new();
+    for field in floating_options.iter().chain(tensor_fields) {
+        let field = field.as_str().unwrap();
+        assert!(unique.insert(field), "duplicate numeric field: {field}");
+        assert!(!["axis", "axes", "label", "unknown"].contains(&field));
+    }
+    assert!(!floating_options.is_empty());
+    assert_eq!(tensor_fields, &[serde_json::json!("data")]);
+    let output = std::process::Command::new("node")
+        .args([
+            "--input-type=module",
+            "-e",
+            r#"
+                import {readFileSync} from 'node:fs';
+                import {pathToFileURL} from 'node:url';
+                const {normalizeValue} = await import(pathToFileURL(process.argv[1]));
+                const fields = JSON.parse(readFileSync(process.argv[2], 'utf8'));
+                const options = Object.fromEntries(fields.floatOptions.map(key => [key, -0]));
+                Object.assign(options, {axis: -0, axes: [-0], label: '-0', unknown: -0});
+                process.stdout.write(JSON.stringify(normalizeValue({
+                    data: [-0, 0, Infinity, -Infinity, NaN, 1n], options,
+                })));
+            "#,
+        ])
+        .arg(bridge.join("normalize-fixture.mjs"))
+        .arg(&contract_path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let normalized: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        normalized["data"],
+        serde_json::json!(["-0", 0, "Infinity", "-Infinity", "NaN", "1"])
+    );
+    let operator = wpt_types::WptOperator {
+        name: "linear".into(),
+        arguments: serde_json::json!([{ "options": normalized["options"] }]),
+        outputs: serde_json::json!("output"),
+    };
+    let call = wpt_execute_graph::build_method_args(
+        &operator.name,
+        &operator,
+        &std::collections::HashMap::new(),
+        &std::collections::HashMap::new(),
+        &std::collections::HashSet::new(),
+    )
+    .unwrap();
+    for key in floating_options {
+        let key = key.as_str().unwrap();
+        assert_eq!(normalized["options"][key], "-0", "JS field {key}");
+        assert_eq!(
+            call.options[key]
+                .as_f64()
+                .unwrap_or_else(|| panic!("Rust field {key} must be a floating number"))
+                .to_bits(),
+            (-0.0f64).to_bits(),
+            "Rust field {key}"
+        );
+    }
+    assert_eq!(call.options["label"], "-0");
+    assert_eq!(call.options["axis"].as_u64(), Some(0));
+    assert_eq!(call.options["axes"], serde_json::json!([0]));
+    assert_eq!(call.options["unknown"].as_u64(), Some(0));
+}
+
+#[test]
 fn javascript_fixture_bridge_preserves_signed_zero_in_tensors_and_options() {
     if !wpt_js_loader::node_available() {
         eprintln!("[SKIP] signed-zero fixture bridge requires Node.js");

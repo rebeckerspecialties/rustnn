@@ -34,6 +34,10 @@ make test-wpt-trtx
 # LiteRT, and CoreML on macOS
 make test-wpt-litert
 make test-wpt-coreml
+
+# Compare the opt-in CoreML storage paths with the default baseline
+WPT_COREML_TENSOR_MODE=persistent make test-wpt-coreml
+WPT_COREML_TENSOR_MODE=backings make test-wpt-coreml
 ```
 
 Always use `--test-threads 1` for WPT runs. Parallel execution is not validated for `MLContext` thread safety.
@@ -124,6 +128,15 @@ WPT_COREML_DEVICE=npu WPT_REPORT_JSON=reports/gelu-coreml-npu.json \
   make test-wpt-coreml TEST_FILTER=coreml::gelu
 ```
 
+`WPT_COREML_TENSOR_MODE` is independent of the requested policy. Combine them
+to exercise persistent storage or output backings without resetting storage
+options when the harness selects a device:
+
+```bash
+WPT_COREML_DEVICE=gpu WPT_COREML_TENSOR_MODE=backings \
+  make test-wpt-coreml TEST_FILTER=coreml::cast
+```
+
 Add `WPT_STRICT_TOLERANCE=1` to use the upstream case's tolerance without local
 ULP minima, absolute-error floors, or CANN's FP16 allowance. This opt-in mode
 preserves the historical default while exposing numerical conformance gaps.
@@ -149,6 +162,9 @@ the revised upstream conversion without narrowing first to FP32; compatibility p
 The JavaScript fixture bridge preserves negative zero in tensor data and floating-point
 options rather than losing its sign during JSON serialization. This source fidelity is
 separate from the ULP comparator, which continues to treat signed zeros as equal.
+Both dump paths use the same normalizer; `scripts/wpt_bridge/numeric-fields.json` defines
+the tensor-data and floating-option fields shared with Rust option parsing. Integer WebIDL
+fields retain their zero-conversion semantics, and string labels are unchanged.
 The test-only JSON dependency enables round-trip binary64 parsing so finite source
 numbers also retain their original JavaScript precision. Production JSON parsing is unchanged.
 
@@ -197,6 +213,7 @@ make test-wpt-cann
 |----------|---------|-------------|
 | `WPT_DIR` | `.cache/wpt` | Path to WPT checkout |
 | `WPT_BACKEND` | (all available) | Limit backend: `onnx`, `trtx`, `litert`, `coreml`, or `cann` |
+| `WPT_COREML_TENSOR_MODE` | `baseline` | CoreML-only storage mode: `baseline`, `persistent` (native inputs, copied outputs), or `backings` (also propose fixed-output backings); the corpus and tolerances are unchanged |
 | `WPT_COREML_DEVICE` | `cpu` | Requested CoreML policy: `cpu`, `gpu`, or `npu`; not measured execution placement |
 | `WPT_STRICT_TOLERANCE` | (off) | Set to `1` for upstream source budgets and strict finite-value comparison; otherwise local compatibility allowances remain enabled |
 | `WPT_REPORT_JSON` | (none; `reports/wpt-conformance.json` when `CI` is set) | Write structured pass/fail JSON report |
