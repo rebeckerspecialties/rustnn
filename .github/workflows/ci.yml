@@ -109,6 +109,9 @@ jobs:
       - name: Run cargo test (library only)
         run: cargo test --lib
 
+      - name: Test WPT tolerance comparison and source budgets
+        run: make test-wpt-tolerance
+
       - name: Run CoreML unit and integration tests (without dynamic-inputs)
         if: runner.os == 'macOS'
         run: make test-coreml COREML_FEATURES=coreml-runtime
@@ -132,6 +135,16 @@ jobs:
         run: |
           make test-coreml-gelu COREML_FEATURES=coreml-runtime
           make test-coreml-gelu
+
+      - name: Test CoreML retained tensor ownership and reuse
+        if: runner.os == 'macOS'
+        run: |
+          make test-coreml-tensor-reuse COREML_FEATURES=coreml-runtime
+          make test-coreml-tensor-reuse
+
+      - name: Test self-contained CoreML KV benchmark
+        if: runner.os == 'macOS'
+        run: make test-coreml-kv-benchmark
 
       - name: Run cargo test (library only, CANN mock)
         run: cargo test --lib --features cann-runtime-mock
@@ -168,7 +181,7 @@ jobs:
         run: mkdocs build --strict
 
   capi-examples:
-    name: C and C++ API Examples
+    name: C and C++ API
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -197,6 +210,9 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-capi-examples-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run capi tests
+        run: cargo test -F capi,onnx-runtime capi --lib
 
       - name: Build and run C and C++ API examples
         run: make capi-examples

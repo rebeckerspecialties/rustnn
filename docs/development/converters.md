@@ -102,10 +102,6 @@ Rules that hold for every converter:
 
 ### CoreML
 
-- WebNN operand names are reversibly escaped when they are not valid MIL identifiers or are
-  reserved words. The model carries an explicit name-encoding metadata marker; runtime binding
-  translation is enabled only for marked models. See the
-  [tensor-name contract](https://rustnn.github.io/rustnn/integration/coreml/#tensor-names).
 - MIL has no rank-0 tensors at the boundary, no dilation in pooling, no `edge`/`reflection`
   padding above two dimensions and no tensors of rank 6 and above; integer arithmetic runs in
   float32.
@@ -121,7 +117,9 @@ Rules that hold for every converter:
 - WebNN names need not be MIL identifiers, and its input/output namespaces are independent.
   Unsafe or colliding names receive unique physical identifiers. Creator-defined
   `rustnn.webnn.input_aliases` and `rustnn.webnn.output_aliases` JSON mappings preserve
-  logical bindings in both execution paths and standalone exports.
+  logical bindings in byte-buffer, retained-tensor and one-shot execution, and standalone
+  exports. Older marked exports use reversible escaping; unmarked models keep literal names.
+  See the [tensor-name contract](https://rustnn.github.io/rustnn/integration/coreml/#tensor-names).
   Source-proven copies with identical type, shape and pending layout share one
   physical result: CoreML can omit duplicate scalar/dynamic copy features from prediction.
   Logical tensors still receive independent results. Unequal computations and real dtype
@@ -143,7 +141,10 @@ Rules that hold for every converter:
   float16. Native float16 GELU can exceed WebNN's error bound under accelerator-enabled
   policies. This preserves the public dtype and shape without forcing CPU execution;
   float32 GELU is unchanged. Deferred layout transposes are emitted after the final cast.
-  MLProgram graphs compile locally from a URL while retaining the requested compute policy.
+  Arithmetic and typed boundaries compile locally from a URL while retaining the requested
+  compute policy. Only input-free single programs made entirely of proven constant copies
+  prefer an in-memory asset, avoiding a BNNS URL constant-fold crash without changing the
+  arithmetic loading path.
 - Typed precision boundaries use native Pipeline children when CoreML can eliminate a
   real Half narrowing or fuse a widened kernel back into Half arithmetic. Child interfaces
   carry live results only; constants are rematerialized from the shared weight blob rather

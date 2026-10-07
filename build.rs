@@ -72,17 +72,19 @@ fn build_coreml_protos() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(feature = "coreml-runtime")]
 fn build_coreml_shim() {
-    // With the CoreML runtime, compile the Objective-C++ exception
-    // firewall (see src/executors/coreml_shim.mm). It catches Objective-C and
-    // C++ exceptions raised by CoreML before they can unwind across the
-    // `extern "C"` objc_msgSend boundary and abort the process.
-    // Build scripts run on the host; select by the actual Cargo target rather
-    // than cfg(target_os), which would incorrectly build Apple shims for Linux
-    // cross-targets and previously left iOS/watchOS calling failing stubs.
-    if env::var("CARGO_CFG_TARGET_VENDOR").as_deref() != Ok("apple") {
+    // Build scripts run on the host: select by the Cargo target, not the host's
+    // cfg. In particular, watchOS cannot compile source models with this API.
+    if !matches!(
+        env::var("CARGO_CFG_TARGET_OS").as_deref(),
+        Ok("macos" | "ios")
+    ) {
         return;
     }
 
+    // On supported Apple targets, compile the Objective-C++ exception
+    // firewall (see src/executors/coreml_shim.mm). It catches Objective-C and
+    // C++ exceptions raised by CoreML before they can unwind across the
+    // `extern "C"` objc_msgSend boundary and abort the process.
     let shim = "src/executors/coreml_shim.mm";
     println!("cargo:rerun-if-changed={shim}");
     cc::Build::new()

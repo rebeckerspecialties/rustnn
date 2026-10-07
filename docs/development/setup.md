@@ -23,7 +23,7 @@ The default build needs no native runtime beyond the prerequisites above.
 | Cargo feature | Additional requirements |
 |---|---|
 | `onnx-runtime` | The pinned ONNX Runtime; `make onnxruntime-download` installs it and the related Make targets configure `ORT_DYLIB_PATH` |
-| `coreml-runtime` | macOS and Xcode Command Line Tools; CoreML is supplied by macOS. Some in-memory execution paths require macOS 15+ |
+| `coreml-runtime` | Xcode and system CoreML on macOS/iOS; see the [CoreML guide](../integration/coreml.md) for deployment requirements and the tvOS dependency caveat |
 | `trtx-runtime`, `trtx-enterprise` | A compatible NVIDIA GPU and driver, CUDA 13.0, and a loadable TensorRT-RTX runtime |
 | `litert-runtime` | `flatc` on `PATH` plus the native LiteRT library provisioned by `litert-sys`; WPT runs also configure its library search path |
 | `cann-runtime` | An OHOS/Ascend HiAI environment and `libcann_shim.so` (or `CANN_SHIM_PATH`) |
@@ -49,18 +49,23 @@ Use the Makefile targets; they set feature flags and environment variables consi
 | `viz` | Export the sample graph as Graphviz DOT |
 | `onnx`, `onnx-validate` | Convert the sample graph to ONNX (`GRAPH_FILE=...` selects another graph); also execute it with ONNX Runtime |
 | `coreml`, `coreml-validate` | CoreML conversion and execution (macOS) |
+| `benchmark-coreml-kv` | Self-contained attention/cache comparison; optionally set `COREML_KV_CONFIG` for an external model/reference fixture; see [Examples](../user-guide/examples.md#coreml-kv-cache-benchmark) |
+| `test-coreml-kv-benchmark` | Oracle and cache-content regressions for all storage modes, without external fixtures; run in macOS CI |
 | `build-coreml`, `test-coreml` | Build all targets; run library and ordinary integration tests. `COREML_FEATURES=coreml-runtime` also checks the build without dynamic inputs |
 | `test-coreml-gather` | Focused active-dimension gather regressions, including scalar indices; `TEST_FILTER` selects a test |
 | `test-coreml-dtypes` | Focused numeric boundary regressions for typed dispatch and the convenience API; CI runs with and without dynamic inputs |
+| `test-coreml-gelu` | Exact Half GELU precision, shapes and compositions, including all Half encodings |
 | `test-coreml-precision` | Native typed-boundary, Half layout, constant, fanout and bounded-dynamic regressions |
 | `test-coreml-pipeline` | Bounded child-runtime, exact Float32/Half Cast, typed-storage and shared-weight source-plan regressions |
 | `test-coreml-matmul` | Source-proven Float32 products, cancellation and signed 256-step actual-output carry regressions |
 | `lint-coreml` | Strict Clippy for all CoreML targets with bounded dynamic inputs enabled |
+| `test-coreml-tensor-reuse` | Retained storage ownership, type conversion and shape regressions; CI runs with and without dynamic inputs |
 | `litert`, `cann` | LiteRT and CANN conversion of the sample graph |
 | `validate-cann-env`, `cann-build`, `cann-device-test` | OpenHarmony toolchain check, cross build, device test through `hdc`; see [CANN](../integration/cann.md) |
 | `validate-all-env` | Build, unit tests, ONNX and CoreML validation in one run |
 | `fetch-wpt` | Download the pinned WPT corpus into the cache (`WPT_DIR` overrides) |
 | `test-wpt` | WPT conformance on ONNX Runtime CPU |
+| `test-wpt-tolerance`, `test-wpt-tolerance-parity` | Backend-independent comparison regressions and direct upstream JavaScript-helper parity; the latter requires Node.js and a fetched WPT corpus and also runs after successful full ONNX/CoreML WPT targets |
 | `test-wpt-op OP=relu` | One operation; `WPT_BACKEND=onnx|trtx|litert|coreml` selects the backend |
 | `test-wpt-trtx`, `test-wpt-litert`, `test-wpt-coreml`, `test-wpt-cann` | Per-backend WPT runs (CANN cross-compiles and runs on the device over `hdc`); `test-wpt-report` and `test-wpt-coreml-report` also write the JSON report |
 | `wpt-sync-onnx`, `wpt-sync-trtx`, `wpt-sync-litert`, `wpt-sync-coreml`, `wpt-sync-cann` | Regenerate snapshots and expected-failure lists |

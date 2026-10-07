@@ -1003,3 +1003,95 @@ fn exact_matmul_normal_rust_executor_preserves_own_output_recurrent_state() {
         }
     }
 }
+
+#[test]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn exact_matmul_retained_storage_preserves_signed_own_state_without_input_copies() {
+    // This repeats the same closed-form implementation-fidelity oracle through
+    // retained native storage. It does not add a composed-graph WPT tolerance.
+    let graph = recurrent_cancellation_graph();
+    let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+    let descriptor = &graph.operands[0].descriptor;
+    for device in [DeviceType::Cpu, DeviceType::Gpu, DeviceType::Npu] {
+        for backings in [false, true] {
+            let model = compile_model(
+                converted.data.clone(),
+                converted.weights_data.clone(),
+                device,
+                false,
+            )
+            .unwrap();
+            assert!(matches!(model, CompiledCoremlModel::Pipeline(_)));
+            for sign in [1f32, -1.] {
+                let mut state = CoremlTensorStorage::new(DataType::Float32, 12, true).unwrap();
+                let mut carry = CoremlTensorStorage::new(DataType::Float32, 12, true).unwrap();
+                let mut increment = CoremlTensorStorage::new(DataType::Float32, 12, true).unwrap();
+                let projected = CoremlTensorStorage::new(DataType::Float32, 12, true).unwrap();
+                state.write(&f32_bytes(&[sign; 3])).unwrap();
+                increment.write(&f32_bytes(&[sign / 1024.; 3])).unwrap();
+                let mut statistics = crate::mlcontextoptions::CoremlTensorStatistics::default();
+                for step in 1..=256 {
+                    let inputs = HashMap::from([
+                        (
+                            "state".into(),
+                            CoremlTensorBinding {
+                                storage: &state,
+                                descriptor,
+                            },
+                        ),
+                        (
+                            "increment".into(),
+                            CoremlTensorBinding {
+                                storage: &increment,
+                                descriptor,
+                            },
+                        ),
+                    ]);
+                    let outputs = HashMap::from([
+                        (
+                            "carry".into(),
+                            CoremlTensorBinding {
+                                storage: &carry,
+                                descriptor,
+                            },
+                        ),
+                        (
+                            "projected".into(),
+                            CoremlTensorBinding {
+                                storage: &projected,
+                                descriptor,
+                            },
+                        ),
+                    ]);
+                    assert!(
+                        run_coreml_tensors(&model, &inputs, &outputs, backings, &mut statistics)
+                            .unwrap()
+                            .is_empty()
+                    );
+                    let mut returned = [0u8; 12];
+                    projected.read(&mut returned).unwrap();
+                    assert_eq!(f32_output_bits(&returned), dyadic_carry(sign, step - 1));
+                    carry.read(&mut returned).unwrap();
+                    assert_eq!(
+                        f32_output_bits(&returned),
+                        dyadic_carry(sign, step),
+                        "{device:?}, backings={backings}, sign={sign}, step={step}"
+                    );
+                    state.read(&mut returned).unwrap();
+                    assert_eq!(
+                        f32_output_bits(&returned),
+                        dyadic_carry(sign, step - 1),
+                        "destination aliased retained input"
+                    );
+                    // Rebind the actual output allocation, not reference bytes.
+                    std::mem::swap(&mut state, &mut carry);
+                }
+                assert_eq!(statistics.native_input_bindings, 512);
+                assert_eq!(statistics.input_copy_bytes, 0);
+                assert_eq!(statistics.output_copy_bytes, 24 * 256);
+                assert_eq!(statistics.output_backings_requested, 0);
+                assert_eq!(statistics.output_backings_accepted, 0);
+            }
+        }
+    }
+}
