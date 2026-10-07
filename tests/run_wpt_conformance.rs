@@ -117,6 +117,15 @@ fn main() {
         return;
     }
 
+    eprintln!(
+        "[WPT] comparison: {}",
+        if wpt_conformance::wpt_config::strict_wpt_tolerance() {
+            "strict upstream tolerance (no local ULP or absolute floors)"
+        } else {
+            "compatibility tolerance (local ULP and absolute floors enabled)"
+        }
+    );
+
     let args = Arguments::from_args();
     let wpt_dir = default_wpt_dir();
 

@@ -2,7 +2,7 @@
 
 use std::hash::{Hash, Hasher};
 
-use rustnn::backend_selection::Backend;
+use rustnn::backend_selection::{Backend, BackendDevice, DeviceType};
 use rustnn::mlcontext::{MLContext, MLContextOptions, MLPowerPreference, RustNNOptions};
 
 /// One WPT trial backend: a stable name prefix plus [`MLContextOptions`] with backend hints.
@@ -29,6 +29,14 @@ impl WptBackend {
 
     pub fn context_options(&self) -> &MLContextOptions {
         &self.options
+    }
+
+    fn with_coreml_device(mut self, device_type: DeviceType) -> Self {
+        self.options.set_accelerated(device_type != DeviceType::Cpu);
+        self.options = self
+            .options
+            .with_rustnn_device_hint(BackendDevice::Coreml { device_type });
+        self
     }
 
     /// Candidate backends for WPT trials (before availability probing).
@@ -121,7 +129,20 @@ impl WptBackend {
         };
 
         let mut available = Vec::new();
-        for backend in candidates {
+        for mut backend in candidates {
+            if backend.prefix == "coreml"
+                && cfg!(all(feature = "coreml-runtime", target_os = "macos"))
+            {
+                let requested = super::wpt_config::coreml_requested_device();
+                let device_type = match requested {
+                    "cpu" => DeviceType::Cpu,
+                    "gpu" => DeviceType::Gpu,
+                    "npu" => DeviceType::Npu,
+                    _ => unreachable!("validated CoreML policy"),
+                };
+                backend = backend.with_coreml_device(device_type);
+                eprintln!("[WPT] CoreML requested device: {requested} (not measured placement)");
+            }
             if backend.is_available() {
                 available.push(backend);
             } else {
@@ -132,5 +153,42 @@ impl WptBackend {
             }
         }
         available
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn coreml_policy_preserves_each_tensor_storage_mode() {
+        use super::*;
+
+        for mode in ["persistent", "backings", "baseline"] {
+            let mut tuning = RustNNOptions::default();
+            if mode != "baseline" {
+                tuning.coreml.reuse_tensor_storage = true;
+                tuning.coreml.output_backings = mode == "backings";
+            }
+            for device_type in [DeviceType::Cpu, DeviceType::Gpu, DeviceType::Npu] {
+                let backend = WptBackend::new(
+                    "coreml",
+                    MLContextOptions::new(MLPowerPreference::Default, false)
+                        .with_rustnn_backend_hint(Backend::Coreml)
+                        .with_rustnn_options(tuning.clone()),
+                )
+                .with_coreml_device(device_type);
+                let expected = MLContextOptions::new(
+                    MLPowerPreference::Default,
+                    device_type != DeviceType::Cpu,
+                )
+                .with_rustnn_backend_hint(Backend::Coreml)
+                .with_rustnn_options(tuning.clone())
+                .with_rustnn_device_hint(BackendDevice::Coreml { device_type });
+                assert_eq!(
+                    backend.context_options(),
+                    &expected,
+                    "{mode} storage under {device_type:?} permission"
+                );
+            }
+        }
     }
 }
