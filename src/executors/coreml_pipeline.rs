@@ -255,8 +255,6 @@ fn source_aliases(description: &ModelDescription) -> Result<CoremlFeatureAliases
         .iter()
         .map(|feature| feature.name.clone())
         .collect();
-    let legacy = metadata.get(coreml_names::METADATA_KEY).map(String::as_str)
-        == Some(coreml_names::METADATA_VALUE);
     let aliases = |key: &str, declared: &[String], input: bool| -> Result<_, GraphError> {
         if let Some(json) = metadata.get(key) {
             parse_feature_aliases(
@@ -265,14 +263,6 @@ fn source_aliases(description: &ModelDescription) -> Result<CoremlFeatureAliases
                 if input { "input" } else { "output" },
                 !input,
             )
-        } else if legacy {
-            Ok(declared
-                .iter()
-                .filter_map(|physical| {
-                    let logical = coreml_names::decode(physical).into_owned();
-                    (logical != *physical).then(|| (logical, physical.clone()))
-                })
-                .collect())
         } else {
             Ok(HashMap::new())
         }
@@ -1411,6 +1401,92 @@ mod tests {
                 .all(|stage| !stage.release_after.contains(&"early".into()))
         );
     }
+
+    #[test]
+    fn source_plan_requires_explicit_aliases_and_rejects_duplicate_proofs() {
+        use crate::converters::coreml_names;
+        let input = coreml_names::encode("source input").into_owned();
+        let output = coreml_names::encode("copy output").into_owned();
+        let mut source = parent(vec![child(&[&input], &[&output])]);
+        let description = source.description.as_mut().unwrap();
+        description.input = vec![feature(&input)];
+        description.output = vec![feature(&output)];
+        let metadata = description.metadata.get_or_insert_default();
+        metadata.user_defined.insert(
+            coreml_names::METADATA_KEY.into(),
+            coreml_names::METADATA_VALUE.into(),
+        );
+        let plan = SourcePlan::parse(&source.encode_to_vec()).unwrap().unwrap();
+        assert!(plan.aliases.inputs.is_empty() && plan.aliases.outputs.is_empty());
+        assert!(plan.inputs.contains_key(&input) && plan.outputs.contains_key(&output));
+
+        let proof = CoremlPassthrough {
+            input: "source input".into(),
+            descriptor: OperandDescriptor {
+                data_type: DataType::Float16,
+                shape: vec![Dimension::Static(4)],
+                pending_permutation: vec![],
+            },
+        };
+        let metadata = &mut source
+            .description
+            .as_mut()
+            .unwrap()
+            .metadata
+            .as_mut()
+            .unwrap()
+            .user_defined;
+        metadata.insert(
+            INPUT_ALIASES_METADATA_KEY.into(),
+            serde_json::json!({"source input": input}).to_string(),
+        );
+        metadata.insert(
+            OUTPUT_ALIASES_METADATA_KEY.into(),
+            serde_json::json!({"copy output": output}).to_string(),
+        );
+        metadata.insert(
+            OUTPUT_PASSTHROUGHS_METADATA_KEY.into(),
+            serde_json::json!({"copy output": proof}).to_string(),
+        );
+        let plan = SourcePlan::parse(&source.encode_to_vec()).unwrap().unwrap();
+        assert_eq!(plan.aliases.inputs["source input"], input);
+        assert_eq!(plan.aliases.outputs["copy output"], output);
+        assert_eq!(plan.aliases.passthroughs.len(), 1);
+
+        let encoded_input = serde_json::to_string(&input).unwrap();
+        let encoded_output = serde_json::to_string(&output).unwrap();
+        let encoded_proof = serde_json::to_string(&proof).unwrap();
+        for (key, duplicate) in [
+            (
+                INPUT_ALIASES_METADATA_KEY,
+                format!(r#"{{"source input":{encoded_input},"source input":{encoded_input}}}"#),
+            ),
+            (
+                OUTPUT_ALIASES_METADATA_KEY,
+                format!(r#"{{"copy output":{encoded_output},"copy output":{encoded_output}}}"#),
+            ),
+            (
+                OUTPUT_PASSTHROUGHS_METADATA_KEY,
+                format!(r#"{{"copy output":{encoded_proof},"copy output":{encoded_proof}}}"#),
+            ),
+        ] {
+            let mut malformed = source.clone();
+            malformed
+                .description
+                .as_mut()
+                .unwrap()
+                .metadata
+                .as_mut()
+                .unwrap()
+                .user_defined
+                .insert(key.into(), duplicate);
+            assert!(
+                SourcePlan::parse(&malformed.encode_to_vec()).is_err(),
+                "{key}"
+            );
+        }
+    }
+
     #[test]
     fn source_plan_rejects_missing_redefined_or_mistyped_features() {
         for children in [

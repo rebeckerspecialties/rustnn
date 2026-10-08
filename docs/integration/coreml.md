@@ -131,12 +131,15 @@ spaces, Unicode, punctuation, leading digits or MIL keywords. The converter reco
 logical-to-physical bindings in creator-defined `rustnn.webnn.input_aliases` and
 `rustnn.webnn.output_aliases` metadata. RustNN applies them automatically; standalone
 consumers should apply them when binding and retrieving CoreML features.
-Previous exports with only the `rustnn.coreml.name_encoding=hex-v1` marker remain
-readable; unmarked third-party models keep literal feature names.
+The JSON maps are the binding contract; models without them keep literal feature names.
+Duplicate logical keys are rejected, even when their values match. Bindings and original
+constant payloads are validated and decoded once when the model is loaded.
 Proven equal copy outputs may share one physical result, avoiding CoreML's omission of
 duplicate scalar/dynamic features. RustNN supplies each requested logical output tensor;
 unequal computations and real dtype conversions remain separate. Returning an original
 input or constant directly remains invalid under WebNN's build rules.
+Same-dtype `cast` is a proven copy and may be fulfilled without reading CoreML's returned
+feature; a cast that changes dtype still executes the conversion boundary.
 For produced copy chains rooted in an input, the serialized
 `rustnn.webnn.output_passthroughs` map identifies the logical input and original descriptor.
 RustNN validates dtype, actual shape and byte length and snapshots that input before
@@ -159,6 +162,10 @@ The same checked bindings apply with retained tensor storage enabled. Proven cop
 are snapshotted before prediction and written into independently owned outputs;
 they do not propose native output backings. Coalesced arithmetic outputs use the
 returned physical result, with at most one backing proposed per physical feature.
+`proven_copy_outputs` counts logical outputs supplied this way in successful dispatches,
+separately from `output_copy_bytes` (which also includes those copies). WPT reports record
+per-trial deltas, including trials whose later result comparison fails. Neither counter
+measures work or copies inside CoreML or its selected hardware.
 
 ## Reusing tensor storage
 

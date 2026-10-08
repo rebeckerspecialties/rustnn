@@ -1022,6 +1022,11 @@ fn exact_matmul_retained_storage_preserves_signed_own_state_without_input_copies
             )
             .unwrap();
             assert!(matches!(model, CompiledCoremlModel::Pipeline(_)));
+            assert_eq!(
+                model.proven_copy_output_count(),
+                0,
+                "exact arithmetic is not an original-source copy"
+            );
             for sign in [1f32, -1.] {
                 let mut state = CoremlTensorStorage::new(DataType::Float32, 12, true).unwrap();
                 let mut carry = CoremlTensorStorage::new(DataType::Float32, 12, true).unwrap();
@@ -1089,6 +1094,9 @@ fn exact_matmul_retained_storage_preserves_signed_own_state_without_input_copies
                 assert_eq!(statistics.native_input_bindings, 512);
                 assert_eq!(statistics.input_copy_bytes, 0);
                 assert_eq!(statistics.output_copy_bytes, 24 * 256);
+                // This direct executor does not update the public dispatch
+                // census; the mixed-Pipeline MLContext test checks that path.
+                assert_eq!(statistics.proven_copy_outputs, 0);
                 assert_eq!(statistics.output_backings_requested, 0);
                 assert_eq!(statistics.output_backings_accepted, 0);
             }
