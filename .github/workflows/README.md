@@ -22,6 +22,8 @@
   `make test-coreml-gelu` covers exact GELU precision, shapes, and compositions under
   both feature configurations, including all FP16 encodings under CPU/GPU/NPU requests
   and Float32 negative tails through the context's three tensor-storage modes.
+  `make test-coreml-sqrt` is the focused Float32 Sqrt check; the full CoreML suite
+  also checks subnormal inputs, source shapes, constant views and native compositions.
   `make test-coreml-tensor-reuse` also runs in both configurations to check retained
   storage ownership, conversion, aliasing and resizing.
   It also builds and tests CoreML with and without dynamic inputs using `make build-coreml`

@@ -40,14 +40,14 @@ struct Stage {
 enum StageExecution {
     Native,
     TypedUnary(typed_unary::Kind),
-    ConstantGelu(Box<typed_unary::ConstantUnary>),
+    ConstantUnary(Box<typed_unary::ConstantUnary>),
 }
 
 fn execution(model: &Model, wire: &[u8]) -> StageExecution {
     if let Some(kind) = typed_unary::classify(model, wire) {
         StageExecution::TypedUnary(kind)
     } else if let Some(constant) = typed_unary::classify_constant(model, wire) {
-        StageExecution::ConstantGelu(Box::new(constant))
+        StageExecution::ConstantUnary(Box::new(constant))
     } else {
         StageExecution::Native
     }
@@ -670,7 +670,7 @@ impl PipelineModel {
             )?;
         }
         for stage in &mut plan.stages {
-            if let StageExecution::ConstantGelu(constant) = &mut stage.execution {
+            if let StageExecution::ConstantUnary(constant) = &mut stage.execution {
                 constant.resolve(mapped.as_deref().map(MappedWeights::bytes))?;
             }
         }
@@ -1008,8 +1008,8 @@ impl PipelineModel {
                     }
                     return Ok(());
                 }
-                if matches!(stage.execution, StageExecution::ConstantGelu(_)) {
-                    self.predict_typed_unary(stage, typed_unary::Kind::Gelu, &mut values)?;
+                if let StageExecution::ConstantUnary(constant) = &stage.execution {
+                    self.predict_typed_unary(stage, constant.kind, &mut values)?;
                     for name in &stage.release_after {
                         values.remove(name);
                     }
@@ -1138,24 +1138,24 @@ impl PipelineModel {
         values: &mut HashMap<String, ReleaseOnDrop>,
     ) -> Result<(), GraphError> {
         let target = &stage.outputs[0];
-        let (actual_shape, bytes) = if let StageExecution::ConstantGelu(constant) = &stage.execution
-        {
-            (
-                constant.shape.clone(),
-                constant.bytes(self.weights.as_deref().map(MappedWeights::bytes))?,
-            )
-        } else {
-            let source = &stage.inputs[0];
-            let feature = values.get(&source.name).ok_or_else(|| {
-                boundary_error(format!("typed unary stage lacks source `{}`", source.name))
-            })?;
-            let array: *mut Object = msg_send![feature.0, multiArrayValue];
-            unsafe { validate_source_feature(source, array)? };
-            let (kind, layout, pointer) = unsafe { multiarray_storage(array)? };
-            let shape = layout.shape.iter().map(|&size| size as i64).collect();
-            let bytes = unsafe { read_array_storage(pointer, &layout, kind.element_size()) };
-            (shape, std::borrow::Cow::Owned(bytes))
-        };
+        let (actual_shape, bytes) =
+            if let StageExecution::ConstantUnary(constant) = &stage.execution {
+                (
+                    constant.shape.clone(),
+                    constant.bytes(self.weights.as_deref().map(MappedWeights::bytes))?,
+                )
+            } else {
+                let source = &stage.inputs[0];
+                let feature = values.get(&source.name).ok_or_else(|| {
+                    boundary_error(format!("typed unary stage lacks source `{}`", source.name))
+                })?;
+                let array: *mut Object = msg_send![feature.0, multiArrayValue];
+                unsafe { validate_source_feature(source, array)? };
+                let (kind, layout, pointer) = unsafe { multiarray_storage(array)? };
+                let shape = layout.shape.iter().map(|&size| size as i64).collect();
+                let bytes = unsafe { read_array_storage(pointer, &layout, kind.element_size()) };
+                (shape, std::borrow::Cow::Owned(bytes))
+            };
         validate_feature_shape(array_type(target)?, &actual_shape)?;
         let result = typed_unary::evaluate(&bytes, operation).map_err(boundary_error)?;
         let output = unsafe { create_multi_array(&actual_shape, array_type(target)?.data_type)? };
@@ -1974,16 +1974,25 @@ mod tests {
         for operation in [
             typed_unary::Kind::FloatCast(typed_unary::Direction::Narrow),
             typed_unary::Kind::Gelu,
+            typed_unary::Kind::Sqrt,
         ] {
             let mut graph = cast_graph(vec![Dimension::Static(6)]);
-            if operation == typed_unary::Kind::Gelu {
+            if matches!(operation, typed_unary::Kind::Gelu | typed_unary::Kind::Sqrt) {
                 graph.operands.truncate(2);
                 graph.operands[1].descriptor.data_type = DataType::Float32;
                 graph.output_operands = vec![1];
-                graph.operations = vec![crate::operators::Operation::Gelu {
-                    input: 0,
-                    options: None,
-                    outputs: vec![1],
+                graph.operations = vec![if operation == typed_unary::Kind::Gelu {
+                    crate::operators::Operation::Gelu {
+                        input: 0,
+                        options: None,
+                        outputs: vec![1],
+                    }
+                } else {
+                    crate::operators::Operation::Sqrt {
+                        input: 0,
+                        options: None,
+                        outputs: vec![1],
+                    }
                 }];
             }
             let converted = CoremlMlProgramConverter.convert(&graph).unwrap();

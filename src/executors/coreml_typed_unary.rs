@@ -16,6 +16,9 @@ pub(super) use kernels::{Direction, cast};
 #[path = "coreml_gelu.rs"]
 mod gelu;
 
+#[path = "coreml_sqrt.rs"]
+mod sqrt;
+
 #[path = "coreml_unary_constant.rs"]
 mod constant;
 pub(super) use constant::{ConstantUnary, classify_constant};
@@ -24,12 +27,14 @@ pub(super) use constant::{ConstantUnary, classify_constant};
 pub(super) enum Kind {
     FloatCast(Direction),
     Gelu,
+    Sqrt,
 }
 
 pub(super) fn evaluate(bytes: &[u8], kind: Kind) -> Result<Vec<u8>, &'static str> {
     match kind {
         Kind::FloatCast(direction) => cast(bytes, direction),
         Kind::Gelu => gelu::evaluate(bytes),
+        Kind::Sqrt => sqrt::evaluate(bytes),
     }
 }
 
@@ -309,12 +314,12 @@ pub(super) fn classify(model: &Model, source: &[u8]) -> Option<Kind> {
         return None;
     }
     let operation = &block.operations[0];
-    if operation.r#type == "gelu" && function.opset != "CoreML7" {
+    if matches!(operation.r#type.as_str(), "gelu" | "sqrt") && function.opset != "CoreML7" {
         return None;
     }
-    if !matches!(operation.r#type.as_str(), "cast" | "gelu")
+    if !matches!(operation.r#type.as_str(), "cast" | "gelu" | "sqrt")
         || operation.outputs.len() != 1
-        || operation.inputs.len() != 2
+        || operation.inputs.len() != if operation.r#type == "sqrt" { 1 } else { 2 }
         || !operation.blocks.is_empty()
         || !operation.attributes.is_empty()
     {
@@ -334,7 +339,7 @@ pub(super) fn classify(model: &Model, source: &[u8]) -> Option<Kind> {
     }
     let source_type = tensor(input.r#type.as_ref()?)?;
     let target_type = tensor(output.r#type.as_ref()?)?;
-    let (kind, source_code, target_code, argument, target_name) = match (
+    let (kind, source_code, target_code, argument) = match (
         operation.r#type.as_str(),
         source_type.data_type,
         target_type.data_type,
@@ -343,17 +348,16 @@ pub(super) fn classify(model: &Model, source: &[u8]) -> Option<Kind> {
             Kind::FloatCast(Direction::Widen),
             65552,
             65568,
-            "dtype",
-            "fp32",
+            Some(("dtype", "fp32")),
         ),
         ("cast", 11, 10) => (
             Kind::FloatCast(Direction::Narrow),
             65568,
             65552,
-            "dtype",
-            "fp16",
+            Some(("dtype", "fp16")),
         ),
-        ("gelu", 11, 11) => (Kind::Gelu, 65568, 65568, "mode", "EXACT"),
+        ("gelu", 11, 11) => (Kind::Gelu, 65568, 65568, Some(("mode", "EXACT"))),
+        ("sqrt", 11, 11) => (Kind::Sqrt, 65568, 65568, None),
         _ => return None,
     };
     let canonical_shape = |ty: &mil::TensorType| {
@@ -374,32 +378,34 @@ pub(super) fn classify(model: &Model, source: &[u8]) -> Option<Kind> {
     if canonical_shape(target_type) != canonical_shape(source_type) {
         return None;
     }
-    let dtype = operation.inputs.get(argument)?;
-    if dtype.arguments.len() != 1 {
-        return None;
-    }
-    let argument::binding::Binding::Value(dtype) = dtype.arguments[0].binding.as_ref()? else {
-        return None;
-    };
-    let dtype_type = tensor(dtype.r#type.as_ref()?)?;
-    if dtype_type.data_type != 2
-        || dtype_type.rank != 0
-        || !dtype_type.dimensions.is_empty()
-        || !dtype_type.attributes.is_empty()
-    {
-        return None;
-    }
-    let value::Value::ImmediateValue(dtype) = dtype.value.as_ref()? else {
-        return None;
-    };
-    let value::immediate_value::Value::Tensor(dtype) = dtype.value.as_ref()? else {
-        return None;
-    };
-    let tensor_value::Value::Strings(dtype) = dtype.value.as_ref()? else {
-        return None;
-    };
-    if dtype.values.len() != 1 || dtype.values[0] != target_name {
-        return None;
+    if let Some((argument, target_name)) = argument {
+        let dtype = operation.inputs.get(argument)?;
+        if dtype.arguments.len() != 1 {
+            return None;
+        }
+        let argument::binding::Binding::Value(dtype) = dtype.arguments[0].binding.as_ref()? else {
+            return None;
+        };
+        let dtype_type = tensor(dtype.r#type.as_ref()?)?;
+        if dtype_type.data_type != 2
+            || dtype_type.rank != 0
+            || !dtype_type.dimensions.is_empty()
+            || !dtype_type.attributes.is_empty()
+        {
+            return None;
+        }
+        let value::Value::ImmediateValue(dtype) = dtype.value.as_ref()? else {
+            return None;
+        };
+        let value::immediate_value::Value::Tensor(dtype) = dtype.value.as_ref()? else {
+            return None;
+        };
+        let tensor_value::Value::Strings(dtype) = dtype.value.as_ref()? else {
+            return None;
+        };
+        if dtype.values.len() != 1 || dtype.values[0] != target_name {
+            return None;
+        }
     }
     let description = model.description.as_ref()?;
     if description.input.len() != 1
@@ -584,6 +590,73 @@ mod tests {
         model
     }
 
+    fn sqrt_model() -> Model {
+        let mut model = gelu_model();
+        let model::Type::MlProgram(program) = model.r#type.as_mut().unwrap() else {
+            unreachable!()
+        };
+        let operation = &mut program
+            .functions
+            .get_mut("main")
+            .unwrap()
+            .block_specializations
+            .get_mut("CoreML7")
+            .unwrap()
+            .operations[0];
+        operation.r#type = "sqrt".into();
+        operation.inputs.remove("mode");
+        model
+    }
+
+    #[test]
+    fn sqrt_requires_complete_float32_source_provenance() {
+        let model = sqrt_model();
+        assert_eq!(classify(&model, &model.encode_to_vec()), Some(Kind::Sqrt));
+        for mutation in 0..5 {
+            let mut changed = model.clone();
+            let model::Type::MlProgram(program) = changed.r#type.as_mut().unwrap() else {
+                unreachable!()
+            };
+            let function = program.functions.get_mut("main").unwrap();
+            let block = function.block_specializations.get_mut("CoreML7").unwrap();
+            match mutation {
+                0 => {
+                    block.operations[0]
+                        .inputs
+                        .insert("extra".into(), Default::default());
+                }
+                1 => {
+                    block.operations[0].outputs[0].r#type = Some(tensor_type(10));
+                }
+                2 => {
+                    block.operations.push(block.operations[0].clone());
+                }
+                3 => {
+                    function.inputs[0].r#type = Some(tensor_type(10));
+                }
+                4 => {
+                    changed.description.as_mut().unwrap().input[0]
+                        .r#type
+                        .as_mut()
+                        .unwrap()
+                        .is_optional = true;
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                classify(&changed, &changed.encode_to_vec()),
+                None,
+                "mutation {mutation}"
+            );
+        }
+        let mut unknown = model.encode_to_vec();
+        unknown.extend([0xf8, 0x7f, 0x01]);
+        assert_eq!(
+            classify(&Model::decode(unknown.as_slice()).unwrap(), &unknown),
+            None
+        );
+    }
+
     #[test]
     fn exact_gelu_requires_complete_mode_types_and_feature_provenance() {
         let model = gelu_model();
@@ -661,7 +734,7 @@ mod tests {
     fn feature_flexibility_cannot_relax_a_static_mil_axis() {
         use crate::protos::coreml::specification::SizeRange;
         use array_feature_type::{EnumeratedShapes, Shape, ShapeFlexibility, ShapeRange};
-        for original in [model(), gelu_model()] {
+        for original in [model(), gelu_model(), sqrt_model()] {
             for mixed in [false, true] {
                 let mut changed = original.clone();
                 let model::Type::MlProgram(program) = changed.r#type.as_mut().unwrap() else {

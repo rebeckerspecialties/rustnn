@@ -159,10 +159,15 @@ Rules that hold for every converter:
   float Cast children use exact host narrowing/widening. Source-proven Float32 EXACT
   GELU uses a host binary64 complementary-error-function evaluation with integer
   Float32 input/output conversion, preserving subnormal rounding independently of the
-  thread's flush mode. Other arithmetic children remain native. Constant GELU inputs
+  thread's flush mode. Source Float32 Sqrt uses an integer square-root/midpoint
+  comparison, so a native kernel cannot flush its subnormal inputs before producing
+  their normal roots. New partition cuts isolate source Sqrt operations; they do
+  not repartition internal square roots introduced by other lowerings. Other
+  arithmetic children remain native.
+  Constant GELU and Sqrt inputs
   retain checked original weight ranges; supported constant views are applied as bit
   transport, not native arithmetic or a second serialized weight payload. Native constexpr
-  and arithmetic producers are materialized before GELU. These typed stages are installed
+  and arithmetic producers are materialized before typed evaluation. These typed stages are installed
   by RustNN's CoreML executor, not by loading an exported model directly with `MLModel`.
 - Affected Half widening layouts use compact private features. Original high-rank inputs
   declare `rustnn.webnn.compact_input_views`; contiguous storage is viewed with its owner
