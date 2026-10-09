@@ -161,10 +161,10 @@ Rules that hold for every converter:
   Float32 input/output conversion, preserving subnormal rounding independently of the
   thread's flush mode. Source Float32 Sqrt uses an integer square-root/midpoint
   comparison, so a native kernel cannot flush its subnormal inputs before producing
-  their normal roots. New partition cuts isolate source Sqrt operations; they do
-  not repartition internal square roots introduced by other lowerings. Other
-  arithmetic children remain native.
-  Constant GELU and Sqrt inputs
+  their normal roots. Source Float32 Exp uses binary64 evaluation and integer
+  Float32 rounding to retain representable subnormal tails. These cuts isolate
+  source Sqrt and Exp operations, not internal operations in other lowerings.
+  Other arithmetic children remain native. Constant GELU, Sqrt, and Exp inputs
   retain checked original weight ranges; supported constant views are applied as bit
   transport, not native arithmetic or a second serialized weight payload. Native constexpr
   and arithmetic producers are materialized before typed evaluation. These typed stages are installed

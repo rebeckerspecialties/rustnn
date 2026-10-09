@@ -1,37 +1,9 @@
 //! Cancellation-free Float32 exact GELU, independent of the caller's FP32 FTZ mode.
 
+use super::binary32::narrow;
+
 unsafe extern "C" {
     fn erfc(x: f64) -> f64;
-}
-
-fn rounded_shift(value: u64, shift: u32) -> u64 {
-    let kept = value >> shift;
-    let remainder = value & ((1_u64 << shift) - 1);
-    let midpoint = 1_u64 << (shift - 1);
-    kept + u64::from(remainder > midpoint || (remainder == midpoint && kept & 1 != 0))
-}
-
-// Unlike a hardware f64->f32 cast, this rounds subnormals even with FPCR.FZ set.
-// The existing Cast stage narrows f32->f16, with a different exponent/width.
-fn narrow(value: f64) -> u32 {
-    let bits = value.to_bits();
-    let sign = ((bits >> 32) as u32) & 0x8000_0000;
-    let exponent = ((bits >> 52) & 0x7ff) as i32;
-    let fraction = bits & 0x000f_ffff_ffff_ffff;
-    if exponent == 0x7ff {
-        return sign | 0x7f80_0000 | if fraction == 0 { 0 } else { 0x0040_0000 };
-    }
-    let exponent = exponent - 896;
-    if exponent >= 255 {
-        return sign | 0x7f80_0000;
-    }
-    if exponent <= 0 {
-        if exponent < -23 {
-            return sign;
-        }
-        return sign | rounded_shift(fraction | (1 << 52), (30 - exponent) as u32) as u32;
-    }
-    sign | (((exponent as u32) << 23) + rounded_shift(fraction, 29) as u32)
 }
 
 fn gelu(bits: u32) -> u32 {

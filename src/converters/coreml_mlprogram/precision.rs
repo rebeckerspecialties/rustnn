@@ -1358,24 +1358,31 @@ impl CoremlMlProgramConverter {
                     .map(move |value| (value.name.clone(), index))
             })
             .collect();
-        let float32_sqrt_results: HashSet<_> = graph
+        let float32_unary_results: HashMap<_, _> = graph
             .operations
             .iter()
-            .filter(|operation| matches!(operation, Operation::Sqrt { .. }))
-            .flat_map(|operation| operation.outputs())
-            .filter(|&&id| {
+            .filter_map(|operation| {
+                let kind = match operation {
+                    Operation::Sqrt { .. } => "sqrt",
+                    Operation::Exp { .. } => "exp",
+                    _ => return None,
+                };
+                Some((operation.outputs(), kind))
+            })
+            .flat_map(|(outputs, kind)| outputs.iter().map(move |&id| (id, kind)))
+            .filter(|&(id, _)| {
                 graph
                     .operand(id)
                     .is_some_and(|operand| operand.descriptor.data_type == DataType::Float32)
             })
-            .map(|&id| operand_name(graph, id))
+            .map(|(id, kind)| (operand_name(graph, id), kind))
             .collect();
-        let source_sqrt = |operation: &MilOperation| {
-            operation.r#type == "sqrt"
-                && operation
-                    .outputs
-                    .iter()
-                    .any(|output| float32_sqrt_results.contains(&output.name))
+        let source_unary = |operation: &MilOperation| {
+            operation.outputs.iter().any(|output| {
+                float32_unary_results
+                    .get(&output.name)
+                    .is_some_and(|&kind| operation.r#type == kind)
+            })
         };
         let mut constant_operations = constant_closure(&block.operations);
         // A typed unary child can read original floating constants and exact
@@ -1401,7 +1408,7 @@ impl CoremlMlProgramConverter {
             }
         }
         for operation in &block.operations {
-            if (operation.r#type == "gelu" || source_sqrt(operation))
+            if (operation.r#type == "gelu" || source_unary(operation))
                 && let Some(input) = named_input(operation, "x")
                 && native_constants.contains(input)
                 && let Some(producer) = producers.get(input)
@@ -1471,10 +1478,10 @@ impl CoremlMlProgramConverter {
                 cuts.insert(index);
                 cuts.insert(index + 1);
             }
-            // Source Float32 Sqrt must not flush a positive subnormal input:
-            // its result is normal and zero exceeds the existing 1-ULP gate.
-            // Do not alter internal sqrt operations in other lowerings.
-            if source_sqrt(operation) {
+            // Source Float32 Sqrt must preserve subnormal inputs, and Exp
+            // must preserve representable tails within its accuracy budget.
+            // Do not alter internal unary operations in other lowerings.
+            if source_unary(operation) {
                 cuts.insert(index);
                 cuts.insert(index + 1);
             }
