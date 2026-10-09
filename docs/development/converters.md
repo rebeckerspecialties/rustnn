@@ -118,7 +118,7 @@ Rules that hold for every converter:
   Unsafe or colliding names receive unique physical identifiers. Creator-defined
   `rustnn.webnn.input_aliases` and `rustnn.webnn.output_aliases` JSON mappings preserve
   logical bindings in byte-buffer, retained-tensor and one-shot execution, and standalone
-  exports. Older marked exports use reversible escaping; unmarked models keep literal names.
+  exports. The JSON maps define the binding contract; models without them keep literal names.
   See the [tensor-name contract](https://rustnn.github.io/rustnn/integration/coreml/#tensor-names).
   Source-proven copies with identical type, shape and pending layout share one
   physical result: CoreML can omit duplicate scalar/dynamic copy features from prediction.
@@ -132,10 +132,13 @@ Rules that hold for every converter:
   Copy proofs cover identity, same-type cast, same-shape reshape, identity transpose, and
   static full-span, unit-stride slice. An equal square shape does not prove a transpose is
   an identity; dynamic maximum extents do not prove a full-span slice.
-  Copies rooted in original constants use versioned `rustnn.webnn.output_constant_copies`
-  metadata: output bindings reference a deduplicated descriptor and original base64 bytes.
-  Only output-reachable constants are included. Execution checks bounds and byte lengths
-  before decoding, then supplies independently owned results. The valid native graph still
+  Copies rooted in original constants use version-2 `rustnn.webnn.output_constant_copies`
+  metadata: output bindings reference a descriptor, original weight-record offset and
+  consistency checksum, without embedding tensor payloads. Unchanged blob weights reuse
+  their record; immediate or converted constants retain one original raw record per source.
+  Execution validates referenced ranges and byte lengths, shares the immutable weight owner
+  or compacts only the required ranges, then supplies independently owned results. Standalone
+  compiled models require the original weights sidecar. The valid native graph still
   runs; arithmetic-derived outputs are not reconstructed from inputs or constants.
 - The internal `shape` extension lowers to MIL `shape`, retaining its native int32 result
   inside CoreML and widening the public int64 result at readback. Imported shape tensors
