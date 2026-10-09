@@ -8,6 +8,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::ptr;
+use std::rc::Rc;
 
 use objc::runtime::{BOOL, NO, Object};
 use objc::{class, msg_send, sel, sel_impl};
@@ -44,7 +45,9 @@ enum StageExecution {
 pub(super) struct SourcePlan {
     inputs: HashMap<String, FeatureDescription>,
     outputs: HashMap<String, FeatureDescription>,
-    aliases: CoremlFeatureAliases,
+    aliases: CoremlFeatureAliases<'static>,
+    // Resolve references only after the one shared source mapping is available.
+    constant_copy_metadata: Option<String>,
     stages: Vec<Stage>,
 }
 
@@ -237,7 +240,9 @@ fn program_weights(program: &mil::Program) -> Result<bool, GraphError> {
     Ok(any)
 }
 
-fn source_aliases(description: &ModelDescription) -> Result<CoremlFeatureAliases, GraphError> {
+fn source_aliases(
+    description: &ModelDescription,
+) -> Result<CoremlFeatureAliases<'static>, GraphError> {
     let empty = HashMap::new();
     let metadata = description
         .metadata
@@ -278,21 +283,25 @@ fn source_aliases(description: &ModelDescription) -> Result<CoremlFeatureAliases
         .map(|json| input_views::parse(json, &inputs))
         .transpose()?
         .unwrap_or_default();
-    let constant_copies = metadata
-        .get(OUTPUT_CONSTANT_COPIES_METADATA_KEY)
-        .map(|json| parse_constant_copies(json, &output_aliases, &outputs, &passthroughs))
-        .transpose()?
-        .unwrap_or_default();
     Ok(CoremlFeatureAliases {
         inputs: input_aliases,
         outputs: output_aliases,
         passthroughs,
         compact_input_views,
-        constant_copies,
+        constant_copies: HashMap::new(),
     })
 }
 
 impl SourcePlan {
+    fn constant_copy_metadata(description: &ModelDescription) -> Option<String> {
+        description
+            .metadata
+            .as_ref()?
+            .user_defined
+            .get(OUTPUT_CONSTANT_COPIES_METADATA_KEY)
+            .cloned()
+    }
+
     #[cfg(test)]
     fn native_control(mut self) -> Self {
         for stage in &mut self.stages {
@@ -315,6 +324,7 @@ impl SourcePlan {
             let outputs = arrays(&description.output)?;
             return Ok(Some(Self {
                 aliases: source_aliases(description)?,
+                constant_copy_metadata: Self::constant_copy_metadata(description),
                 stages: vec![Stage {
                     source: bytes.to_vec(),
                     inputs: description.input.clone(),
@@ -432,6 +442,7 @@ impl SourcePlan {
             inputs,
             outputs,
             aliases,
+            constant_copy_metadata: Self::constant_copy_metadata(description),
             stages,
         }))
     }
@@ -519,7 +530,7 @@ struct PipelineState {
     diagnostics: CoremlLoadDiagnostics,
 }
 
-struct MappedWeights {
+pub(super) struct MappedWeights {
     owner: ReleaseOnDrop,
     pointer: *const u8,
     length: usize,
@@ -556,7 +567,7 @@ impl MappedWeights {
         })
     }
 
-    fn bytes(&self) -> &[u8] {
+    pub(super) fn bytes(&self) -> &[u8] {
         let _ = &self.owner;
         // SAFETY: immutable NSData mapping is retained for the graph lifetime.
         unsafe { std::slice::from_raw_parts(self.pointer, self.length) }
@@ -569,7 +580,7 @@ pub(crate) struct PipelineModel {
     state: RefCell<PipelineState>,
     source_root: tempfile::TempDir,
     device: DeviceType,
-    weights: Option<MappedWeights>,
+    weights: Option<Rc<MappedWeights>>,
 }
 
 impl std::fmt::Debug for PipelineModel {
@@ -599,12 +610,12 @@ impl Drop for PipelineModel {
 }
 
 impl PipelineModel {
-    pub(super) fn feature_aliases(&self) -> &CoremlFeatureAliases {
+    pub(super) fn feature_aliases(&self) -> &CoremlFeatureAliases<'static> {
         &self.plan.aliases
     }
 
     pub(super) fn compile(
-        plan: SourcePlan,
+        mut plan: SourcePlan,
         weights: Option<&[u8]>,
         device: DeviceType,
     ) -> Result<Self, GraphError> {
@@ -612,7 +623,9 @@ impl PipelineModel {
             .prefix("rustnn_coreml_children_")
             .tempdir()
             .map_err(|error| boundary_error(format!("Pipeline source directory: {error}")))?;
-        if plan.stages.iter().any(|stage| stage.has_weights) {
+        let needs_weights = plan.stages.iter().any(|stage| stage.has_weights)
+            || plan.constant_copy_metadata.is_some();
+        if needs_weights {
             let weights = weights
                 .ok_or_else(|| boundary_error("Pipeline source references missing weights"))?;
             std::fs::write(root.path().join("weights.bin"), weights)
@@ -622,13 +635,26 @@ impl PipelineModel {
             .stages
             .iter()
             .position(|stage| matches!(stage.execution, StageExecution::Native));
-        let mapped = if plan.stages.iter().any(|stage| stage.has_weights) {
-            Some(autoreleasepool(|| unsafe {
+        let mapped = if needs_weights {
+            Some(Rc::new(autoreleasepool(|| unsafe {
                 MappedWeights::open(&root.path().join("weights.bin"))
-            })?)
+            })?))
         } else {
             None
         };
+        if let Some(metadata) = plan.constant_copy_metadata.take() {
+            let storage = mapped
+                .as_ref()
+                .map(|mapping| CoremlWeightStorage::Mapped(Rc::clone(mapping)));
+            let outputs = plan.outputs.keys().cloned().collect::<Vec<_>>();
+            plan.aliases.constant_copies = parse_constant_copies(
+                &metadata,
+                &plan.aliases.outputs,
+                &outputs,
+                &plan.aliases.passthroughs,
+                storage.as_ref(),
+            )?;
+        }
         let diagnostics = LoadTrace::new(device).finish(
             if first_native.is_some() {
                 CoremlLoadRoute::CompiledUrl
@@ -712,7 +738,7 @@ impl PipelineModel {
                 stage,
                 temporary.path(),
                 &self.source_root.path().join("weights.bin"),
-                self.weights.as_ref().map(MappedWeights::bytes),
+                self.weights.as_deref().map(MappedWeights::bytes),
             )? && !state.diagnostics.failures.contains(&diagnostic)
             {
                 state.diagnostics.failures.push(diagnostic);
@@ -1492,6 +1518,125 @@ mod tests {
                 assert_eq!(wide.to_bits(), expected.to_f32().to_bits());
             }
         }
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn constant_copy_pipeline_shares_one_mapping_and_releases_it_after_dispatch() {
+        use crate::converters::{CoremlMlProgramConverter, GraphConverter};
+        use crate::graph::{ConstantData, Operand, OperandKind};
+        use crate::operators::Operation;
+
+        let mut graph = cast_graph(vec![Dimension::Static(8)]);
+        let expected = [1_u32, 0x8000_0000, 0x3f80_0001, 0x7fc1_2345]
+            .repeat(327_680)
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(expected.len(), 5 * 1024 * 1024);
+        let descriptor = OperandDescriptor {
+            data_type: DataType::Float32,
+            shape: vec![Dimension::Static((expected.len() / 4) as u32)],
+            pending_permutation: vec![],
+        };
+        for (name, kind) in [
+            ("original constant", OperandKind::Constant),
+            ("first copy", OperandKind::Output),
+            ("second copy", OperandKind::Output),
+        ] {
+            graph.operands.push(Operand {
+                name: Some(name.into()),
+                kind,
+                descriptor: descriptor.clone(),
+            });
+        }
+        graph.constant_operand_ids_to_handles.insert(
+            3,
+            ConstantData {
+                data: expected.clone(),
+                label: None,
+            },
+        );
+        for (input, output) in [(3, 4), (4, 5)] {
+            graph.operations.push(Operation::Identity {
+                input,
+                outputs: vec![output],
+                options: None,
+            });
+            graph.output_operands.push(output);
+        }
+        let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+        let input_descriptor = graph.operands[0].descriptor.clone();
+        let outputs = graph
+            .output_operands
+            .iter()
+            .map(|&id| {
+                let operand = &graph.operands[id as usize];
+                (operand.name.clone().unwrap(), operand.descriptor.clone())
+            })
+            .collect::<HashMap<_, _>>();
+        drop(graph);
+        let input_bytes = [0_u8; 32];
+        let inputs = HashMap::from([(
+            "source input".into(),
+            CoremlByteInput {
+                data: &input_bytes,
+                descriptor: &input_descriptor,
+            },
+        )]);
+        assert!(compile_model(converted.data.clone(), None, DeviceType::Cpu, false).is_err());
+        let mut corrupted = converted.weights_data.clone().unwrap();
+        corrupted[128] ^= 1;
+        assert!(
+            compile_model(
+                converted.data.clone(),
+                Some(corrupted),
+                DeviceType::Cpu,
+                false
+            )
+            .is_err()
+        );
+        let weak = autoreleasepool(|| {
+            let model = compile_model(
+                converted.data,
+                converted.weights_data,
+                DeviceType::Cpu,
+                false,
+            )
+            .unwrap();
+            let CompiledCoremlModel::Pipeline(pipeline) = &model else {
+                panic!("typed Cast plus constant output must remain a Pipeline")
+            };
+            let mapping = pipeline.weights.as_ref().unwrap();
+            let weak = Rc::downgrade(mapping);
+            for copy in pipeline.plan.aliases.constant_copies.values() {
+                let CoremlWeightStorage::Mapped(owner) = &copy.bytes.storage else {
+                    panic!("constant views must reuse the source mapping")
+                };
+                assert!(Rc::ptr_eq(mapping, owner));
+                assert_eq!(&*copy.bytes, expected);
+            }
+            assert_eq!(pipeline.plan.aliases.constant_copies.len(), 2);
+            for _ in 0..2 {
+                let mut result = run_coreml_bytes(&model, &inputs, &outputs).unwrap();
+                assert_eq!(result["first copy"], expected);
+                assert_eq!(result["second copy"], expected);
+                result.get_mut("first copy").unwrap()[0] ^= 0xff;
+                assert_eq!(result["second copy"], expected);
+            }
+            let mut invalid = outputs.clone();
+            invalid.get_mut("second copy").unwrap().data_type = DataType::Int32;
+            assert!(run_coreml_bytes(&model, &inputs, &invalid).is_err());
+            assert_eq!(
+                run_coreml_bytes(&model, &inputs, &outputs).unwrap()["second copy"],
+                expected
+            );
+            weak
+        });
+        assert!(
+            weak.upgrade().is_none(),
+            "mapping must not outlive the model"
+        );
     }
 
     #[cfg(target_vendor = "apple")]
