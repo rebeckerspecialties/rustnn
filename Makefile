@@ -218,7 +218,7 @@ test-coreml-scalar-binary:
 
 .PHONY: test-coreml-gelu
 test-coreml-gelu:
-	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_gelu --test test_coreml_gelu_precision -- $(TEST_FILTER) --test-threads=1
+	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_gelu --test test_coreml_gelu_precision --test test_coreml_gelu_float32 -- $(TEST_FILTER) --test-threads=1
 
 .PHONY: test-coreml-precision
 test-coreml-precision:
@@ -226,7 +226,7 @@ test-coreml-precision:
 
 .PHONY: test-coreml-pipeline
 test-coreml-pipeline:
-	$(CARGO) test --lib --no-default-features --features $(COREML_FEATURES) -- coreml::float_cast --test-threads=1
+	$(CARGO) test --lib --no-default-features --features $(COREML_FEATURES) -- coreml::typed_unary --test-threads=1
 	$(CARGO) test --lib --no-default-features --features $(COREML_FEATURES) -- coreml::pipeline --test-threads=1
 
 .PHONY: lint-coreml

@@ -89,6 +89,21 @@ graph and conversion buffers are dropped. They do not keep a second decoded weig
 allocation. Referenced bytes are checked before loading a child, and each public output
 still receives independently writable storage. The mapping is released with the graph.
 
+A complete, source-proven Float32 EXACT GELU child runs on the host with a binary64
+complementary-error-function evaluation. This avoids cancellation in the negative tail;
+integer input/output conversion retains Float32 subnormals without changing the thread's
+floating-point control register. GELU is isolated from preceding/following native operations
+in larger graphs. This is a Rust CoreML executor repair: loading an exported model directly
+with Apple's `MLModel` does not install these typed stages. Immediate and weight-backed constants are checked against their declared
+type and length; exact constant views and Half widening preserve their original bits.
+Requested compute permissions still apply to native children; they do not move this typed
+host stage to GPU or Neural Engine. Public dtype, active shape, and output ownership remain
+unchanged in all three tensor-storage modes. Unknown GELU modes or unproven source programs
+remain native rather than being reinterpreted as EXACT.
+Native constexpr or arithmetic producers are materialized before GELU rather than
+re-evaluated by the host stage. Correctness of those producers and later consumers remains
+independently testable; the GELU repair does not replace unrelated native arithmetic.
+
 A complete, source-proven Float32-to-Half or Half-to-Float32 Cast child uses integer-bit
 conversion rather than a native cast that may flush subnormals or erase a rounding
 boundary. The proof checks the entire known-wire program and its feature descriptors,

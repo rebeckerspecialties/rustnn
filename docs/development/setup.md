@@ -54,7 +54,7 @@ Use the Makefile targets; they set feature flags and environment variables consi
 | `build-coreml`, `test-coreml` | Build all targets; run library and ordinary integration tests. `COREML_FEATURES=coreml-runtime` also checks the build without dynamic inputs |
 | `test-coreml-gather` | Focused active-dimension gather regressions, including scalar indices; `TEST_FILTER` selects a test |
 | `test-coreml-dtypes` | Focused numeric boundary regressions for typed dispatch and the convenience API; CI runs with and without dynamic inputs |
-| `test-coreml-gelu` | Exact Half GELU precision, shapes and compositions, including all Half encodings |
+| `test-coreml-gelu` | Exact GELU precision, shapes, constant closures and native compositions, including all Half encodings and Float32 negative tails |
 | `test-coreml-precision` | Native typed-boundary, Half layout, constant, fanout and bounded-dynamic regressions |
 | `test-coreml-pipeline` | Bounded child-runtime, exact Float32/Half Cast, typed-storage and shared-weight source-plan regressions |
 | `lint-coreml` | Strict Clippy for all CoreML targets with bounded dynamic inputs enabled |

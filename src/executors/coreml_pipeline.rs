@@ -36,10 +36,21 @@ struct Stage {
     execution: StageExecution,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 enum StageExecution {
     Native,
-    FloatCast(float_cast::Direction),
+    TypedUnary(typed_unary::Kind),
+    ConstantGelu(Box<typed_unary::ConstantUnary>),
+}
+
+fn execution(model: &Model, wire: &[u8]) -> StageExecution {
+    if let Some(kind) = typed_unary::classify(model, wire) {
+        StageExecution::TypedUnary(kind)
+    } else if let Some(constant) = typed_unary::classify_constant(model, wire) {
+        StageExecution::ConstantGelu(Box::new(constant))
+    } else {
+        StageExecution::Native
+    }
 }
 
 pub(super) struct SourcePlan {
@@ -313,8 +324,9 @@ impl SourcePlan {
     pub(super) fn parse(bytes: &[u8]) -> Result<Option<Self>, GraphError> {
         let model = Model::decode(bytes)
             .map_err(|error| boundary_error(format!("invalid CoreML source: {error}")))?;
+        let stage_execution = execution(&model, bytes);
         if matches!(model.r#type, Some(model::Type::MlProgram(_)))
-            && let Some(direction) = float_cast::classify(&model, bytes)
+            && stage_execution != StageExecution::Native
         {
             let description = model
                 .description
@@ -334,8 +346,11 @@ impl SourcePlan {
                         .filter(|name| !outputs.contains_key(*name))
                         .cloned()
                         .collect(),
-                    has_weights: false,
-                    execution: StageExecution::FloatCast(direction),
+                    has_weights: match model.r#type.as_ref().unwrap() {
+                        model::Type::MlProgram(program) => program_weights(program)?,
+                        _ => unreachable!(),
+                    },
+                    execution: stage_execution,
                 }],
                 inputs,
                 outputs,
@@ -416,8 +431,7 @@ impl SourcePlan {
                 outputs: child_description.output.clone(),
                 release_after: vec![],
                 has_weights: program_weights(program)?,
-                execution: float_cast::classify(child, wire)
-                    .map_or(StageExecution::Native, StageExecution::FloatCast),
+                execution: execution(child, wire),
             });
         }
         for (name, feature) in &outputs {
@@ -590,7 +604,7 @@ impl std::fmt::Debug for PipelineModel {
         f.debug_struct("BoundedCoremlPipeline")
             .field("children", &self.plan.stages.len())
             .field("native_stage_count", &native)
-            .field("host_cast_stages", &host)
+            .field("host_typed_stages", &host)
             .field("loaded_model_capacity", &1)
             .field("compiled_children", &compiled)
             .field("loaded_children", &loaded)
@@ -654,6 +668,11 @@ impl PipelineModel {
                 &plan.aliases.passthroughs,
                 storage.as_ref(),
             )?;
+        }
+        for stage in &mut plan.stages {
+            if let StageExecution::ConstantGelu(constant) = &mut stage.execution {
+                constant.resolve(mapped.as_deref().map(MappedWeights::bytes))?;
+            }
         }
         let diagnostics = LoadTrace::new(device).finish(
             if first_native.is_some() {
@@ -982,8 +1001,15 @@ impl PipelineModel {
         })?;
         for (index, stage) in self.plan.stages.iter().enumerate() {
             autoreleasepool(|| unsafe {
-                if let StageExecution::FloatCast(direction) = &stage.execution {
-                    self.predict_cast(stage, *direction, &mut values)?;
+                if let StageExecution::TypedUnary(kind) = &stage.execution {
+                    self.predict_typed_unary(stage, *kind, &mut values)?;
+                    for name in &stage.release_after {
+                        values.remove(name);
+                    }
+                    return Ok(());
+                }
+                if matches!(stage.execution, StageExecution::ConstantGelu(_)) {
+                    self.predict_typed_unary(stage, typed_unary::Kind::Gelu, &mut values)?;
                     for name in &stage.release_after {
                         values.remove(name);
                     }
@@ -1105,24 +1131,33 @@ impl PipelineModel {
         })
     }
 
-    unsafe fn predict_cast(
+    unsafe fn predict_typed_unary(
         &self,
         stage: &Stage,
-        direction: float_cast::Direction,
+        operation: typed_unary::Kind,
         values: &mut HashMap<String, ReleaseOnDrop>,
     ) -> Result<(), GraphError> {
-        let source = &stage.inputs[0];
         let target = &stage.outputs[0];
-        let feature = values
-            .get(&source.name)
-            .ok_or_else(|| boundary_error(format!("typed Cast lacks source `{}`", source.name)))?;
-        let array: *mut Object = msg_send![feature.0, multiArrayValue];
-        unsafe { validate_source_feature(source, array)? };
-        let (kind, layout, pointer) = unsafe { multiarray_storage(array)? };
-        let actual_shape: Vec<_> = layout.shape.iter().map(|&size| size as i64).collect();
+        let (actual_shape, bytes) = if let StageExecution::ConstantGelu(constant) = &stage.execution
+        {
+            (
+                constant.shape.clone(),
+                constant.bytes(self.weights.as_deref().map(MappedWeights::bytes))?,
+            )
+        } else {
+            let source = &stage.inputs[0];
+            let feature = values.get(&source.name).ok_or_else(|| {
+                boundary_error(format!("typed unary stage lacks source `{}`", source.name))
+            })?;
+            let array: *mut Object = msg_send![feature.0, multiArrayValue];
+            unsafe { validate_source_feature(source, array)? };
+            let (kind, layout, pointer) = unsafe { multiarray_storage(array)? };
+            let shape = layout.shape.iter().map(|&size| size as i64).collect();
+            let bytes = unsafe { read_array_storage(pointer, &layout, kind.element_size()) };
+            (shape, std::borrow::Cow::Owned(bytes))
+        };
         validate_feature_shape(array_type(target)?, &actual_shape)?;
-        let bytes = unsafe { read_array_storage(pointer, &layout, kind.element_size()) };
-        let result = float_cast::cast(&bytes, direction).map_err(boundary_error)?;
+        let result = typed_unary::evaluate(&bytes, operation).map_err(boundary_error)?;
         let output = unsafe { create_multi_array(&actual_shape, array_type(target)?.data_type)? };
         let (kind, layout, pointer) = unsafe { multiarray_storage(output)? };
         unsafe { write_array_storage(pointer, &layout, kind.element_size(), &result)? };
@@ -1136,7 +1171,7 @@ impl PipelineModel {
                 .is_some()
         {
             return Err(boundary_error(
-                "typed Cast did not produce a unique owned feature",
+                "typed unary stage did not produce a unique owned feature",
             ));
         }
         Ok(())
@@ -1783,6 +1818,127 @@ mod tests {
 
     #[cfg(target_vendor = "apple")]
     #[test]
+    fn typed_gelu_classifies_scalar_constant_and_dynamic_source_features() {
+        use crate::converters::{CoremlMlProgramConverter, GraphConverter};
+        let mut cases = Vec::new();
+        cases.push((vec![], true));
+        #[cfg(feature = "dynamic-inputs")]
+        cases.push((
+            vec![Dimension::Dynamic(crate::graph::DynamicDimension {
+                name: "length".into(),
+                max_size: 8,
+            })],
+            false,
+        ));
+        for (shape, constant) in cases {
+            let mut graph = cast_graph(shape);
+            graph.operands.truncate(2);
+            graph.operands[1].descriptor.data_type = DataType::Float32;
+            graph.output_operands = vec![1];
+            graph.operations = vec![crate::operators::Operation::Gelu {
+                input: 0,
+                options: None,
+                outputs: vec![1],
+            }];
+            if constant {
+                graph.input_operands.clear();
+                graph.operands[0].kind = crate::graph::OperandKind::Constant;
+                graph.constant_operand_ids_to_handles.insert(
+                    0,
+                    crate::graph::ConstantData {
+                        data: (-10.0_f32).to_le_bytes().to_vec(),
+                        label: None,
+                    },
+                );
+            }
+            let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+            let model = Model::decode(converted.data.as_slice()).unwrap();
+            let plan = SourcePlan::parse(&converted.data).unwrap();
+            assert!(
+                plan.as_ref().is_some_and(|plan| plan
+                    .stages
+                    .iter()
+                    .all(|stage| stage.execution != StageExecution::Native)),
+                "{model:#?}"
+            );
+        }
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn typed_gelu_native_control_accuracy_and_warm_timings() {
+        use crate::converters::{CoremlMlProgramConverter, GraphConverter};
+        for length in [4_u32, 128, 4096] {
+            let mut graph = cast_graph(vec![Dimension::Static(length)]);
+            graph.operands.truncate(2);
+            graph.operands[1].descriptor.data_type = DataType::Float32;
+            graph.output_operands = vec![1];
+            graph.operations = vec![crate::operators::Operation::Gelu {
+                input: 0,
+                options: None,
+                outputs: vec![1],
+            }];
+            let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+            let input_bits = [0xc1200000_u32, 0xc0a00000, 0xbf800000, 0x3f800000];
+            let expected = [0x9ab83c9b_u32, 0xb5c05e5d, 0xbe227686, 0x3f57625f];
+            let bytes: Vec<_> = (0..length as usize)
+                .flat_map(|index| input_bits[index % 4].to_ne_bytes())
+                .collect();
+            let inputs = [(
+                "source input".into(),
+                CoremlByteInput {
+                    data: &bytes,
+                    descriptor: &graph.operands[0].descriptor,
+                },
+            )]
+            .into();
+            let outputs = [(
+                "represented half".into(),
+                graph.operands[1].descriptor.clone(),
+            )]
+            .into();
+            for device in [DeviceType::Cpu, DeviceType::Gpu, DeviceType::Npu] {
+                for repaired in [false, true] {
+                    let plan = SourcePlan::parse(&converted.data).unwrap().unwrap();
+                    let plan = if repaired {
+                        plan
+                    } else {
+                        plan.native_control()
+                    };
+                    let model = PipelineModel::compile(plan, None, device).unwrap();
+                    let actual = model.predict(&inputs, &outputs).unwrap();
+                    let max_ulp = actual["represented half"]
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .enumerate()
+                        .map(|(index, bytes)| {
+                            u32::from_ne_bytes(*bytes).abs_diff(expected[index % 4])
+                        })
+                        .max()
+                        .unwrap();
+                    if repaired {
+                        assert_eq!(max_ulp, 0);
+                    }
+                    for _ in 0..5 {
+                        std::hint::black_box(model.predict(&inputs, &outputs).unwrap());
+                    }
+                    let start = std::time::Instant::now();
+                    for _ in 0..25 {
+                        std::hint::black_box(model.predict(&inputs, &outputs).unwrap());
+                    }
+                    eprintln!(
+                        "GELU length={length} permission={device:?} repaired={repaired} max_ulp={max_ulp} warm_us={:.3} route={:?}",
+                        start.elapsed().as_secs_f64() * 1e6 / 25.0,
+                        model.diagnostics().route
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
     fn typed_cast_pipeline_preserves_outputs_without_compilation_or_policy() {
         use crate::converters::{CoremlMlProgramConverter, GraphConverter};
         let graph = cast_graph(vec![Dimension::Static(65_536)]);
@@ -1813,91 +1969,99 @@ mod tests {
 
     #[cfg(target_vendor = "apple")]
     #[test]
-    fn typed_cast_reads_actual_padded_storage_without_padding_or_reinterpretation() {
+    fn typed_unary_reads_actual_padded_storage_without_padding_or_reinterpretation() {
         use crate::converters::{CoremlMlProgramConverter, GraphConverter};
-        let graph = cast_graph(vec![Dimension::Static(6)]);
-        let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
-        let plan = SourcePlan::parse(&converted.data).unwrap().unwrap();
-        let model = PipelineModel::compile(plan, None, DeviceType::Cpu).unwrap();
-        assert_eq!(
-            model.plan.stages[0].execution,
-            StageExecution::FloatCast(float_cast::Direction::Narrow)
-        );
-        let data: Vec<_> = [
-            1.0003_f32,
-            -0.0,
-            -2f32.powi(-25),
-            f32::NAN,
-            f32::INFINITY,
-            2f32.powi(-24),
-        ]
-        .into_iter()
-        .flat_map(f32::to_ne_bytes)
-        .collect();
-        let mut backing = vec![0xdd_u8; 12 * 4];
-        let result = autoreleasepool(|| unsafe {
-            let mut error: *mut Object = ptr::null_mut();
-            let numbers = |values: &[i64]| {
-                let objects: Vec<*mut Object> = values
-                    .iter()
-                    .map(|&value| {
-                        let object: *mut Object =
-                            msg_send![class!(NSNumber), numberWithLongLong: value];
-                        object
-                    })
-                    .collect();
-                let array: *mut Object = msg_send![class!(NSArray), arrayWithObjects: objects.as_ptr() count: objects.len()];
-                array
-            };
-            let alloc: *mut Object = msg_send![class!(MLMultiArray), alloc];
-            let source: *mut Object = msg_send![alloc,
+        for operation in [
+            typed_unary::Kind::FloatCast(typed_unary::Direction::Narrow),
+            typed_unary::Kind::Gelu,
+        ] {
+            let mut graph = cast_graph(vec![Dimension::Static(6)]);
+            if operation == typed_unary::Kind::Gelu {
+                graph.operands.truncate(2);
+                graph.operands[1].descriptor.data_type = DataType::Float32;
+                graph.output_operands = vec![1];
+                graph.operations = vec![crate::operators::Operation::Gelu {
+                    input: 0,
+                    options: None,
+                    outputs: vec![1],
+                }];
+            }
+            let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+            let plan = SourcePlan::parse(&converted.data).unwrap().unwrap();
+            let model = PipelineModel::compile(plan, None, DeviceType::Cpu).unwrap();
+            assert_eq!(
+                model.plan.stages[0].execution,
+                StageExecution::TypedUnary(operation)
+            );
+            let data: Vec<_> = [
+                1.0003_f32,
+                -0.0,
+                -2f32.powi(-25),
+                f32::NAN,
+                f32::INFINITY,
+                2f32.powi(-24),
+            ]
+            .into_iter()
+            .flat_map(f32::to_ne_bytes)
+            .collect();
+            let mut backing = vec![0xdd_u8; 12 * 4];
+            let result = autoreleasepool(|| unsafe {
+                let mut error: *mut Object = ptr::null_mut();
+                let numbers = |values: &[i64]| {
+                    let objects: Vec<*mut Object> = values
+                        .iter()
+                        .map(|&value| {
+                            let object: *mut Object =
+                                msg_send![class!(NSNumber), numberWithLongLong: value];
+                            object
+                        })
+                        .collect();
+                    let array: *mut Object = msg_send![class!(NSArray), arrayWithObjects: objects.as_ptr() count: objects.len()];
+                    array
+                };
+                let alloc: *mut Object = msg_send![class!(MLMultiArray), alloc];
+                let source: *mut Object = msg_send![alloc,
                 initWithDataPointer: backing.as_mut_ptr().cast::<std::ffi::c_void>()
                 shape: numbers(&[6])
                 dataType: NativeType::Float32.code()
                 strides: numbers(&[2])
                 deallocator: ptr::null_mut::<Object>()
                 error: &mut error];
+                assert!(
+                    !source.is_null(),
+                    "{}",
+                    ns_error_to_string(error, "padded Cast source")
+                );
+                let source = ReleaseOnDrop(source);
+                let (kind, layout, pointer) = multiarray_storage(source.0).unwrap();
+                write_array_storage(pointer, &layout, kind.element_size(), &data).unwrap();
+                let feature: *mut Object =
+                    msg_send![class!(MLFeatureValue), featureValueWithMultiArray: source.0];
+                let feature: *mut Object = msg_send![feature, retain];
+                let mut values = HashMap::from([(
+                    model.plan.stages[0].inputs[0].name.clone(),
+                    ReleaseOnDrop(feature),
+                )]);
+                model
+                    .predict_typed_unary(&model.plan.stages[0], operation, &mut values)
+                    .unwrap();
+                let returned: *mut Object = msg_send![
+                    values[&model.plan.stages[0].outputs[0].name].0,
+                    multiArrayValue
+                ];
+                let (kind, layout, pointer) = multiarray_storage(returned).unwrap();
+                read_array_storage(pointer, &layout, kind.element_size())
+            });
+            assert_eq!(result, typed_unary::evaluate(&data, operation).unwrap());
             assert!(
-                !source.is_null(),
-                "{}",
-                ns_error_to_string(error, "padded Cast source")
+                backing
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .enumerate()
+                    .all(|(index, value)| index % 2 == 0 || *value == [0xdd; 4])
             );
-            let source = ReleaseOnDrop(source);
-            let (kind, layout, pointer) = multiarray_storage(source.0).unwrap();
-            write_array_storage(pointer, &layout, kind.element_size(), &data).unwrap();
-            let feature: *mut Object =
-                msg_send![class!(MLFeatureValue), featureValueWithMultiArray: source.0];
-            let feature: *mut Object = msg_send![feature, retain];
-            let mut values = HashMap::from([(
-                model.plan.stages[0].inputs[0].name.clone(),
-                ReleaseOnDrop(feature),
-            )]);
-            model
-                .predict_cast(
-                    &model.plan.stages[0],
-                    float_cast::Direction::Narrow,
-                    &mut values,
-                )
-                .unwrap();
-            let returned: *mut Object = msg_send![
-                values[&model.plan.stages[0].outputs[0].name].0,
-                multiArrayValue
-            ];
-            let (kind, layout, pointer) = multiarray_storage(returned).unwrap();
-            read_array_storage(pointer, &layout, kind.element_size())
-        });
-        assert_eq!(
-            result,
-            float_cast::cast(&data, float_cast::Direction::Narrow).unwrap()
-        );
-        assert!(
-            backing
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .enumerate()
-                .all(|(index, value)| index % 2 == 0 || *value == [0xdd; 4])
-        );
-        assert_eq!(model.cache_counts(), (0, 0));
+            assert_eq!(model.cache_counts(), (0, 0));
+        }
     }
 }

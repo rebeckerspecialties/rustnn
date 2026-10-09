@@ -1358,7 +1358,38 @@ impl CoremlMlProgramConverter {
                     .map(move |value| (value.name.clone(), index))
             })
             .collect();
-        let constant_operations = constant_closure(&block.operations);
+        let mut constant_operations = constant_closure(&block.operations);
+        // A typed GELU child can read original floating constants and exact
+        // views/casts, but does not evaluate native constexpr operations or
+        // integer-source casts. Materialize those results in the preceding
+        // native child instead of rematerializing an unsupported closure
+        // together with GELU and silently selecting its inaccurate native op.
+        let mut native_constants = HashSet::new();
+        for (index, operation) in block.operations.iter().enumerate() {
+            if constant_operations.contains(&index)
+                && (operation.r#type.starts_with("constexpr_")
+                    || operation.outputs.iter().any(|output| {
+                        !tensor(output).is_some_and(|value| {
+                            value.data_type == MilDataType::Float16 as i32
+                                || value.data_type == MilDataType::Float32 as i32
+                        })
+                    })
+                    || inputs(operation)
+                        .iter()
+                        .any(|name| native_constants.contains(name)))
+            {
+                native_constants.extend(operation.outputs.iter().map(|value| value.name.clone()));
+            }
+        }
+        for operation in &block.operations {
+            if operation.r#type == "gelu"
+                && let Some(input) = named_input(operation, "x")
+                && native_constants.contains(input)
+                && let Some(producer) = producers.get(input)
+            {
+                constant_operations.remove(producer);
+            }
+        }
         let mut cuts = BTreeSet::new();
         let graph_outputs: HashSet<_> = block.outputs.iter().cloned().collect();
         let float32_affine_layer_norm_inputs: HashSet<_> = graph
@@ -1409,6 +1440,18 @@ impl CoremlMlProgramConverter {
             cuts.insert(producers[last] + 1);
         }
         for (index, operation) in block.operations.iter().enumerate() {
+            // Expose exact Float32 GELU as a complete typed unary child. Native
+            // EXACT kernels can cancel the negative tail in 1+erf(x), beyond
+            // WebNN's GELU accuracy allowance, including in larger models.
+            if operation.r#type == "gelu"
+                && operation.outputs.iter().any(|output| {
+                    tensor(output)
+                        .is_some_and(|value| value.data_type == MilDataType::Float32 as i32)
+                })
+            {
+                cuts.insert(index);
+                cuts.insert(index + 1);
+            }
             if !constant_operations.contains(&index)
                 && operation
                     .outputs

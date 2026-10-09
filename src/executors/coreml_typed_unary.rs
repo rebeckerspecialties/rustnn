@@ -1,4 +1,4 @@
-//! Classify only complete, source-proven pure binary16/binary32 Cast programs.
+//! Classify complete, source-proven typed unary programs for exact host stages.
 
 use prost::Message;
 
@@ -12,6 +12,26 @@ use crate::protos::coreml::specification::{
 #[path = "coreml_float_cast/kernels.rs"]
 mod kernels;
 pub(super) use kernels::{Direction, cast};
+
+#[path = "coreml_gelu.rs"]
+mod gelu;
+
+#[path = "coreml_unary_constant.rs"]
+mod constant;
+pub(super) use constant::{ConstantUnary, classify_constant};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Kind {
+    FloatCast(Direction),
+    Gelu,
+}
+
+pub(super) fn evaluate(bytes: &[u8], kind: Kind) -> Result<Vec<u8>, &'static str> {
+    match kind {
+        Kind::FloatCast(direction) => cast(bytes, direction),
+        Kind::Gelu => gelu::evaluate(bytes),
+    }
+}
 
 #[derive(Clone, Copy)]
 enum Schema {
@@ -45,18 +65,24 @@ enum Schema {
     Immediate,
     TensorValue,
     Strings,
+    ValueEntry,
+    Floats,
+    Ints,
+    Bytes,
+    Blob,
 }
 
 enum WireType {
     Varint,
     Bytes,
     PackedVarints,
+    PackedFloats,
     Message(Schema),
 }
 
 fn field_type(schema: Schema, field: u64) -> Option<WireType> {
     use Schema as S;
-    use WireType::{Bytes as B, Message as M, PackedVarints as P, Varint as V};
+    use WireType::{Bytes as B, Message as M, PackedFloats as F, PackedVarints as P, Varint as V};
     Some(match (schema, field) {
         (S::Model, 1) => V,
         (S::Model, 2) => M(S::Description),
@@ -92,6 +118,9 @@ fn field_type(schema: Schema, field: u64) -> Option<WireType> {
         (S::Operation, 1) => B,
         (S::Operation, 2) => M(S::ArgumentEntry),
         (S::Operation, 3) => M(S::NamedType),
+        (S::Operation, 5) => M(S::ValueEntry),
+        (S::ValueEntry, 1) => B,
+        (S::ValueEntry, 2) => M(S::Value),
         (S::Argument, 1) => M(S::Binding),
         (S::Binding, 1) => B,
         (S::Binding, 2) => M(S::Value),
@@ -105,16 +134,24 @@ fn field_type(schema: Schema, field: u64) -> Option<WireType> {
         (S::ConstantDimension, 1) | (S::UnknownDimension, 1) => V,
         (S::Value, 1) => B,
         (S::Value, 3) => M(S::Immediate),
+        (S::Value, 5) => M(S::Blob),
         (S::Immediate, 1) => M(S::TensorValue),
+        (S::TensorValue, 1) => M(S::Floats),
+        (S::TensorValue, 2) => M(S::Ints),
+        (S::TensorValue, 7) => M(S::Bytes),
         (S::TensorValue, 4) => M(S::Strings),
         (S::Strings, 1) => B,
+        (S::Floats, 1) => F,
+        (S::Ints, 1) => P,
+        (S::Bytes, 1) | (S::Blob, 1) => B,
+        (S::Blob, 2) => V,
         _ => return None,
     })
 }
 
 // Unknown fields at any nested level stay native, even if their wire length
 // happens to equal a known message's re-encoding. This whitelist describes the
-// complete straight-line Cast subset, not a rewriting of its source bytes.
+// complete straight-line typed unary subset, not a rewriting of its source bytes.
 fn known_wire(mut bytes: &[u8], schema: Schema, depth: u8) -> Option<()> {
     fn varint(bytes: &mut &[u8]) -> Option<u64> {
         let mut result = 0_u64;
@@ -140,11 +177,22 @@ fn known_wire(mut bytes: &[u8], schema: Schema, depth: u8) -> Option<()> {
             (WireType::Varint | WireType::PackedVarints, 0) => {
                 varint(&mut bytes)?;
             }
-            (kind @ (WireType::Bytes | WireType::PackedVarints | WireType::Message(_)), 2) => {
+            (WireType::PackedFloats, 5) => {
+                bytes = bytes.get(4..)?;
+            }
+            (
+                kind @ (WireType::Bytes
+                | WireType::PackedVarints
+                | WireType::PackedFloats
+                | WireType::Message(_)),
+                2,
+            ) => {
                 let length = usize::try_from(varint(&mut bytes)?).ok()?;
                 let (value, remaining) = bytes.split_at_checked(length)?;
                 if let WireType::Message(schema) = kind {
                     known_wire(value, schema, depth + 1)?;
+                } else if matches!(kind, WireType::PackedFloats) && value.len() % 4 != 0 {
+                    return None;
                 }
                 bytes = remaining;
             }
@@ -180,7 +228,7 @@ fn compatible_shape(tensor: &mil::TensorType, array: &ArrayFeatureType) -> bool 
     if tensor.rank == 0 {
         return array.shape == [1] && array.shape_flexibility.is_none();
     }
-    if tensor.dimensions.len() != array.shape.len() {
+    if tensor.dimensions.len() != array.shape.len() || array.shape.iter().any(|&size| size <= 0) {
         return false;
     }
     tensor
@@ -191,16 +239,33 @@ fn compatible_shape(tensor: &mil::TensorType, array: &ArrayFeatureType) -> bool 
         .all(|(axis, (dimension, &size))| match &dimension.dimension {
             Some(dimension::Dimension::Constant(constant)) => {
                 u64::try_from(size).ok() == Some(constant.size)
+                    && match &array.shape_flexibility {
+                        None => true,
+                        Some(array_feature_type::ShapeFlexibility::ShapeRange(bounds)) => {
+                            bounds.size_ranges.len() == array.shape.len()
+                                && bounds.size_ranges[axis].lower_bound == constant.size
+                                && bounds.size_ranges[axis].upper_bound == size
+                        }
+                        Some(array_feature_type::ShapeFlexibility::EnumeratedShapes(bounds)) => {
+                            !bounds.shapes.is_empty()
+                                && bounds.shapes.iter().all(|shape| {
+                                    shape.shape.len() == array.shape.len()
+                                        && shape.shape[axis] == size
+                                })
+                        }
+                    }
             }
             Some(dimension::Dimension::Unknown(unknown)) if !unknown.variadic => {
                 match &array.shape_flexibility {
                     Some(array_feature_type::ShapeFlexibility::ShapeRange(bounds)) => {
                         bounds.size_ranges.len() == array.shape.len()
-                            && bounds.size_ranges[axis].lower_bound > 0
+                            && size > 0
+                            && bounds.size_ranges[axis].lower_bound <= size as u64
                             && bounds.size_ranges[axis].upper_bound >= size
                     }
                     Some(array_feature_type::ShapeFlexibility::EnumeratedShapes(bounds)) => {
                         !bounds.shapes.is_empty()
+                            && bounds.shapes.iter().any(|shape| shape.shape == array.shape)
                             && bounds.shapes.iter().all(|shape| {
                                 shape.shape.len() == array.shape.len()
                                     && shape.shape.iter().all(|&size| size > 0)
@@ -216,7 +281,7 @@ fn compatible_shape(tensor: &mil::TensorType, array: &ArrayFeatureType) -> bool 
 /// Conservatively keep programs with extra operations, attributes, unresolved
 /// types/shapes or unknown source fields native. No feature name/proxy dtype
 /// or hardware-generation heuristic establishes logical Cast provenance.
-pub(super) fn classify(model: &Model, source: &[u8]) -> Option<Direction> {
+pub(super) fn classify(model: &Model, source: &[u8]) -> Option<Kind> {
     // Ordinary converter wire is canonical in encoded length. Extra unknown
     // fields or redundant wire encodings deliberately do not get a host path.
     if model.encoded_len() != source.len() || known_wire(source, Schema::Model, 0).is_none() {
@@ -244,7 +309,10 @@ pub(super) fn classify(model: &Model, source: &[u8]) -> Option<Direction> {
         return None;
     }
     let operation = &block.operations[0];
-    if operation.r#type != "cast"
+    if operation.r#type == "gelu" && function.opset != "CoreML7" {
+        return None;
+    }
+    if !matches!(operation.r#type.as_str(), "cast" | "gelu")
         || operation.outputs.len() != 1
         || operation.inputs.len() != 2
         || !operation.blocks.is_empty()
@@ -261,23 +329,52 @@ pub(super) fn classify(model: &Model, source: &[u8]) -> Option<Direction> {
     };
     let input = &function.inputs[0];
     let output = &operation.outputs[0];
-    if *name != input.name || block.outputs[0] != output.name {
+    if *name != input.name || block.outputs[0] != output.name || input.name == output.name {
         return None;
     }
     let source_type = tensor(input.r#type.as_ref()?)?;
     let target_type = tensor(output.r#type.as_ref()?)?;
-    let (direction, source_code, target_code, target_name) =
-        match (source_type.data_type, target_type.data_type) {
-            (10, 11) => (Direction::Widen, 65552, 65568, "fp32"),
-            (11, 10) => (Direction::Narrow, 65568, 65552, "fp16"),
-            _ => return None,
-        };
-    let mut target_shape = target_type.clone();
-    target_shape.data_type = source_type.data_type;
-    if target_shape != *source_type {
+    let (kind, source_code, target_code, argument, target_name) = match (
+        operation.r#type.as_str(),
+        source_type.data_type,
+        target_type.data_type,
+    ) {
+        ("cast", 10, 11) => (
+            Kind::FloatCast(Direction::Widen),
+            65552,
+            65568,
+            "dtype",
+            "fp32",
+        ),
+        ("cast", 11, 10) => (
+            Kind::FloatCast(Direction::Narrow),
+            65568,
+            65552,
+            "dtype",
+            "fp16",
+        ),
+        ("gelu", 11, 11) => (Kind::Gelu, 65568, 65568, "mode", "EXACT"),
+        _ => return None,
+    };
+    let canonical_shape = |ty: &mil::TensorType| {
+        let mut ty = ty.clone();
+        ty.data_type = 0;
+        if ty.rank == 0 && ty.dimensions.is_empty() {
+            ty.rank = 1;
+            ty.dimensions = vec![mil::Dimension {
+                dimension: Some(dimension::Dimension::Constant(
+                    mil::dimension::ConstantDimension { size: 1 },
+                )),
+            }];
+        }
+        ty
+    };
+    // CoreML features represent public scalar tensors as [1]. This is only
+    // that one-element adapter, not a general reshape or broadcast rule.
+    if canonical_shape(target_type) != canonical_shape(source_type) {
         return None;
     }
-    let dtype = operation.inputs.get("dtype")?;
+    let dtype = operation.inputs.get(argument)?;
     if dtype.arguments.len() != 1 {
         return None;
     }
@@ -328,7 +425,7 @@ pub(super) fn classify(model: &Model, source: &[u8]) -> Option<Direction> {
     }
     let mut target_shape = target_feature.clone();
     target_shape.data_type = source_code;
-    (target_shape == *source_feature).then_some(direction)
+    (target_shape == *source_feature).then_some(kind)
 }
 
 #[cfg(test)]
@@ -442,12 +539,209 @@ mod tests {
         }
     }
 
+    fn gelu_model() -> Model {
+        let mut model = model();
+        let model::Type::MlProgram(program) = model.r#type.as_mut().unwrap() else {
+            unreachable!()
+        };
+        let operation = &mut program
+            .functions
+            .get_mut("main")
+            .unwrap()
+            .block_specializations
+            .get_mut("CoreML7")
+            .unwrap()
+            .operations[0];
+        operation.r#type = "gelu".into();
+        operation.outputs[0].r#type = Some(tensor_type(11));
+        let mut mode = operation.inputs.remove("dtype").unwrap();
+        let argument::binding::Binding::Value(value) = mode.arguments[0].binding.as_mut().unwrap()
+        else {
+            unreachable!()
+        };
+        let value::Value::ImmediateValue(value) = value.value.as_mut().unwrap() else {
+            unreachable!()
+        };
+        let value::immediate_value::Value::Tensor(value) = value.value.as_mut().unwrap() else {
+            unreachable!()
+        };
+        let tensor_value::Value::Strings(value) = value.value.as_mut().unwrap() else {
+            unreachable!()
+        };
+        value.values[0] = "EXACT".into();
+        operation.inputs.insert("mode".into(), mode);
+        let feature_type::Type::MultiArrayType(output) = model.description.as_mut().unwrap().output
+            [0]
+        .r#type
+        .as_mut()
+        .unwrap()
+        .r#type
+        .as_mut()
+        .unwrap() else {
+            unreachable!()
+        };
+        output.data_type = 65568;
+        model
+    }
+
+    #[test]
+    fn exact_gelu_requires_complete_mode_types_and_feature_provenance() {
+        let model = gelu_model();
+        assert_eq!(classify(&model, &model.encode_to_vec()), Some(Kind::Gelu));
+        for mutation in 0..6 {
+            let mut changed = model.clone();
+            let model::Type::MlProgram(program) = changed.r#type.as_mut().unwrap() else {
+                unreachable!()
+            };
+            let block = program
+                .functions
+                .get_mut("main")
+                .unwrap()
+                .block_specializations
+                .get_mut("CoreML7")
+                .unwrap();
+            let operation = &mut block.operations[0];
+            match mutation {
+                0 => {
+                    operation.inputs.remove("mode");
+                }
+                1 => {
+                    let argument::binding::Binding::Value(value) =
+                        operation.inputs.get_mut("mode").unwrap().arguments[0]
+                            .binding
+                            .as_mut()
+                            .unwrap()
+                    else {
+                        unreachable!()
+                    };
+                    let value::Value::ImmediateValue(value) = value.value.as_mut().unwrap() else {
+                        unreachable!()
+                    };
+                    let value::immediate_value::Value::Tensor(value) =
+                        value.value.as_mut().unwrap()
+                    else {
+                        unreachable!()
+                    };
+                    let tensor_value::Value::Strings(value) = value.value.as_mut().unwrap() else {
+                        unreachable!()
+                    };
+                    value.values[0] = "TANH_APPROXIMATION".into();
+                }
+                2 => {
+                    operation.outputs[0].r#type = Some(tensor_type(10));
+                }
+                3 => {
+                    operation.outputs[0].name = "source".into();
+                }
+                4 => {
+                    block.operations.push(block.operations[0].clone());
+                }
+                5 => {
+                    changed.description.as_mut().unwrap().input[0]
+                        .r#type
+                        .as_mut()
+                        .unwrap()
+                        .is_optional = true;
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                classify(&changed, &changed.encode_to_vec()),
+                None,
+                "mutation {mutation}"
+            );
+        }
+        let mut unknown = model.encode_to_vec();
+        unknown.extend([0xf8, 0x7f, 0x01]);
+        let decoded = Model::decode(unknown.as_slice()).unwrap();
+        assert_eq!(classify(&decoded, &unknown), None);
+    }
+
+    #[test]
+    fn feature_flexibility_cannot_relax_a_static_mil_axis() {
+        use crate::protos::coreml::specification::SizeRange;
+        use array_feature_type::{EnumeratedShapes, Shape, ShapeFlexibility, ShapeRange};
+        for original in [model(), gelu_model()] {
+            for mixed in [false, true] {
+                let mut changed = original.clone();
+                let model::Type::MlProgram(program) = changed.r#type.as_mut().unwrap() else {
+                    unreachable!()
+                };
+                let function = program.functions.get_mut("main").unwrap();
+                let output = &mut function
+                    .block_specializations
+                    .get_mut("CoreML7")
+                    .unwrap()
+                    .operations[0]
+                    .outputs[0];
+                if mixed {
+                    for value in [&mut function.inputs[0], output] {
+                        let value_type::Type::TensorType(tensor) =
+                            value.r#type.as_mut().unwrap().r#type.as_mut().unwrap()
+                        else {
+                            unreachable!()
+                        };
+                        tensor.rank = 2;
+                        tensor.dimensions.insert(
+                            0,
+                            mil::Dimension {
+                                dimension: Some(dimension::Dimension::Unknown(Default::default())),
+                            },
+                        );
+                    }
+                }
+                let description = changed.description.as_mut().unwrap();
+                for feature in [&mut description.input[0], &mut description.output[0]] {
+                    let feature_type::Type::MultiArrayType(array) =
+                        feature.r#type.as_mut().unwrap().r#type.as_mut().unwrap()
+                    else {
+                        unreachable!()
+                    };
+                    array.shape_flexibility = Some(if mixed {
+                        array.shape.insert(0, 1);
+                        ShapeFlexibility::EnumeratedShapes(EnumeratedShapes {
+                            shapes: vec![Shape { shape: vec![1, 4] }, Shape { shape: vec![2, 3] }],
+                        })
+                    } else {
+                        ShapeFlexibility::ShapeRange(ShapeRange {
+                            size_ranges: vec![SizeRange {
+                                lower_bound: 1,
+                                upper_bound: 8,
+                            }],
+                        })
+                    });
+                }
+                assert_eq!(
+                    classify(&changed, &changed.encode_to_vec()),
+                    None,
+                    "mixed={mixed}"
+                );
+                let description = changed.description.as_mut().unwrap();
+                for feature in [&mut description.input[0], &mut description.output[0]] {
+                    let feature_type::Type::MultiArrayType(array) =
+                        feature.r#type.as_mut().unwrap().r#type.as_mut().unwrap()
+                    else {
+                        unreachable!()
+                    };
+                    match array.shape_flexibility.as_mut().unwrap() {
+                        ShapeFlexibility::EnumeratedShapes(bounds) => bounds.shapes[1].shape[1] = 4,
+                        ShapeFlexibility::ShapeRange(bounds) => {
+                            bounds.size_ranges[0].lower_bound = 4;
+                            bounds.size_ranges[0].upper_bound = 4;
+                        }
+                    }
+                }
+                assert!(classify(&changed, &changed.encode_to_vec()).is_some());
+            }
+        }
+    }
+
     #[test]
     fn complete_source_cast_is_classified_without_name_or_proxy_heuristics() {
         let model = model();
         assert_eq!(
             classify(&model, &model.encode_to_vec()),
-            Some(Direction::Narrow)
+            Some(Kind::FloatCast(Direction::Narrow))
         );
         for mutation in 0..5 {
             let mut model = model.clone();

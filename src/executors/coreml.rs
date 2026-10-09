@@ -57,10 +57,10 @@ impl CompiledCoremlModel {
 mod load;
 use load::LoadTrace;
 pub use load::{CoremlLoadDiagnostics, CoremlLoadFailure, CoremlLoadRoute};
-#[path = "coreml_float_cast.rs"]
-mod float_cast;
 #[path = "coreml_pipeline.rs"]
 mod pipeline;
+#[path = "coreml_typed_unary.rs"]
+mod typed_unary;
 
 // Link against the system frameworks we use.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
