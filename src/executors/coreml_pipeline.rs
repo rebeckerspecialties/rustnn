@@ -41,7 +41,7 @@ enum StageExecution {
     Native,
     TypedUnary(typed_unary::Kind),
     ConstantGelu(Box<typed_unary::ConstantUnary>),
-    IntegerDivision(Box<integer_division::Division>),
+    Int32Binary(Box<int32_binary::Binary>),
     Int32Identity,
 }
 
@@ -50,8 +50,8 @@ fn execution(model: &Model, wire: &[u8]) -> StageExecution {
         StageExecution::TypedUnary(kind)
     } else if let Some(constant) = typed_unary::classify_constant(model, wire) {
         StageExecution::ConstantGelu(Box::new(constant))
-    } else if let Some(division) = integer_division::classify(model, wire) {
-        StageExecution::IntegerDivision(Box::new(division))
+    } else if let Some(division) = int32_binary::classify(model, wire) {
+        StageExecution::Int32Binary(Box::new(division))
     } else if int32_identity::classify(model, wire) {
         StageExecution::Int32Identity
     } else {
@@ -1021,8 +1021,8 @@ impl PipelineModel {
                     }
                     return Ok(());
                 }
-                if let StageExecution::IntegerDivision(division) = &stage.execution {
-                    self.predict_integer_division(stage, division, &mut values)?;
+                if let StageExecution::Int32Binary(division) = &stage.execution {
+                    self.predict_int32_binary(stage, division, &mut values)?;
                     for name in &stage.release_after {
                         values.remove(name);
                     }
@@ -1178,31 +1178,29 @@ impl PipelineModel {
         Ok(())
     }
 
-    unsafe fn predict_integer_division(
+    unsafe fn predict_int32_binary(
         &self,
         stage: &Stage,
-        division: &integer_division::Division,
+        binary: &int32_binary::Binary,
         values: &mut HashMap<String, ReleaseOnDrop>,
     ) -> Result<(), GraphError> {
         fn read<'a>(
             stage: &Stage,
-            input: &'a integer_division::Input,
+            input: &'a int32_binary::Input,
             values: &HashMap<String, ReleaseOnDrop>,
         ) -> Result<(Vec<usize>, std::borrow::Cow<'a, [u8]>), GraphError> {
             match input {
-                integer_division::Input::Constant { bytes, shape } => {
+                int32_binary::Input::Constant { bytes, shape } => {
                     Ok((shape.clone(), std::borrow::Cow::Borrowed(bytes)))
                 }
-                integer_division::Input::Runtime(name) => {
+                int32_binary::Input::Runtime(name) => {
                     let source = stage
                         .inputs
                         .iter()
                         .find(|input| input.name == *name)
-                        .ok_or_else(|| {
-                            boundary_error("integer division lacks source description")
-                        })?;
+                        .ok_or_else(|| boundary_error("integer binary lacks source description"))?;
                     let feature = values.get(name).ok_or_else(|| {
-                        boundary_error(format!("integer division lacks source `{name}`"))
+                        boundary_error(format!("integer binary lacks source `{name}`"))
                     })?;
                     let array: *mut Object = unsafe { msg_send![feature.0, multiArrayValue] };
                     unsafe { validate_source_feature(source, array)? };
@@ -1213,11 +1211,12 @@ impl PipelineModel {
                 }
             }
         }
-        let (left_shape, left) = read(stage, &division.left, values)?;
-        let (right_shape, right) = read(stage, &division.right, values)?;
+        let (left_shape, left) = read(stage, &binary.left, values)?;
+        let (right_shape, right) = read(stage, &binary.right, values)?;
         // Evaluate privately: zero/overflow errors must not publish a partial output.
-        let (shape, result) = integer_division::evaluate(&left, &left_shape, &right, &right_shape)
-            .map_err(boundary_error)?;
+        let (shape, result) =
+            int32_binary::evaluate(binary.kind, &left, &left_shape, &right, &right_shape)
+                .map_err(boundary_error)?;
         let actual_shape: Vec<i64> = if shape.is_empty() {
             vec![1]
         } else {
@@ -1225,7 +1224,7 @@ impl PipelineModel {
                 .into_iter()
                 .map(|n| {
                     i64::try_from(n)
-                        .map_err(|_| boundary_error("integer division extent exceeds i64"))
+                        .map_err(|_| boundary_error("integer binary extent exceeds i64"))
                 })
                 .collect::<Result<_, _>>()?
         };
@@ -1244,7 +1243,7 @@ impl PipelineModel {
                 .is_some()
         {
             return Err(boundary_error(
-                "integer division did not produce a unique owned feature",
+                "integer binary did not produce a unique owned feature",
             ));
         }
         Ok(())
@@ -1355,6 +1354,70 @@ mod tests {
     use crate::protos::coreml::specification::{FeatureType, Pipeline};
 
     #[test]
+    #[cfg(feature = "dynamic-inputs")]
+    fn int32_selection_plan_preserves_shared_scalar_and_dynamic_source() {
+        use crate::converters::{CoremlMlProgramConverter, GraphConverter};
+        use crate::graph::{ConstantData, DynamicDimension, GraphInfo, Operand, OperandKind};
+        use crate::operators::Operation;
+        let shape = vec![Dimension::Dynamic(DynamicDimension {
+            name: "length".into(),
+            max_size: 8,
+        })];
+        let operand = |name: &str, kind, shape| Operand {
+            name: Some(name.into()),
+            kind,
+            descriptor: OperandDescriptor {
+                data_type: DataType::Int32,
+                shape,
+                pending_permutation: vec![],
+            },
+        };
+        let graph = GraphInfo {
+            operands: vec![
+                operand("source", OperandKind::Input, shape.clone()),
+                operand("limit", OperandKind::Constant, vec![]),
+                operand("min", OperandKind::Output, shape.clone()),
+                operand("max", OperandKind::Output, shape),
+            ],
+            input_operands: vec![0],
+            output_operands: vec![2, 3],
+            constant_operand_ids_to_handles: [(
+                1,
+                ConstantData {
+                    data: 16_777_217_i32.to_le_bytes().to_vec(),
+                    label: None,
+                },
+            )]
+            .into(),
+            operations: vec![
+                Operation::Min {
+                    a: 0,
+                    b: 1,
+                    outputs: vec![2],
+                    options: None,
+                },
+                Operation::Max {
+                    a: 0,
+                    b: 1,
+                    outputs: vec![3],
+                    options: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+        let plan = SourcePlan::parse(&converted.data).unwrap().unwrap();
+        assert_eq!(plan.stages.len(), 2);
+        for stage in &plan.stages {
+            assert!(
+                matches!(stage.execution, StageExecution::Int32Binary(_)),
+                "{:?}",
+                Model::decode(stage.source.as_slice()).unwrap()
+            );
+        }
+    }
+
+    #[test]
     fn integer_division_plan_keeps_native_cast_producer_and_consumer_separate() {
         use crate::converters::{CoremlMlProgramConverter, GraphConverter};
         use crate::graph::{ConstantData, GraphInfo, Operand, OperandKind};
@@ -1418,7 +1481,7 @@ mod tests {
         assert_eq!(plan.stages[0].execution, StageExecution::Native);
         assert!(matches!(
             plan.stages[1].execution,
-            StageExecution::IntegerDivision(_)
+            StageExecution::Int32Binary(_)
         ));
         assert_eq!(plan.stages[2].execution, StageExecution::Native);
     }
@@ -2157,95 +2220,145 @@ mod tests {
 
     #[cfg(target_vendor = "apple")]
     #[test]
-    fn int32_identity_retains_validated_padded_storage_and_rejects_wrong_actual_shape() {
+    fn int32_identity_and_int32_selection_keep_validated_padded_storage() {
         use crate::converters::{CoremlMlProgramConverter, GraphConverter};
-        let mut graph = cast_graph(vec![Dimension::Static(4)]);
-        graph.operands.truncate(2);
-        for operand in &mut graph.operands {
-            operand.descriptor.data_type = DataType::Int32;
-        }
-        graph.output_operands = vec![1];
-        graph.operations = vec![crate::operators::Operation::Identity {
-            input: 0,
-            outputs: vec![1],
-            options: None,
-        }];
-        let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
-        let plan = SourcePlan::parse(&converted.data).unwrap().unwrap();
-        let model = PipelineModel::compile(plan, None, DeviceType::Cpu).unwrap();
-        assert_eq!(
-            model.plan.stages[0].execution,
-            StageExecution::Int32Identity
-        );
-        let expected = [16_777_217_i32, -16_777_217, i32::MIN, i32::MAX]
-            .into_iter()
-            .flat_map(i32::to_le_bytes)
-            .collect::<Vec<_>>();
-        let mut backing = vec![0xdd_u8; 8 * 4];
-        let returned = autoreleasepool(|| unsafe {
-            let numbers = |values: &[i64]| {
-                let values: Vec<*mut Object> = values
-                    .iter()
-                    .map(|&n| {
-                        let value: *mut Object = msg_send![class!(NSNumber), numberWithLongLong:n];
-                        value
-                    })
-                    .collect();
-                let result: *mut Object =
-                    msg_send![class!(NSArray), arrayWithObjects:values.as_ptr() count:values.len()];
+        for selection in 0..3 {
+            let mut graph = cast_graph(vec![Dimension::Static(4)]);
+            graph.operands.truncate(2);
+            for operand in &mut graph.operands {
+                operand.descriptor.data_type = DataType::Int32;
+            }
+            graph.output_operands = vec![1];
+            graph.operations = vec![crate::operators::Operation::Identity {
+                input: 0,
+                outputs: vec![1],
+                options: None,
+            }];
+            if selection != 0 {
+                let mut constant = graph.operands[0].clone();
+                constant.name = Some("limit".into());
+                constant.kind = crate::graph::OperandKind::Constant;
+                constant.descriptor.shape.clear();
+                graph.operands.push(constant);
+                graph.constant_operand_ids_to_handles.insert(
+                    2,
+                    crate::graph::ConstantData {
+                        data: 0_i32.to_le_bytes().to_vec(),
+                        label: None,
+                    },
+                );
+                graph.operations = vec![if selection == 1 {
+                    crate::operators::Operation::Min {
+                        a: 0,
+                        b: 2,
+                        outputs: vec![1],
+                        options: None,
+                    }
+                } else {
+                    crate::operators::Operation::Max {
+                        a: 0,
+                        b: 2,
+                        outputs: vec![1],
+                        options: None,
+                    }
+                }];
+            }
+            let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+            let plan = SourcePlan::parse(&converted.data).unwrap().unwrap();
+            let model = PipelineModel::compile(plan, None, DeviceType::Cpu).unwrap();
+            assert!(if selection == 0 {
+                model.plan.stages[0].execution == StageExecution::Int32Identity
+            } else {
+                matches!(
+                    model.plan.stages[0].execution,
+                    StageExecution::Int32Binary(_)
+                )
+            });
+            let expected = [16_777_217_i32, -16_777_217, i32::MIN, i32::MAX]
+                .into_iter()
+                .flat_map(i32::to_le_bytes)
+                .collect::<Vec<_>>();
+            let mut backing = vec![0xdd_u8; 8 * 4];
+            let returned = autoreleasepool(|| unsafe {
+                let numbers = |values: &[i64]| {
+                    let values: Vec<*mut Object> = values
+                        .iter()
+                        .map(|&n| {
+                            let value: *mut Object =
+                                msg_send![class!(NSNumber), numberWithLongLong:n];
+                            value
+                        })
+                        .collect();
+                    let result: *mut Object = msg_send![class!(NSArray), arrayWithObjects:values.as_ptr() count:values.len()];
+                    result
+                };
+                let mut error: *mut Object = ptr::null_mut();
+                let allocated: *mut Object = msg_send![class!(MLMultiArray), alloc];
+                let source: *mut Object = msg_send![allocated, initWithDataPointer:backing.as_mut_ptr().cast::<std::ffi::c_void>() shape:numbers(&[4]) dataType:NativeType::Int32.code() strides:numbers(&[2]) deallocator:ptr::null_mut::<Object>() error:&mut error];
+                assert!(
+                    !source.is_null(),
+                    "{}",
+                    ns_error_to_string(error, "padded Int32 source")
+                );
+                let source = ReleaseOnDrop(source);
+                let (kind, layout, pointer) = multiarray_storage(source.0).unwrap();
+                write_array_storage(pointer, &layout, kind.element_size(), &expected).unwrap();
+                let feature: *mut Object =
+                    msg_send![class!(MLFeatureValue), featureValueWithMultiArray:source.0];
+                let feature: *mut Object = msg_send![feature, retain];
+                let stage = &model.plan.stages[0];
+                let mut values =
+                    HashMap::from([(stage.inputs[0].name.clone(), ReleaseOnDrop(feature))]);
+                let predict = |values: &mut HashMap<String, ReleaseOnDrop>| match &stage.execution {
+                    StageExecution::Int32Identity => model.predict_int32_identity(stage, values),
+                    StageExecution::Int32Binary(binary) => {
+                        model.predict_int32_binary(stage, binary, values)
+                    }
+                    _ => panic!("expected a typed integer stage"),
+                };
+                predict(&mut values).unwrap();
+                if selection == 0 {
+                    assert_eq!(
+                        values[&stage.outputs[0].name].0, feature,
+                        "Identity must retain the original owned feature"
+                    );
+                }
+                values.remove(&stage.inputs[0].name);
+                drop(source);
+                let array: *mut Object =
+                    msg_send![values[&stage.outputs[0].name].0, multiArrayValue];
+                let (kind, layout, pointer) = multiarray_storage(array).unwrap();
+                let result = read_array_storage(pointer, &layout, kind.element_size());
+                let wrong = create_multi_array(&[3], NativeType::Int32.code()).unwrap();
+                let wrong: *mut Object =
+                    msg_send![class!(MLFeatureValue), featureValueWithMultiArray:wrong];
+                let wrong: *mut Object = msg_send![wrong, retain];
+                let mut wrong_values =
+                    HashMap::from([(stage.inputs[0].name.clone(), ReleaseOnDrop(wrong))]);
+                assert!(predict(&mut wrong_values).is_err());
+                assert!(!wrong_values.contains_key(&stage.outputs[0].name));
                 result
-            };
-            let mut error: *mut Object = ptr::null_mut();
-            let allocated: *mut Object = msg_send![class!(MLMultiArray), alloc];
-            let source: *mut Object = msg_send![allocated, initWithDataPointer:backing.as_mut_ptr().cast::<std::ffi::c_void>() shape:numbers(&[4]) dataType:NativeType::Int32.code() strides:numbers(&[2]) deallocator:ptr::null_mut::<Object>() error:&mut error];
+            });
+            let selected: Vec<_> = [16_777_217_i32, -16_777_217, i32::MIN, i32::MAX]
+                .into_iter()
+                .map(|n| match selection {
+                    1 => n.min(0),
+                    2 => n.max(0),
+                    _ => n,
+                })
+                .flat_map(i32::to_le_bytes)
+                .collect();
+            assert_eq!(returned, selected);
             assert!(
-                !source.is_null(),
-                "{}",
-                ns_error_to_string(error, "padded Int32 source")
+                backing
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .enumerate()
+                    .all(|(index, bytes)| index % 2 == 0 || *bytes == [0xdd; 4])
             );
-            let source = ReleaseOnDrop(source);
-            let (kind, layout, pointer) = multiarray_storage(source.0).unwrap();
-            write_array_storage(pointer, &layout, kind.element_size(), &expected).unwrap();
-            let feature: *mut Object =
-                msg_send![class!(MLFeatureValue), featureValueWithMultiArray:source.0];
-            let feature: *mut Object = msg_send![feature, retain];
-            let stage = &model.plan.stages[0];
-            let mut values =
-                HashMap::from([(stage.inputs[0].name.clone(), ReleaseOnDrop(feature))]);
-            model.predict_int32_identity(stage, &mut values).unwrap();
-            assert_eq!(
-                values[&stage.outputs[0].name].0, feature,
-                "the stage must retain the original owned feature"
-            );
-            values.remove(&stage.inputs[0].name);
-            drop(source);
-            let array: *mut Object = msg_send![values[&stage.outputs[0].name].0, multiArrayValue];
-            let (kind, layout, pointer) = multiarray_storage(array).unwrap();
-            let result = read_array_storage(pointer, &layout, kind.element_size());
-            let wrong = create_multi_array(&[3], NativeType::Int32.code()).unwrap();
-            let wrong: *mut Object =
-                msg_send![class!(MLFeatureValue), featureValueWithMultiArray:wrong];
-            let wrong: *mut Object = msg_send![wrong, retain];
-            let mut wrong_values =
-                HashMap::from([(stage.inputs[0].name.clone(), ReleaseOnDrop(wrong))]);
-            assert!(
-                model
-                    .predict_int32_identity(stage, &mut wrong_values)
-                    .is_err()
-            );
-            assert!(!wrong_values.contains_key(&stage.outputs[0].name));
-            result
-        });
-        assert_eq!(returned, expected);
-        assert!(
-            backing
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .enumerate()
-                .all(|(index, bytes)| index % 2 == 0 || *bytes == [0xdd; 4])
-        );
-        assert_eq!(model.cache_counts(), (0, 0));
+            assert_eq!(model.cache_counts(), (0, 0));
+        }
     }
 
     #[cfg(target_vendor = "apple")]
