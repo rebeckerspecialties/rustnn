@@ -161,21 +161,78 @@ fn constant_no_op_fanout_serializes_one_original_exact_payload() {
         ],
     );
     let before = serde_json::to_vec(&graph).unwrap();
-    let metadata = metadata(&graph);
+    let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+    let model = specification::Model::decode(converted.data.as_slice()).unwrap();
+    let metadata = model.description.unwrap().metadata.unwrap().user_defined;
     let copies: Value = serde_json::from_str(&metadata[CONSTANT_COPIES]).unwrap();
-    assert_eq!(copies["version"], 1);
+    assert_eq!(copies["version"], 2);
     assert_eq!(copies["sources"].as_object().unwrap().len(), 1);
     assert_eq!(copies["outputs"].as_object().unwrap().len(), 5);
     assert_eq!(copies["sources"]["0"]["descriptor"]["data_type"], "int32");
-    use base64::Engine;
+    let offset = copies["sources"]["0"]["offset"].as_u64().unwrap() as usize;
+    let weights = converted.weights_data.unwrap();
     assert_eq!(
-        base64::engine::general_purpose::STANDARD
-            .decode(copies["sources"]["0"]["data"].as_str().unwrap())
-            .unwrap(),
+        &weights[offset + 64..offset + 64 + exact_bytes().len()],
         exact_bytes()
     );
     assert!(!metadata.contains_key(INPUT_COPIES));
     assert_eq!(serde_json::to_vec(&graph).unwrap(), before);
+}
+
+#[test]
+fn multi_megabyte_constant_fanout_reuses_the_existing_mil_weight_record() {
+    for dtype in [DataType::Float32, DataType::Float16] {
+        let mut graph = copy_graph(true, &[CopyOp::Identity, CopyOp::Identity]);
+        let length = 5 * 1024 * 1024;
+        let width = if dtype == DataType::Float32 { 4 } else { 2 };
+        for operand in &mut graph.operands {
+            operand.descriptor.data_type = dtype;
+            operand.descriptor.shape = vec![Dimension::Static((length / width) as u32)];
+        }
+        let source = (0..length)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        graph
+            .constant_operand_ids_to_handles
+            .get_mut(&0)
+            .unwrap()
+            .data = source.clone();
+        let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+        drop(graph);
+        let model = specification::Model::decode(converted.data.as_slice()).unwrap();
+        let json = &model
+            .description
+            .as_ref()
+            .unwrap()
+            .metadata
+            .as_ref()
+            .unwrap()
+            .user_defined[CONSTANT_COPIES];
+        assert!(json.len() < 1024, "metadata must not contain tensor bytes");
+        assert!(
+            converted.data.len() < 8192,
+            "the model must not duplicate the weight"
+        );
+        let proof: Value = serde_json::from_str(json).unwrap();
+        let offset = proof["sources"]["0"]["offset"].as_u64().unwrap() as usize;
+        let weights = converted.weights_data.unwrap();
+        assert_eq!(weights.len(), source.len() + 128);
+        assert_eq!(&weights[offset + 64..offset + 64 + source.len()], source);
+        let specification::model::Type::MlProgram(program) = model.r#type.unwrap() else {
+            panic!("expected MLProgram")
+        };
+        let mil_source = program.functions["main"].block_specializations["CoreML7"]
+            .operations
+            .iter()
+            .find(|operation| operation.r#type == "const" && operation.outputs[0].name == "source")
+            .unwrap();
+        let Some(rustnn::protos::coreml::mil_spec::value::Value::BlobFileValue(blob)) =
+            &mil_source.attributes["val"].value
+        else {
+            panic!("source must be blob-backed")
+        };
+        assert_eq!(blob.offset, offset as u64);
+    }
 }
 
 #[test]
