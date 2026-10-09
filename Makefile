@@ -196,8 +196,10 @@ test-wpt-coreml:
 	WPT_BACKEND=coreml $(CARGO) test --test run_wpt_conformance --features coreml-runtime -- $(if $(TEST_FILTER),$(TEST_FILTER),coreml) --test-threads 1
 	$(MAKE) test-wpt-tolerance-parity
 
-.PHONY: test-wpt-tolerance test-wpt-tolerance-parity
-test-wpt-tolerance:
+.PHONY: test-wpt-tolerance test-wpt-tolerance-parity test-wpt-source-tolerance
+test-wpt-source-tolerance:
+	node --test scripts/wpt_bridge/source-tolerance.test.mjs
+test-wpt-tolerance: test-wpt-source-tolerance
 	$(CARGO) test --test test_wpt_tolerance
 
 test-wpt-tolerance-parity: require-wpt-cache
