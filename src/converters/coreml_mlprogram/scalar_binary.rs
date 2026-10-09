@@ -49,7 +49,27 @@ impl CoremlMlProgramConverter {
                     | "logical_or"
                     | "logical_xor"
             );
+            let all_scalar = ["x", "y"].iter().all(|key| {
+                let Some(argument) = operation.inputs.get(*key) else {
+                    return false;
+                };
+                let [binding] = argument.arguments.as_slice() else {
+                    return false;
+                };
+                let ty = match &binding.binding {
+                    Some(Binding::Name(name)) => types.get(name),
+                    Some(Binding::Value(value)) => {
+                        match value.r#type.as_ref().and_then(|ty| ty.r#type.as_ref()) {
+                            Some(value_type::Type::TensorType(ty)) => Some(ty),
+                            _ => None,
+                        }
+                    }
+                    None => None,
+                };
+                ty.is_some_and(|ty| ty.rank == 0)
+            });
             if binary
+                && all_scalar
                 && operation.outputs.iter().any(|value| {
                     tensor(value).is_some_and(|ty| {
                         ty.rank == 1
@@ -174,5 +194,53 @@ mod tests {
         assert_eq!(block.operations[1].inputs["y"], immediate);
         assert_eq!(block.operations[3], other);
         assert_eq!(tensor(&scalar).unwrap().rank, 0);
+    }
+
+    #[test]
+    fn mixed_scalar_and_rank_one_binary_keeps_native_broadcasting() {
+        let scalar = CoremlMlProgramConverter::value_type_for_static_shape(
+            "scalar".into(),
+            DataType::Int32 as i32,
+            &[],
+        );
+        let vector = CoremlMlProgramConverter::value_type_for_static_shape(
+            "shape".into(),
+            DataType::Int32 as i32,
+            &[1],
+        );
+        for reverse in [false, true] {
+            let (x, y) = if reverse {
+                ("scalar", "shape")
+            } else {
+                ("shape", "scalar")
+            };
+            let operation = CoremlMlProgramConverter::create_mil_operation(
+                "sub",
+                HashMap::from([
+                    (
+                        "x".into(),
+                        CoremlMlProgramConverter::create_name_argument(x.into()),
+                    ),
+                    (
+                        "y".into(),
+                        CoremlMlProgramConverter::create_name_argument(y.into()),
+                    ),
+                ]),
+                vec![CoremlMlProgramConverter::value_type_for_static_shape(
+                    "result".into(),
+                    DataType::Int32 as i32,
+                    &[1],
+                )],
+            );
+            let mut block = Block {
+                operations: vec![operation.clone()],
+                ..Default::default()
+            };
+            CoremlMlProgramConverter::adapt_scalar_binary_inputs(
+                &[scalar.clone(), vector.clone()],
+                &mut block,
+            );
+            assert_eq!(block.operations, [operation]);
+        }
     }
 }
