@@ -639,14 +639,14 @@ fn exact_matmul_marking_preserves_native_constexpr_parameter_closures() {
 fn exact_matmul_constant_transpose_is_not_retained_in_unrelated_native_stages() {
     let mut fixture = cancellation(3, false, true, false, true);
     let graph = &mut fixture.graph;
-    let one = u32::try_from(graph.operands.len()).unwrap();
+    let zero = u32::try_from(graph.operands.len()).unwrap();
     graph
         .operands
-        .push(operand("one", OperandKind::Constant, &[1]));
+        .push(operand("zero", OperandKind::Constant, &[1]));
     graph.constant_operand_ids_to_handles.insert(
-        one,
+        zero,
         ConstantData {
-            data: f32_bytes(&[1.0]),
+            data: f32_bytes(&[0.0]),
             label: None,
         },
     );
@@ -661,9 +661,9 @@ fn exact_matmul_constant_transpose_is_not_retained_in_unrelated_native_stages() 
     }
     graph.operations.insert(
         0,
-        Operation::Mul {
+        Operation::Add {
             a: 0,
-            b: one,
+            b: zero,
             options: None,
             outputs: vec![pre],
         },
@@ -676,9 +676,9 @@ fn exact_matmul_constant_transpose_is_not_retained_in_unrelated_native_stages() 
         .operands
         .push(operand("exact result", OperandKind::Output, &[2, 12]));
     graph.output_operands = vec![final_output];
-    graph.operations.push(Operation::Mul {
+    graph.operations.push(Operation::Add {
         a: matrix_output,
-        b: one,
+        b: zero,
         options: None,
         outputs: vec![final_output],
     });
