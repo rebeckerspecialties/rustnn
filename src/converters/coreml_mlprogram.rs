@@ -452,6 +452,7 @@ fn equivalent_output_names(graph: &LoweringGraph<'_>) -> HashMap<String, String>
         .collect()
 }
 mod precision;
+mod scalar_binary;
 
 /// Convert zero_point byte data from a source dtype to a target dtype.
 /// Only Int32 → Uint8 and Int32 → Int8 are supported; all other pairs are returned as-is.
@@ -12698,6 +12699,8 @@ impl CoremlMlProgramConverter {
             }
             main_block.outputs.push(output_name);
         }
+
+        Self::adapt_scalar_binary_inputs(&main_function.inputs, &mut main_block);
 
         let value_types: HashMap<_, _> = main_function
             .inputs
