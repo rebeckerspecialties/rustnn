@@ -122,6 +122,12 @@ Rules that hold for every converter:
   tensor destinations still receive independent copies. This avoids native
   Identity rounding without changing the arithmetic that produces or consumes
   the value. Synthetic Int32 helpers inside narrow-integer lowerings are not split.
+- Source Int32 `min` and `max` use the same source-proven typed binary runtime as
+  integer division. Signed comparisons select the original integer bytes, avoiding
+  native full-range values rounding through floating-point precision. Constant
+  views, broadcasting and bounded actual shapes retain checked storage contracts;
+  internal min/max helpers belonging to other lowerings remain native. Selection
+  cannot overflow and does not assign overflow behavior to Add/Sub/Mul.
 - Comparison results are `uint8`; `reduceLogSumExp` uses the max-shifted form; reductions with
   empty `axes` and `resample2d` on arbitrary axes are lowered explicitly.
 - Gather-family index normalization uses active indexed dimensions, not their declared maxima.

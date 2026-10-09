@@ -1,4 +1,4 @@
-//! Recognize the complete signed truncation expression, never a bare floor_div.
+//! Prove exact Int32 binary stages and their original constant/view closure.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -7,7 +7,7 @@ use super::typed_unary::{array, compatible_shape, known_source, tensor};
 use crate::protos::coreml::mil_spec::{self as mil, argument, dimension, tensor_value, value};
 use crate::protos::coreml::specification::{ArrayFeatureType, Model, array_feature_type, model};
 
-#[path = "coreml_integer_division/kernels.rs"]
+#[path = "coreml_int32_binary/kernels.rs"]
 mod kernels;
 pub(super) use kernels::evaluate;
 
@@ -18,9 +18,17 @@ pub(super) enum Input {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(super) struct Division {
+pub(super) struct Binary {
+    pub kind: Kind,
     pub left: Input,
     pub right: Input,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Kind {
+    Divide,
+    Minimum,
+    Maximum,
 }
 
 fn named<'a>(operation: &'a mil::Operation, key: &str) -> Option<&'a str> {
@@ -107,11 +115,13 @@ fn storage_fits(array: &ArrayFeatureType, max_bytes: u64) -> bool {
                 !shapes.shapes.is_empty() && shapes.shapes.iter().all(|shape| fits(&shape.shape))
             }
             Some(array_feature_type::ShapeFlexibility::ShapeRange(range)) => {
+                // Dynamic WebNN metadata may declare a zero lower bound. The
+                // finite maximum proves allocation size; the runtime still
+                // rejects unsupported actual zero extents before publication.
                 range.size_ranges.len() == array.shape.len()
                     && range.size_ranges.iter().all(|bound| {
-                        bound.lower_bound > 0
-                            && u64::try_from(bound.upper_bound)
-                                .is_ok_and(|upper| upper >= bound.lower_bound)
+                        u64::try_from(bound.upper_bound)
+                            .is_ok_and(|upper| upper > 0 && upper >= bound.lower_bound)
                     })
                     && fits(
                         &range
@@ -247,10 +257,10 @@ fn broadcast(left: &mil::TensorType, right: &mil::TensorType) -> Option<Vec<mil:
     Some(result)
 }
 
-/// Accept only a complete known-wire program with the proven quotient/remainder
-/// correction and its exact Int32 constant/view closure. No name, marker or
-/// individual opcode is sufficient evidence of WebNN truncation semantics.
-pub(super) fn classify(model: &Model, source: &[u8]) -> Option<Division> {
+/// Accept only a complete known-wire binary program and its exact Int32 views.
+/// Division requires the full quotient/remainder correction, never a bare
+/// floor_div. Min/Max require typed signed selection, not arbitrary arithmetic.
+pub(super) fn classify(model: &Model, source: &[u8]) -> Option<Binary> {
     if !known_source(model, source) {
         return None;
     }
@@ -269,10 +279,16 @@ pub(super) fn classify(model: &Model, source: &[u8]) -> Option<Division> {
         return None;
     }
     let block = function.block_specializations.get(&function.opset)?;
+    let (kind, tail_length) = match block.operations.last()?.r#type.as_str() {
+        "minimum" => (Kind::Minimum, 1),
+        "maximum" => (Kind::Maximum, 1),
+        "add" => (Kind::Divide, 7),
+        _ => return None,
+    };
     if !block.inputs.is_empty()
         || !block.attributes.is_empty()
         || block.outputs.len() != 1
-        || block.operations.len() < 7
+        || block.operations.len() < tail_length
     {
         return None;
     }
@@ -302,7 +318,9 @@ pub(super) fn classify(model: &Model, source: &[u8]) -> Option<Division> {
             return None;
         }
     }
-    let (prefix, tail) = block.operations.split_at(block.operations.len() - 7);
+    let (prefix, tail) = block
+        .operations
+        .split_at(block.operations.len() - tail_length);
     for operation in prefix {
         if !operation.blocks.is_empty() || operation.outputs.len() != 1 {
             return None;
@@ -388,30 +406,45 @@ pub(super) fn classify(model: &Model, source: &[u8]) -> Option<Division> {
             return None;
         }
     }
-    let q = output(&tail[0], "floor_div", &["x", "y"])?;
-    let r = output(&tail[1], "mod", &["x", "y"])?;
-    let negative = output(&tail[2], "less", &["x", "y"])?;
-    let nonzero = output(&tail[3], "not_equal", &["x", "y"])?;
-    let adjust = output(&tail[4], "logical_and", &["x", "y"])?;
-    let integer = output(&tail[5], "cast", &["x", "dtype"])?;
-    let result = output(&tail[6], "add", &["x", "y"])?;
     let left_name = named(&tail[0], "x")?;
     let right_name = named(&tail[0], "y")?;
-    if named(&tail[1], "x")? != left_name
-        || named(&tail[1], "y")? != right_name
-        || named(&tail[2], "x")? != q.name
-        || !zero(&tail[2], "y")
-        || named(&tail[3], "x")? != r.name
-        || !zero(&tail[3], "y")
-        || named(&tail[4], "x")? != negative.name
-        || named(&tail[4], "y")? != nonzero.name
-        || named(&tail[5], "x")? != adjust.name
-        || target_int32(&tail[5]).is_none()
-        || named(&tail[6], "x")? != q.name
-        || named(&tail[6], "y")? != integer.name
-        || block.outputs[0] != result.name
-        || description.output[0].name != result.name
-    {
+    let nodes = if kind == Kind::Divide {
+        let q = output(&tail[0], "floor_div", &["x", "y"])?;
+        let r = output(&tail[1], "mod", &["x", "y"])?;
+        let negative = output(&tail[2], "less", &["x", "y"])?;
+        let nonzero = output(&tail[3], "not_equal", &["x", "y"])?;
+        let adjust = output(&tail[4], "logical_and", &["x", "y"])?;
+        let integer = output(&tail[5], "cast", &["x", "dtype"])?;
+        let result = output(&tail[6], "add", &["x", "y"])?;
+        if named(&tail[1], "x")? != left_name
+            || named(&tail[1], "y")? != right_name
+            || named(&tail[2], "x")? != q.name
+            || !zero(&tail[2], "y")
+            || named(&tail[3], "x")? != r.name
+            || !zero(&tail[3], "y")
+            || named(&tail[4], "x")? != negative.name
+            || named(&tail[4], "y")? != nonzero.name
+            || named(&tail[5], "x")? != adjust.name
+            || target_int32(&tail[5]).is_none()
+            || named(&tail[6], "x")? != q.name
+            || named(&tail[6], "y")? != integer.name
+        {
+            return None;
+        }
+        vec![q, r, negative, nonzero, adjust, integer, result]
+    } else {
+        vec![output(
+            &tail[0],
+            if kind == Kind::Minimum {
+                "minimum"
+            } else {
+                "maximum"
+            },
+            &["x", "y"],
+        )?]
+    };
+    let result = nodes.last()?;
+    if block.outputs[0] != result.name || description.output[0].name != result.name {
         return None;
     }
     let (left_type, left) = values.get(left_name)?;
@@ -424,16 +457,13 @@ pub(super) fn classify(model: &Model, source: &[u8]) -> Option<Division> {
         .keys()
         .cloned()
         .collect::<std::collections::HashSet<_>>();
-    for (index, value) in [&q, &r, &negative, &nonzero, &adjust, &integer, &result]
-        .into_iter()
-        .enumerate()
-    {
+    for (index, value) in nodes.iter().enumerate() {
         let ty = tensor(value.r#type.as_ref()?)?;
         if ty.rank as usize != dimensions.len()
             || ty.dimensions != dimensions
             || !ty.attributes.is_empty()
             || ty.data_type
-                != if [2, 3, 4].contains(&index) {
+                != if kind == Kind::Divide && [2, 3, 4].contains(&index) {
                     mil::DataType::Bool
                 } else {
                     mil::DataType::Int32
@@ -459,7 +489,8 @@ pub(super) fn classify(model: &Model, source: &[u8]) -> Option<Division> {
     }) {
         return None;
     }
-    Some(Division {
+    Some(Binary {
+        kind,
         left: left.clone(),
         right: right.clone(),
     })
@@ -526,6 +557,154 @@ mod tests {
 
     fn accepted(model: &Model) -> bool {
         classify(model, &model.encode_to_vec()).is_some()
+    }
+
+    fn selection_fixture(kind: Kind, constant_view: Option<&str>) -> Model {
+        let mut source = constant_view.map_or_else(fixture, constant_view_fixture);
+        let b = block(&mut source);
+        let start = b.operations.len() - 7;
+        let mut selection = b.operations[start].clone();
+        selection.r#type = if kind == Kind::Minimum {
+            "minimum"
+        } else {
+            "maximum"
+        }
+        .into();
+        selection.outputs = b.operations.last().unwrap().outputs.clone();
+        b.operations.truncate(start);
+        b.operations.push(selection);
+        source
+    }
+
+    #[test]
+    fn int32_selection_proves_signed_types_and_complete_source_without_extra_semantics() {
+        for kind in [Kind::Minimum, Kind::Maximum] {
+            let source = selection_fixture(kind, None);
+            assert_eq!(
+                classify(&source, &source.encode_to_vec()).unwrap().kind,
+                kind
+            );
+            for mutation in 0..10 {
+                let mut changed = source.clone();
+                let b = block(&mut changed);
+                let selection = &mut b.operations[0];
+                match mutation {
+                    0 => selection.r#type = "mul".into(),
+                    1 => {
+                        selection
+                            .attributes
+                            .insert("unknown".into(), Default::default());
+                    }
+                    2 => selection.blocks.push(Default::default()),
+                    3 => selection.outputs[0].name = "left".into(),
+                    4 => {
+                        selection.inputs.get_mut("y").unwrap().arguments =
+                            selection.inputs["x"].arguments.clone();
+                    }
+                    5 => {
+                        let duplicate = selection.inputs["x"].arguments[0].clone();
+                        selection
+                            .inputs
+                            .get_mut("x")
+                            .unwrap()
+                            .arguments
+                            .push(duplicate);
+                    }
+                    6 => {
+                        let mil::value_type::Type::TensorType(ty) = selection.outputs[0]
+                            .r#type
+                            .as_mut()
+                            .unwrap()
+                            .r#type
+                            .as_mut()
+                            .unwrap()
+                        else {
+                            panic!()
+                        };
+                        ty.data_type = mil::DataType::Float32 as i32;
+                    }
+                    7 => {
+                        let duplicate = selection.clone();
+                        b.operations.push(duplicate);
+                    }
+                    8 => {
+                        changed.description.as_mut().unwrap().input[0]
+                            .r#type
+                            .as_mut()
+                            .unwrap()
+                            .is_optional = true;
+                    }
+                    9 => b.outputs.push("left".into()),
+                    _ => unreachable!(),
+                }
+                assert!(!accepted(&changed), "kind={kind:?}, mutation={mutation}");
+            }
+            let mut wire = source.encode_to_vec();
+            wire.extend([0xf8, 0x7f, 1]);
+            assert!(classify(&Model::decode(wire.as_slice()).unwrap(), &wire).is_none());
+            for view in ["identity", "reshape", "transpose", "mul"] {
+                let model = selection_fixture(kind, Some(view));
+                let checked = classify(&model, &model.encode_to_vec()).unwrap();
+                assert!(matches!(checked.left, Input::Constant { .. }));
+                assert_eq!(checked.kind, kind);
+            }
+        }
+    }
+
+    #[test]
+    fn int32_selection_rejects_incompatible_broadcast_and_unbounded_storage() {
+        let mut changed = selection_fixture(Kind::Minimum, None);
+        let model::Type::MlProgram(program) = changed.r#type.as_mut().unwrap() else {
+            panic!()
+        };
+        let function = program.functions.get_mut("main").unwrap();
+        let mil::value_type::Type::TensorType(ty) = function.inputs[1]
+            .r#type
+            .as_mut()
+            .unwrap()
+            .r#type
+            .as_mut()
+            .unwrap()
+        else {
+            panic!()
+        };
+        ty.dimensions[0].dimension = Some(dimension::Dimension::Constant(
+            dimension::ConstantDimension { size: 3 },
+        ));
+        let crate::protos::coreml::specification::feature_type::Type::MultiArrayType(feature) =
+            changed.description.as_mut().unwrap().input[1]
+                .r#type
+                .as_mut()
+                .unwrap()
+                .r#type
+                .as_mut()
+                .unwrap()
+        else {
+            panic!()
+        };
+        feature.shape = vec![3];
+        assert!(!accepted(&changed));
+
+        let mut feature = array(&fixture().description.unwrap().input[0])
+            .unwrap()
+            .clone();
+        for (lower, upper, accepted) in [
+            (0, 8, true),
+            (1, 8, true),
+            (0, 0, false),
+            (0, -1, false),
+            (9, 8, false),
+        ] {
+            feature.shape_flexibility = Some(array_feature_type::ShapeFlexibility::ShapeRange(
+                array_feature_type::ShapeRange {
+                    size_ranges: vec![crate::protos::coreml::specification::SizeRange {
+                        lower_bound: lower,
+                        upper_bound: upper,
+                    }],
+                },
+            ));
+            assert_eq!(storage_fits(&feature, u32::MAX as u64), accepted);
+        }
     }
 
     fn constant_view_fixture(kind: &str) -> Model {
@@ -615,6 +794,9 @@ mod tests {
                 },
             ],
         );
+        if kind == "identity" {
+            b.operations[1].inputs.remove("perm");
+        }
         source
     }
 
