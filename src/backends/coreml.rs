@@ -1,7 +1,7 @@
-//! CoreML backend for the unified WebNN IDL API (macOS only).
+//! CoreML backend for the unified WebNN IDL API on supported Apple targets.
 //!
 //! Mirrors the ONNX Runtime backend in `src/backends/ort.rs`: a `CoremlContext`
-//! owns raw-byte host tensor storage, a `CoremlBuilder` converts a [`GraphInfo`]
+//! owns persistent native tensor storage, a `CoremlBuilder` converts a [`GraphInfo`]
 //! to a CoreML MLProgram and compiles it once, and `CoremlGraph` holds the
 //! compiled model for repeated dispatch.
 //!
@@ -18,13 +18,15 @@ use crate::backend_selection::DeviceType;
 use crate::converters::{CoremlMlProgramConverter, GraphConverter};
 use crate::error::Error;
 use crate::executors::coreml::{
-    CompiledCoremlModel, CoremlByteInput, compile_model, run_coreml_bytes,
+    CompiledCoremlModel, CoremlByteInput, CoremlTensorBinding, CoremlTensorStorage, compile_model,
+    run_coreml_bytes, run_coreml_tensors,
 };
 use crate::mlcontext::RustNNOptions;
 use crate::mlcontext::{
     MLBackendBuilder, MLBackendContext, MLBackendGraph, MLGraph, MLNamedTensors, MLTensor,
     MLTensorDescriptor,
 };
+use crate::mlcontextoptions::{BackendStatistics, CoremlOptions, CoremlTensorStatistics};
 
 /// Number of bytes required to store a tensor described by `descriptor`.
 fn tensor_byte_len(descriptor: &MLTensorDescriptor) -> usize {
@@ -53,19 +55,20 @@ fn runtime_input_descriptor(
     })
 }
 
-/// Host tensor storage for the CoreML backend (mirrors `OrtTensor`).
+/// Context-owned tensor storage; native arrays never alias distinct tensors.
 #[derive(Debug)]
 pub(crate) struct CoremlTensor {
-    memory: Vec<u8>,
+    storage: CoremlTensorStorage,
 }
 
 /// A compiled CoreML model held by [`MLGraph`] (mirrors `OrtGraph`).
 pub(crate) struct CoremlGraph {
     model: CompiledCoremlModel,
+    output_backings_eligible: bool,
 }
 
 impl CoremlGraph {
-    pub(crate) fn load_diagnostics(&self) -> &crate::executors::coreml::CoremlLoadDiagnostics {
+    pub(crate) fn load_diagnostics(&self) -> crate::executors::coreml::CoremlLoadDiagnostics {
         self.model.load_diagnostics()
     }
 }
@@ -92,44 +95,137 @@ impl fmt::Debug for CoremlBuilder {
 
 impl<'context, 'builder> MLBackendBuilder<'context, 'builder> for CoremlBuilder {
     fn build(&mut self, graph_info: GraphInfo) -> crate::error::Result<MLGraph<'context>> {
+        let output_backings_eligible = supports_output_backings(&graph_info);
         let converted = CoremlMlProgramConverter
             .convert(&graph_info)
             .map_err(|e| Error::GraphBuildError { source: e.into() })?;
+        let use_asset =
+            CoremlMlProgramConverter::constant_copy_asset_eligible(&graph_info, &converted.data);
         let model = compile_model(
             converted.data,
             converted.weights_data,
             self.device_type,
-            // Use one compilation path for all graphs. The asset compiler
-            // loses typed integer values as well as half precision boundaries.
-            false,
+            // Arithmetic and typed boundaries keep the URL precision path.
+            // Data-free, proven copies avoid a BNNS URL constant-fold crash.
+            use_asset,
         )
         .map_err(|e| Error::GraphBuildError { source: e.into() })?;
         MLGraph::new(
-            MLBackendGraph::CoremlModel(CoremlGraph { model }),
+            MLBackendGraph::CoremlModel(CoremlGraph {
+                model,
+                output_backings_eligible,
+            }),
             &graph_info,
         )
     }
+}
+
+/// A fixed output feature does not prove that the whole graph is static.
+/// Dynamic intermediates can still make a proposed output backing unsafe.
+fn supports_output_backings(graph: &GraphInfo) -> bool {
+    graph.operands.iter().all(|operand| {
+        operand
+            .descriptor
+            .shape
+            .iter()
+            .all(|dimension| matches!(dimension, crate::graph::Dimension::Static(_)))
+    })
 }
 
 #[derive(Debug)]
 pub(crate) struct CoremlContext {
     device_type: DeviceType,
     tensors: Vec<CoremlTensor>,
+    options: CoremlOptions,
+    statistics: CoremlTensorStatistics,
 }
 
 impl CoremlContext {
     pub(crate) fn new_from_device_type(
         device_type: DeviceType,
-        _options: Option<&RustNNOptions>,
+        options: Option<&RustNNOptions>,
     ) -> crate::error::Result<Self> {
         Ok(Self {
             device_type,
             tensors: Vec::new(),
+            options: options.map(|o| o.coreml.clone()).unwrap_or_default(),
+            statistics: CoremlTensorStatistics::default(),
         })
+    }
+
+    fn dispatch_native(
+        &mut self,
+        graph: &MLGraph,
+        inputs: &MLNamedTensors,
+        outputs: &MLNamedTensors,
+    ) -> crate::error::Result<HashMap<String, Vec<u8>>> {
+        let coreml_graph =
+            graph
+                .backend
+                .as_coreml_model()
+                .ok_or_else(|| Error::GraphDispatchError {
+                    source: "MLGraph is not a CoreML model graph".into(),
+                })?;
+        let model = &coreml_graph.model;
+        let active = |descriptors: &HashMap<String, crate::graph::OperandDescriptor>,
+                      bindings: &MLNamedTensors| {
+            descriptors
+                .iter()
+                .map(|(name, descriptor)| {
+                    let tensor =
+                        bindings
+                            .get(name.as_str())
+                            .ok_or_else(|| Error::GraphDispatchError {
+                                source: format!("missing tensor '{name}'").into(),
+                            })?;
+                    Ok((
+                        name.clone(),
+                        runtime_input_descriptor(descriptor, tensor.shape())?,
+                    ))
+                })
+                .collect::<crate::error::Result<HashMap<_, _>>>()
+        };
+        let input_descriptors = active(&graph.input_descriptors, inputs)?;
+        let output_descriptors = active(&graph.output_descriptors, outputs)?;
+        fn bind<'a>(
+            descriptors: &'a HashMap<String, crate::graph::OperandDescriptor>,
+            tensors: &MLNamedTensors,
+            storage: &'a [CoremlTensor],
+        ) -> HashMap<String, CoremlTensorBinding<'a>> {
+            descriptors
+                .iter()
+                .map(|(name, descriptor)| {
+                    (
+                        name.clone(),
+                        CoremlTensorBinding {
+                            storage: &storage[tensors[name.as_str()].id].storage,
+                            descriptor,
+                        },
+                    )
+                })
+                .collect::<HashMap<_, _>>()
+        }
+        let native_inputs = bind(&input_descriptors, inputs, &self.tensors);
+        let native_outputs = bind(&output_descriptors, outputs, &self.tensors);
+        let result = run_coreml_tensors(
+            model,
+            &native_inputs,
+            &native_outputs,
+            self.options.output_backings && coreml_graph.output_backings_eligible,
+            &mut self.statistics,
+        )
+        .map_err(|e| Error::GraphDispatchError { source: e.into() });
+        // Bounded Pipelines load native children lazily during prediction.
+        // Report the observed completed attempt, including mixed-stage policy.
+        self.statistics.last_compute_units = model.compute_unit();
+        result
     }
 }
 
 impl<'context> MLBackendContext<'context> for CoremlContext {
+    fn backend_statistics(&self) -> Option<BackendStatistics> {
+        Some(BackendStatistics::Coreml(self.statistics))
+    }
     fn accelerated(&self) -> bool {
         self.device_type != DeviceType::Cpu
     }
@@ -147,9 +243,17 @@ impl<'context> MLBackendContext<'context> for CoremlContext {
 
     fn create_tensor(&mut self, descriptor: &MLTensorDescriptor) -> crate::error::Result<MLTensor> {
         let n = tensor_byte_len(descriptor);
-        self.tensors.push(CoremlTensor {
-            memory: vec![0u8; n.max(1)],
-        });
+        let storage = CoremlTensorStorage::new(
+            descriptor.data_type().into(),
+            n,
+            self.options.reuse_tensor_storage,
+        )
+        .map_err(|e| Error::TensorCreationError {
+            source: e.into(),
+            descriptor: descriptor.clone(),
+        })?;
+        self.statistics.native_allocations += u64::from(storage.is_native());
+        self.tensors.push(CoremlTensor { storage });
         Ok(MLTensor {
             id: self.tensors.len() - 1,
             constant: false,
@@ -173,7 +277,6 @@ impl<'context> MLBackendContext<'context> for CoremlContext {
     }
 
     fn read_tensor(&mut self, tensor: &MLTensor, array: &mut [u8]) -> crate::error::Result<()> {
-        let host = &self.tensors[tensor.id].memory;
         let logical = tensor_byte_len(tensor.descriptor());
         if array.len() < logical {
             return Err(Error::TensorReadError {
@@ -186,29 +289,26 @@ impl<'context> MLBackendContext<'context> for CoremlContext {
                 tensor: tensor.clone(),
             });
         }
-        let slice = host.get(..logical).ok_or_else(|| Error::TensorReadError {
-            source: format!("tensor storage shorter than logical size ({logical} bytes)").into(),
-            tensor: tensor.clone(),
-        })?;
-        array[..logical].copy_from_slice(slice);
+        self.tensors[tensor.id]
+            .storage
+            .read(&mut array[..logical])
+            .map_err(|e| Error::TensorReadError {
+                source: e.into(),
+                tensor: tensor.clone(),
+            })?;
+        self.statistics.host_read_bytes += logical as u64;
         Ok(())
     }
 
     fn write_tensor(&mut self, tensor: &MLTensor, array: &[u8]) -> crate::error::Result<()> {
-        let host = &mut self.tensors[tensor.id].memory;
-        if array.len() > host.len() {
-            return Err(Error::TensorWriteError {
-                source: format!(
-                    "write exceeds tensor storage: {} bytes > {}",
-                    array.len(),
-                    host.len()
-                )
-                .into(),
+        self.tensors[tensor.id]
+            .storage
+            .write(array)
+            .map_err(|e| Error::TensorWriteError {
+                source: e.into(),
                 tensor: tensor.clone(),
-            });
-        }
-        let n = array.len();
-        host[..n].copy_from_slice(array);
+            })?;
+        self.statistics.host_write_bytes += array.len() as u64;
         Ok(())
     }
 
@@ -220,7 +320,17 @@ impl<'context> MLBackendContext<'context> for CoremlContext {
     ) -> crate::error::Result<()> {
         // Gather raw-byte inputs keyed by feature name, then run; the borrow of
         // `self.tensors` is released before we write outputs back.
-        let out_bytes = {
+        let proven_copy_outputs = graph
+            .backend
+            .as_coreml_model()
+            .ok_or_else(|| Error::GraphDispatchError {
+                source: "MLGraph is not a CoreML model graph".into(),
+            })?
+            .model
+            .proven_copy_output_count();
+        let out_bytes = if self.options.reuse_tensor_storage {
+            self.dispatch_native(graph, inputs, outputs)?
+        } else {
             let coreml_graph =
                 graph
                     .backend
@@ -264,7 +374,10 @@ impl<'context> MLBackendContext<'context> for CoremlContext {
                         .ok_or_else(|| Error::GraphDispatchError {
                             source: format!("input '{name}': cannot compute byte length").into(),
                         })?;
-                let full = &self.tensors[tensor.id].memory;
+                let full = self.tensors[tensor.id]
+                    .storage
+                    .host()
+                    .map_err(|e| Error::GraphDispatchError { source: e.into() })?;
                 let bytes = full
                     .get(..logical)
                     .ok_or_else(|| Error::GraphDispatchError {
@@ -290,11 +403,24 @@ impl<'context> MLBackendContext<'context> for CoremlContext {
                 );
             }
 
-            run_coreml_bytes(&coreml_graph.model, &byte_inputs, &graph.output_descriptors)
-                .map_err(|e| Error::GraphDispatchError { source: e.into() })?
+            self.statistics.input_copy_bytes += byte_inputs
+                .values()
+                .map(|i| i.data.len() as u64)
+                .sum::<u64>();
+            let result =
+                run_coreml_bytes(&coreml_graph.model, &byte_inputs, &graph.output_descriptors)
+                    .map_err(|e| Error::GraphDispatchError { source: e.into() });
+            self.statistics.last_compute_units = coreml_graph.model.compute_unit();
+            let result = result?;
+            self.statistics.output_copy_bytes +=
+                result.values().map(|b| b.len() as u64).sum::<u64>();
+            result
         };
 
         for (&name, ml_tensor) in outputs.iter() {
+            if self.tensors[ml_tensor.id].storage.is_native() {
+                continue;
+            }
             let data = out_bytes
                 .get(name)
                 .ok_or_else(|| Error::GraphDispatchError {
@@ -317,18 +443,14 @@ impl<'context> MLBackendContext<'context> for CoremlContext {
                     .into(),
                 });
             }
-            let dst = &mut self.tensors[ml_tensor.id].memory;
-            if dst.len() < logical {
-                return Err(Error::GraphDispatchError {
-                    source: format!(
-                        "output '{name}': storage too small ({} bytes) for {logical} logical bytes",
-                        dst.len()
-                    )
-                    .into(),
-                });
-            }
-            dst[..logical].copy_from_slice(&effective[..logical]);
+            self.tensors[ml_tensor.id]
+                .storage
+                .write(effective)
+                .map_err(|e| Error::GraphDispatchError { source: e.into() })?;
         }
+        // Count logical copies only after the whole dispatch succeeds, in all
+        // storage modes. An arithmetic-derived alias is not a proven source copy.
+        self.statistics.proven_copy_outputs += proven_copy_outputs;
         Ok(())
     }
 
@@ -340,10 +462,11 @@ impl<'context> MLBackendContext<'context> for CoremlContext {
         let mut new_desc = tensor.descriptor().clone();
         new_desc.set_shape(new_shape.to_vec());
         let new_bytes = new_desc.rustnn_required_bytes();
-        let host = &mut self.tensors[tensor.id].memory;
-        if new_bytes > host.len() {
-            host.resize(new_bytes, 0u8);
-        }
+        let allocated = self.tensors[tensor.id]
+            .storage
+            .reserve(new_bytes, true)
+            .map_err(|e| Error::GraphDispatchError { source: e.into() })?;
+        self.statistics.native_allocations += u64::from(allocated);
         tensor.descriptor = new_desc;
         Ok(())
     }
@@ -360,19 +483,71 @@ impl<'context> MLBackendContext<'context> for CoremlContext {
             .ok_or_else(|| Error::GraphDispatchError {
                 source: "rustnn_set_tensor_capacity: shape element count overflow".into(),
             })?;
-        let new_bytes = (elements as usize)
-            .checked_mul(bits)
-            .and_then(|b| b.checked_div(8))
+        let new_bytes = usize::try_from(elements)
+            .ok()
+            .and_then(|elements| elements.checked_mul(bits))
+            .and_then(|b| b.checked_add(7))
+            .map(|b| b / 8)
             .ok_or_else(|| Error::GraphDispatchError {
                 source: "rustnn_set_tensor_capacity: byte length overflow".into(),
             })?;
-        self.tensors[tensor.id].memory = vec![0u8; new_bytes.max(1)];
+        let allocated = self.tensors[tensor.id]
+            .storage
+            .reserve(new_bytes.max(1), false)
+            .map_err(|e| Error::GraphDispatchError { source: e.into() })?;
+        self.statistics.native_allocations += u64::from(allocated);
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod test {
+    #[test]
+    fn output_backings_require_static_intermediates_as_well_as_inputs_and_outputs() {
+        use crate::graph::{
+            DataType, Dimension, DynamicDimension, GraphInfo, Operand, OperandDescriptor,
+            OperandKind,
+        };
+
+        let mut graph = GraphInfo {
+            operands: [
+                OperandKind::Input,
+                OperandKind::Intermediate,
+                OperandKind::Output,
+            ]
+            .into_iter()
+            .map(|kind| Operand {
+                kind,
+                name: None,
+                descriptor: OperandDescriptor {
+                    data_type: DataType::Float32,
+                    shape: vec![Dimension::Static(1)],
+                    pending_permutation: vec![],
+                },
+            })
+            .collect(),
+            input_operands: vec![0],
+            output_operands: vec![2],
+            ..Default::default()
+        };
+        assert!(super::supports_output_backings(&graph));
+        for index in 0..graph.operands.len() {
+            for name in ["sequence", ""] {
+                // Even max_size=1 is a dynamic dimension, not a static proof.
+                graph.operands[index].descriptor.shape[0] = Dimension::Dynamic(DynamicDimension {
+                    name: name.into(),
+                    max_size: 1,
+                });
+                assert!(!super::supports_output_backings(&graph));
+                graph.operands[index].descriptor.shape[0] = Dimension::Static(1);
+            }
+        }
+        for operand in &mut graph.operands {
+            operand.descriptor.shape.clear();
+        }
+        assert!(super::supports_output_backings(&graph));
+    }
+
     use crate::mlcontext::{
         Backend, MLContext, MLContextOptions, MLNamedOperands, MLNamedTensors, MLOperandDescriptor,
         MLPowerPreference, MLTensorDescriptor,

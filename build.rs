@@ -70,18 +70,27 @@ fn build_coreml_protos() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", feature = "coreml-runtime"))]
+#[cfg(feature = "coreml-runtime")]
 fn build_coreml_shim() {
-    // On macOS with the CoreML runtime, compile the Objective-C++ exception
+    // Build scripts run on the host: select by the Cargo target, not the host's
+    // cfg. In particular, watchOS cannot compile source models with this API.
+    if !matches!(
+        env::var("CARGO_CFG_TARGET_OS").as_deref(),
+        Ok("macos" | "ios")
+    ) {
+        return;
+    }
+
+    // On supported Apple targets, compile the Objective-C++ exception
     // firewall (see src/executors/coreml_shim.mm). It catches Objective-C and
     // C++ exceptions raised by CoreML before they can unwind across the
     // `extern "C"` objc_msgSend boundary and abort the process.
-
     let shim = "src/executors/coreml_shim.mm";
     println!("cargo:rerun-if-changed={shim}");
     cc::Build::new()
         .file(shim)
         .flag("-fobjc-arc")
+        .flag("-Werror=unguarded-availability-new")
         .compile("rustnn_coreml_shim");
     // The shim's `@catch (...)` pulls in the C++ runtime (__cxa_begin_catch,
     // std::terminate); Rust links with -nodefaultlibs, so request libc++.
@@ -153,7 +162,7 @@ fn embed_wpt_corpus() -> Result<(), Box<dyn std::error::Error>> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Only compile CoreML protos - ONNX protos come from webnn-onnx-utils
     build_coreml_protos()?;
-    #[cfg(all(target_os = "macos", feature = "coreml-runtime"))]
+    #[cfg(feature = "coreml-runtime")]
     build_coreml_shim();
     embed_wpt_corpus()?;
 

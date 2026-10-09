@@ -18,8 +18,10 @@
 
 #import <CoreML/CoreML.h>
 #import <Foundation/Foundation.h>
+#import <TargetConditionals.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdint.h>
 
 extern "C" {
 
@@ -44,6 +46,14 @@ static void rustnn_copy_err(char *buf, size_t len, NSString *msg) {
 // hand the caller an already-deallocated object in optimized builds.
 int rustnn_coreml_compile(void *model_url, void **out_url, char *err, size_t err_len) {
     *out_url = NULL;
+#if TARGET_OS_WATCH
+    // watchOS provides the compiled-model loader, but not Apple's URL or
+    // specification-data compiler. An offline exporter must supply this route.
+    (void)model_url;
+    rustnn_copy_err(err, err_len,
+                    @"Apple's source-model compilation route is unavailable on watchOS; use an offline-generated compiled model");
+    return 1;
+#else
     @try {
         NSError *nserr = nil;
         NSURL *compiled = [MLModel compileModelAtURL:(__bridge NSURL *)model_url error:&nserr];
@@ -62,6 +72,7 @@ int rustnn_coreml_compile(void *model_url, void **out_url, char *err, size_t err
         rustnn_copy_err(err, err_len, @"caught non-Objective-C exception during CoreML compile");
         return 3;
     }
+#endif
 }
 
 // Load an MLModel from a compiled URL with the given configuration. On success
@@ -125,6 +136,62 @@ int rustnn_coreml_predict(void *model, void *features, void **out_provider, char
         return 2;
     } @catch (...) {
         rustnn_copy_err(err, err_len, @"caught non-Objective-C exception during CoreML prediction");
+        return 3;
+    }
+}
+
+// Retained shape view over a context-owned buffer. The context
+// keeps the buffer alive longer than the view and every synchronous prediction.
+int rustnn_coreml_array_view(void *data, const int64_t *shape, const int64_t *strides,
+                            size_t rank, int32_t dtype, void **out, char *err, size_t err_len) {
+    *out = NULL;
+    @try {
+        NSMutableArray<NSNumber *> *dimensions = [NSMutableArray arrayWithCapacity:rank];
+        NSMutableArray<NSNumber *> *steps = [NSMutableArray arrayWithCapacity:rank];
+        for (size_t i = 0; i < rank; ++i) {
+            [dimensions addObject:@(shape[i])];
+            [steps addObject:@(strides[i])];
+        }
+        NSError *nserr = nil;
+        MLMultiArray *array = [[MLMultiArray alloc] initWithDataPointer:data shape:dimensions
+            dataType:(MLMultiArrayDataType)dtype strides:steps deallocator:nil error:&nserr];
+        if (array == nil) {
+            rustnn_copy_err(err, err_len, nserr.localizedDescription ?: @"array view failed");
+            return 1;
+        }
+        *out = (__bridge_retained void *)array;
+        return 0;
+    } @catch (NSException *e) {
+        rustnn_copy_err(err, err_len, [NSString stringWithFormat:@"%@: %@", e.name, e.reason]);
+        return 2;
+    } @catch (...) {
+        rustnn_copy_err(err, err_len, @"exception creating native tensor view");
+        return 3;
+    }
+}
+
+int rustnn_coreml_predict_backed(void *model, void *features, void *backings,
+                                void **out_provider, char *err, size_t err_len) {
+    *out_provider = NULL;
+    @try {
+        MLPredictionOptions *options = [[MLPredictionOptions alloc] init];
+        if ([options respondsToSelector:@selector(setOutputBackings:)]) {
+            options.outputBackings = (__bridge NSDictionary *)backings;
+        }
+        NSError *nserr = nil;
+        id<MLFeatureProvider> out = [(__bridge MLModel *)model
+            predictionFromFeatures:(__bridge id<MLFeatureProvider>)features options:options error:&nserr];
+        if (out == nil) {
+            rustnn_copy_err(err, err_len, nserr.description ?: @"prediction returned nil");
+            return 1;
+        }
+        *out_provider = (__bridge_retained void *)out;
+        return 0;
+    } @catch (NSException *e) {
+        rustnn_copy_err(err, err_len, [NSString stringWithFormat:@"%@: %@", e.name, e.reason]);
+        return 2;
+    } @catch (...) {
+        rustnn_copy_err(err, err_len, @"exception during backed CoreML prediction");
         return 3;
     }
 }

@@ -252,10 +252,11 @@ fn convert(
 /// Validated positive element strides. The native array owns the storage; this
 /// checks its metadata before any pointer arithmetic at the FFI boundary.
 pub(super) struct ArrayLayout {
-    shape: Vec<usize>,
-    strides: Vec<usize>,
+    pub(super) shape: Vec<usize>,
+    pub(super) strides: Vec<usize>,
     pub(super) count: usize,
     pub(super) byte_length: usize,
+    pub(super) storage_byte_length: usize,
     pub(super) contiguous: bool,
     element_size: usize,
 }
@@ -294,7 +295,7 @@ impl ArrayLayout {
             .checked_mul(element_size)
             .filter(|&length| length <= isize::MAX as usize)
             .ok_or_else(|| boundary_error("MLMultiArray byte length overflow"))?;
-        if count > 0 {
+        let storage_byte_length = if count > 0 {
             let span = dimensions
                 .iter()
                 .zip(&strides)
@@ -306,10 +307,11 @@ impl ArrayLayout {
                 })
                 .and_then(|last| last.checked_add(1))
                 .and_then(|elements| elements.checked_mul(element_size));
-            if span.is_none_or(|span| span > isize::MAX as usize) {
-                return Err(boundary_error("MLMultiArray strided storage span overflow"));
-            }
-        }
+            span.filter(|&span| span <= isize::MAX as usize)
+                .ok_or_else(|| boundary_error("MLMultiArray strided storage span overflow"))?
+        } else {
+            0
+        };
         let mut contiguous = true;
         let mut expected_stride = 1usize;
         for (&dimension, &stride) in dimensions.iter().zip(&strides).rev() {
@@ -323,6 +325,7 @@ impl ArrayLayout {
             strides,
             count,
             byte_length,
+            storage_byte_length,
             contiguous,
             element_size,
         })
@@ -659,6 +662,8 @@ mod tests {
         assert!(ArrayLayout::new(&[i64::MAX, 3], &[3, 1], 0, 4).is_err());
         let layout = ArrayLayout::new(&[2, 3], &[16, 2], 6, 2).unwrap();
         assert!(!layout.contiguous);
+        assert_eq!(layout.byte_length, 12);
+        assert_eq!(layout.storage_byte_length, 42);
         assert_eq!(
             (0..6)
                 .map(|index| layout.byte_offset(index))
@@ -668,9 +673,11 @@ mod tests {
         assert_eq!(
             ArrayLayout::new(&[0, 3], &[3, 1], 0, 4)
                 .unwrap()
-                .byte_length,
+                .storage_byte_length,
             0
         );
-        assert_eq!(ArrayLayout::new(&[], &[], 1, 4).unwrap().byte_offset(0), 0);
+        let scalar = ArrayLayout::new(&[], &[], 1, 4).unwrap();
+        assert_eq!(scalar.byte_offset(0), 0);
+        assert_eq!(scalar.storage_byte_length, 4);
     }
 }

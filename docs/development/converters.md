@@ -102,10 +102,6 @@ Rules that hold for every converter:
 
 ### CoreML
 
-- WebNN operand names are reversibly escaped when they are not valid MIL identifiers or are
-  reserved words. The model carries an explicit name-encoding metadata marker; runtime binding
-  translation is enabled only for marked models. See the
-  [tensor-name contract](https://rustnn.github.io/rustnn/integration/coreml/#tensor-names).
 - MIL has no rank-0 tensors at the boundary, no dilation in pooling, no `edge`/`reflection`
   padding above two dimensions and no tensors of rank 6 and above; integer arithmetic runs in
   float32.
@@ -121,7 +117,9 @@ Rules that hold for every converter:
 - WebNN names need not be MIL identifiers, and its input/output namespaces are independent.
   Unsafe or colliding names receive unique physical identifiers. Creator-defined
   `rustnn.webnn.input_aliases` and `rustnn.webnn.output_aliases` JSON mappings preserve
-  logical bindings in both execution paths and standalone exports.
+  logical bindings in byte-buffer, retained-tensor and one-shot execution, and standalone
+  exports. The JSON maps define the binding contract; models without them keep literal names.
+  See the [tensor-name contract](https://rustnn.github.io/rustnn/integration/coreml/#tensor-names).
   Source-proven copies with identical type, shape and pending layout share one
   physical result: CoreML can omit duplicate scalar/dynamic copy features from prediction.
   Logical tensors still receive independent results. Unequal computations and real dtype
@@ -134,21 +132,30 @@ Rules that hold for every converter:
   Copy proofs cover identity, same-type cast, same-shape reshape, identity transpose, and
   static full-span, unit-stride slice. An equal square shape does not prove a transpose is
   an identity; dynamic maximum extents do not prove a full-span slice.
-  Copies rooted in original constants use versioned `rustnn.webnn.output_constant_copies`
-  metadata: output bindings reference a deduplicated descriptor and original base64 bytes.
-  Only output-reachable constants are included. Execution checks bounds and byte lengths
-  before decoding, then supplies independently owned results. The valid native graph still
+  Copies rooted in original constants use version-2 `rustnn.webnn.output_constant_copies`
+  metadata: output bindings reference a descriptor, original weight-record offset and
+  consistency checksum, without embedding tensor payloads. Unchanged blob weights reuse
+  their record; immediate or converted constants retain one original raw record per source.
+  Execution validates referenced ranges and byte lengths, shares the immutable weight owner
+  or compacts only the required ranges, then supplies independently owned results. Standalone
+  compiled models require the original weights sidecar. The valid native graph still
   runs; arithmetic-derived outputs are not reconstructed from inputs or constants.
 - Float16 `gelu` widens to float32 for MIL `gelu(mode="EXACT")`, then rounds back to
   float16. Native float16 GELU can exceed WebNN's error bound under accelerator-enabled
   policies. This preserves the public dtype and shape without forcing CPU execution;
   float32 GELU is unchanged. Deferred layout transposes are emitted after the final cast.
-  MLProgram graphs compile locally from a URL while retaining the requested compute policy.
+  Arithmetic and typed boundaries compile locally from a URL while retaining the requested
+  compute policy. Only input-free single programs made entirely of proven constant copies
+  prefer an in-memory asset, avoiding a BNNS URL constant-fold crash without changing the
+  arithmetic loading path.
 - Typed precision boundaries use native Pipeline children when CoreML can eliminate a
   real Half narrowing or fuse a widened kernel back into Half arithmetic. Child interfaces
   carry live results only; constants are rematerialized from the shared weight blob rather
   than carried through every stage. Public descriptors and the backend-independent graph
   remain unchanged. Private scalar and Boolean interfaces use explicit rank/type adapters.
+  The bounded executor retains original child bytes and typed outputs until their last
+  consumer, with one loaded native child and shared source weights. Complete known-wire
+  float Cast children use exact host narrowing/widening; arithmetic children remain native.
 - Affected Half widening layouts use compact private features. Original high-rank inputs
   declare `rustnn.webnn.compact_input_views`; contiguous storage is viewed with its owner
   retained, while padded storage is copied as raw Half bytes. Dynamic restoration uses

@@ -9,7 +9,7 @@ use wpt_conformance::wpt_backend::WptBackend;
 use wpt_conformance::wpt_js_loader::{
     check_wpt_revision, default_wpt_dir, load_wpt_corpus, trial_name,
 };
-use wpt_conformance::wpt_report::{WptReportCollector, report_output_path};
+use wpt_conformance::wpt_report::{CoremlTrialStatistics, WptReportCollector, report_output_path};
 use wpt_conformance::wpt_tensor;
 use wpt_conformance::wpt_types::WptLoadedCase;
 use wpt_conformance::{
@@ -22,6 +22,7 @@ fn run_trial(
     file_name: &str,
     test_case: &WptTestCase,
     audit: Option<&WptAuditCollector>,
+    execution: &mut Option<CoremlTrialStatistics>,
 ) -> Result<Completion, Failed> {
     // Normalize camelCase WPT stems to the snake_case names used by the
     // tolerance tables and the litert skip list.
@@ -37,7 +38,7 @@ fn run_trial(
         return Ok(Completion::ignored_with(reason));
     }
 
-    run_one_test_case_with_audit(backend, &operation, file_name, test_case, audit)
+    run_one_test_case_with_audit(backend, &operation, file_name, test_case, audit, execution)
         .map(|()| Completion::Completed)
         .map_err(Failed::from)
 }
@@ -64,7 +65,15 @@ fn push_backend_trials(
         let audit = audit.clone();
         trials.push(Trial::ignorable_test(name, move || {
             let started = Instant::now();
-            let result = run_trial(&backend, &operation, &file_name, &test_case, audit.as_ref());
+            let mut execution = None;
+            let result = run_trial(
+                &backend,
+                &operation,
+                &file_name,
+                &test_case,
+                audit.as_ref(),
+                &mut execution,
+            );
             let result = match result {
                 Err(err) if expected_failure => {
                     let msg = err.message().unwrap_or("test failed");
@@ -79,16 +88,36 @@ fn push_backend_trials(
 
             match &result {
                 Ok(Completion::Completed) => {
-                    report.record_pass(&file_name, &test_name, &backend_prefix, duration);
+                    report.record_pass(
+                        &file_name,
+                        &test_name,
+                        &backend_prefix,
+                        duration,
+                        execution,
+                    );
                 }
                 Ok(Completion::Ignored { reason }) => {
                     let reason = reason.as_deref().unwrap_or("ignored").to_string();
-                    report.record_skip(&file_name, &test_name, &backend_prefix, reason, duration);
+                    report.record_skip(
+                        &file_name,
+                        &test_name,
+                        &backend_prefix,
+                        reason,
+                        duration,
+                        execution,
+                    );
                 }
                 Err(err) => {
                     let msg = err.message().unwrap_or("test failed");
                     // Failures are tracked in {backend}_expected_failures.txt.
-                    report.record_fail(&file_name, &test_name, &backend_prefix, msg, duration);
+                    report.record_fail(
+                        &file_name,
+                        &test_name,
+                        &backend_prefix,
+                        msg,
+                        duration,
+                        execution,
+                    );
                 }
             }
             result
@@ -98,6 +127,33 @@ fn push_backend_trials(
 
 fn main() {
     pretty_env_logger::init();
+
+    // A build without any backend feature has nothing to test; only a compiled-in backend
+    // that fails to come up is an error (for example a missing ONNX Runtime library).
+    const BACKEND_FEATURE_ENABLED: bool = cfg!(any(
+        feature = "onnx-runtime",
+        feature = "trtx-runtime",
+        feature = "trtx-runtime-mock",
+        feature = "litert-runtime",
+        feature = "cann-runtime",
+        feature = "cann-runtime-mock",
+        all(target_os = "macos", feature = "coreml-runtime")
+    ));
+    if !BACKEND_FEATURE_ENABLED {
+        eprintln!(
+            "[WPT] no backend feature enabled; skipping the conformance trials (build with --features onnx-runtime, trtx-runtime, litert-runtime or coreml-runtime)."
+        );
+        return;
+    }
+
+    eprintln!(
+        "[WPT] comparison: {}",
+        if wpt_conformance::wpt_config::strict_wpt_tolerance() {
+            "strict upstream tolerance (no local ULP or absolute floors)"
+        } else {
+            "compatibility tolerance (local ULP and absolute floors enabled)"
+        }
+    );
 
     let args = Arguments::from_args();
     let wpt_dir = default_wpt_dir();
@@ -133,21 +189,6 @@ fn main() {
 
     let backends = WptBackend::selected();
     if backends.is_empty() {
-        // A build without any backend feature has nothing to test; only a compiled-in backend
-        // that fails to come up is an error (for example a missing ONNX Runtime library).
-        const BACKEND_FEATURE_ENABLED: bool = cfg!(any(
-            feature = "onnx-runtime",
-            feature = "trtx-runtime",
-            feature = "trtx-runtime-mock",
-            feature = "litert-runtime",
-            all(target_os = "macos", feature = "coreml-runtime")
-        ));
-        if !BACKEND_FEATURE_ENABLED {
-            eprintln!(
-                "[WPT] no backend feature enabled; skipping the conformance trials (build with --features onnx-runtime, trtx-runtime, litert-runtime or coreml-runtime)."
-            );
-            return;
-        }
         eprintln!(
             "No WPT backends available (enable onnx-runtime, trtx-runtime, coreml-runtime, ...)."
         );
