@@ -70,7 +70,7 @@ logical-to-physical bindings in creator-defined `rustnn.webnn.input_aliases` and
 consumers should apply them when binding and retrieving CoreML features.
 The JSON maps are the binding contract; models without them keep literal feature names.
 Duplicate logical keys are rejected, even when their values match. Bindings and original
-constant payloads are validated and decoded once when the model is loaded.
+constant references are validated once when the model is loaded.
 Proven equal copy outputs may share one physical result, avoiding CoreML's omission of
 duplicate scalar/dynamic features. RustNN supplies each requested logical output tensor;
 unequal computations and real dtype conversions remain separate. Returning an original
@@ -84,11 +84,23 @@ prediction, supplying independent output copies even if CoreML omits or changes 
 feature. Standalone consumers should honor these proven-copy bindings too; they must not
 infer an input/output alias from matching names or values.
 Copy proofs also cover same-shape reshape, identity transpose and static full-span
-unit-stride slice. Original constant copies use version-1
-`rustnn.webnn.output_constant_copies` metadata, with one original raw base64 payload per
-output-reachable source and independent output bindings. Consumers must validate the
-descriptor and encoded/decoded byte lengths. This adds approximately four encoded bytes
-per three source bytes, once per referenced constant, not once per output or for all weights.
+unit-stride slice. Original constant copies use version-2
+`rustnn.webnn.output_constant_copies` metadata: each source has its original descriptor,
+a `WeightMetadata` offset in `weights/weights.bin`, and a SeaHash checksum of its raw
+bytes. Independent output bindings reference these sources; metadata contains no tensor
+payloads. Unchanged blob-backed weights reuse the existing MIL record. Constants stored
+as immediates or changed during lowering retain one additional raw UINT8 record per source.
+Consumers validate the file records, referenced ranges, descriptor byte lengths and
+checksums before prediction. The checksum detects a mismatched sidecar, not malicious
+modification. In-memory compiled graphs share the existing immutable weight allocation;
+one-shot diagnostics borrow it, without decoding a second source allocation. URL-compiled
+graphs retain that owner only when its capacity is at most twice the uniquely referenced
+bytes; otherwise they compact just those ranges into one shared allocation, so a tiny
+copy output does not retain a large unrelated weight file.
+Standalone consumers must retain the original weights sidecar alongside the compiled
+model; a `.mlmodelc` alone cannot supply RustNN's exact original-copy values. Missing or
+invalid source data fails closed, regardless of tensor size. Exported `.mlpackage`
+sources contain that sidecar and do not depend on the original Rust graph or its lifetime.
 The native graph still runs; these proofs do not replace arithmetic-derived results.
 The same checked bindings apply with retained tensor storage enabled. Proven copies
 are snapshotted before prediction and written into independently owned outputs;

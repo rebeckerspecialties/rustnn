@@ -66,8 +66,10 @@ pub(crate) struct CoremlConstantCopies {
 #[serde(deny_unknown_fields)]
 pub(crate) struct CoremlConstantSource {
     pub(crate) descriptor: crate::graph::OperandDescriptor,
-    // Keep the encoded string until its declared byte length has been checked.
-    pub(crate) data: String,
+    /// WeightMetadata offset in the existing weights.bin sidecar.
+    pub(crate) offset: u64,
+    /// Detect a mismatched sidecar; this is not an authentication mechanism.
+    pub(crate) checksum: u64,
 }
 
 fn proven_copy_input(graph: &GraphInfo, operation: &Operation, output: u32) -> Option<u32> {
@@ -197,11 +199,13 @@ fn input_passthroughs(
         .collect()
 }
 
-fn constant_copies(graph: &LoweringGraph<'_>) -> CoremlConstantCopies {
-    use base64::Engine;
+fn constant_copies(
+    graph: &LoweringGraph<'_>,
+    weights: &mut super::WeightFileBuilder,
+) -> CoremlConstantCopies {
     let origins = copy_origins(graph);
     let mut copies = CoremlConstantCopies {
-        version: 1,
+        version: 2,
         sources: Default::default(),
         outputs: Default::default(),
     };
@@ -229,7 +233,8 @@ fn constant_copies(graph: &LoweringGraph<'_>) -> CoremlConstantCopies {
             .entry(origin)
             .or_insert_with(|| CoremlConstantSource {
                 descriptor: source.descriptor.clone(),
-                data: base64::engine::general_purpose::STANDARD.encode(&data.data),
+                offset: weights.original_weight(origin, &data.data),
+                checksum: seahash::hash(&data.data),
             });
         copies
             .outputs
@@ -12201,7 +12206,7 @@ impl CoremlMlProgramConverter {
             .any(|(logical, physical)| logical != physical);
         let inputs_changed = inputs.iter().any(|(logical, physical)| logical != physical);
         let passthroughs = input_passthroughs(graph_info);
-        let constant_copies = constant_copies(graph_info);
+        let constant_copies = constant_copies(graph_info, weight_builder);
         let metadata = Some(Metadata {
             user_defined: [
                 (OUTPUT_ALIASES_METADATA_KEY, &aliases, outputs_changed),
@@ -12459,6 +12464,51 @@ mod tests {
                 "{label}",
             );
         }
+    }
+
+    #[test]
+    fn shared_program_builder_reuses_original_immediate_constant_record() {
+        let mut graph = constant_copy_asset_graph();
+        graph.operands.truncate(2);
+        graph.operations.truncate(1);
+        graph.output_operands = vec![1];
+        graph.operands[1].kind = OperandKind::Output;
+        for operand in &mut graph.operands {
+            operand.descriptor.data_type = DataType::Int32;
+        }
+        graph
+            .constant_operand_ids_to_handles
+            .get_mut(&0)
+            .unwrap()
+            .data = [16_777_217i32, i32::MIN]
+            .into_iter()
+            .flat_map(i32::to_le_bytes)
+            .collect();
+        let graph = LoweringGraph::new(&graph).unwrap();
+        let mut weights = super::super::WeightFileBuilder::new();
+        let metadata: Vec<_> = (0..2)
+            .map(|_| {
+                let model = CoremlMlProgramConverter
+                    .convert_program(
+                        &graph,
+                        &graph.input_operands,
+                        &graph.output_operands,
+                        &graph.operations,
+                        &mut weights,
+                    )
+                    .unwrap();
+                model.description.unwrap().metadata.unwrap().user_defined
+                    [OUTPUT_CONSTANT_COPIES_METADATA_KEY]
+                    .clone()
+            })
+            .collect();
+        assert_eq!(metadata[0], metadata[1]);
+        let weights = weights.finalize();
+        assert_eq!(u32::from_le_bytes(weights[..4].try_into().unwrap()), 1);
+        assert_eq!(
+            &weights[128..136],
+            &graph.constant_operand_ids_to_handles[&0].data,
+        );
     }
 
     #[test]
