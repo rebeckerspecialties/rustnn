@@ -972,6 +972,22 @@ fn strict_comparator_matches_upstream_javascript_intermediate_budgets() {
     .unwrap();
     assert_eq!(source.metric_type, "ULP");
     assert_eq!(source.value, 0);
+    // This composite callback adds GEMM's undefined int8 entry and yields NaN.
+    // The browser still accepts equal integers and rejects unequal ones; use
+    // the same exact comparison with real inferred intermediate descriptors.
+    let source = wpt_js_loader::resolve_source_tolerance(
+        "qdq_subgraph.https.any.js",
+        "per-channel quantized gemm with non-zero quantized dimension of the filter",
+        &json!({
+            "dequantizedInputA": {"shape": [2, 2], "dataType": "float32"},
+            "dequantizedInputB": {"shape": [5, 2], "dataType": "float32"},
+            "gemmOutput": {"shape": [2, 5], "dataType": "float32"},
+            "output": {"shape": [2, 5], "dataType": "int8"}
+        }),
+    )
+    .unwrap();
+    assert_eq!(source.metric_type, "ULP");
+    assert_eq!(source.value, 0);
     for data_type in ["float16", "float32"] {
         let source = wpt_js_loader::resolve_source_tolerance(
             "div.https.any.js",

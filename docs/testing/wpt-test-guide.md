@@ -147,8 +147,12 @@ The compatibility ATOL/RTOL and ULP comparators retain their existing behavior;
 the stronger nonfinite gate and full-width ULP budgets apply only to strict mode.
 Callbacks that require intermediate operands are reevaluated with shapes and
 types from the Rust builder, using Node.js and the fetched source file. No
-tolerance formula is reimplemented. An upstream callback that still returns
-an undefined or nonfinite budget remains a test failure.
+tolerance formula is reimplemented. For validated Number-valued integer output
+arrays, an undefined or NaN ULP budget preserves the upstream comparator's exact
+equality behavior as zero ULP: equal integers pass before the budget is consulted,
+and unequal integers fail. This does not apply to floating-point, BigInt, scalar,
+or malformed expectations, or to infinite budgets; unresolved budgets in those
+cases remain a test failure.
 The strict finite-value comparator follows the revised upstream helpers: numerical
 half-bit ordering across signs and zero, direct binary64-to-FP16 nearest-even rounding, and unrounded
 JavaScript-number expected values for ATOL. Its audit uses the same comparator
