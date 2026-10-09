@@ -41,6 +41,7 @@ enum StageExecution {
     Native,
     TypedUnary(typed_unary::Kind),
     ConstantGelu(Box<typed_unary::ConstantUnary>),
+    IntegerDivision(Box<integer_division::Division>),
 }
 
 fn execution(model: &Model, wire: &[u8]) -> StageExecution {
@@ -48,6 +49,8 @@ fn execution(model: &Model, wire: &[u8]) -> StageExecution {
         StageExecution::TypedUnary(kind)
     } else if let Some(constant) = typed_unary::classify_constant(model, wire) {
         StageExecution::ConstantGelu(Box::new(constant))
+    } else if let Some(division) = integer_division::classify(model, wire) {
+        StageExecution::IntegerDivision(Box::new(division))
     } else {
         StageExecution::Native
     }
@@ -1015,6 +1018,13 @@ impl PipelineModel {
                     }
                     return Ok(());
                 }
+                if let StageExecution::IntegerDivision(division) = &stage.execution {
+                    self.predict_integer_division(stage, division, &mut values)?;
+                    for name in &stage.release_after {
+                        values.remove(name);
+                    }
+                    return Ok(());
+                }
                 let model = self.load_child(index)?;
                 let dictionary: *mut Object = msg_send![class!(NSMutableDictionary), dictionary];
                 let description: *mut Object = msg_send![model, modelDescription];
@@ -1131,6 +1141,78 @@ impl PipelineModel {
         })
     }
 
+    unsafe fn predict_integer_division(
+        &self,
+        stage: &Stage,
+        division: &integer_division::Division,
+        values: &mut HashMap<String, ReleaseOnDrop>,
+    ) -> Result<(), GraphError> {
+        fn read<'a>(
+            stage: &Stage,
+            input: &'a integer_division::Input,
+            values: &HashMap<String, ReleaseOnDrop>,
+        ) -> Result<(Vec<usize>, std::borrow::Cow<'a, [u8]>), GraphError> {
+            match input {
+                integer_division::Input::Constant { bytes, shape } => {
+                    Ok((shape.clone(), std::borrow::Cow::Borrowed(bytes)))
+                }
+                integer_division::Input::Runtime(name) => {
+                    let source = stage
+                        .inputs
+                        .iter()
+                        .find(|input| input.name == *name)
+                        .ok_or_else(|| {
+                            boundary_error("integer division lacks source description")
+                        })?;
+                    let feature = values.get(name).ok_or_else(|| {
+                        boundary_error(format!("integer division lacks source `{name}`"))
+                    })?;
+                    let array: *mut Object = unsafe { msg_send![feature.0, multiArrayValue] };
+                    unsafe { validate_source_feature(source, array)? };
+                    let (kind, layout, pointer) = unsafe { multiarray_storage(array)? };
+                    let bytes =
+                        unsafe { read_array_storage(pointer, &layout, kind.element_size()) };
+                    Ok((layout.shape, std::borrow::Cow::Owned(bytes)))
+                }
+            }
+        }
+        let (left_shape, left) = read(stage, &division.left, values)?;
+        let (right_shape, right) = read(stage, &division.right, values)?;
+        // Evaluate privately: zero/overflow errors must not publish a partial output.
+        let (shape, result) = integer_division::evaluate(&left, &left_shape, &right, &right_shape)
+            .map_err(boundary_error)?;
+        let actual_shape: Vec<i64> = if shape.is_empty() {
+            vec![1]
+        } else {
+            shape
+                .into_iter()
+                .map(|n| {
+                    i64::try_from(n)
+                        .map_err(|_| boundary_error("integer division extent exceeds i64"))
+                })
+                .collect::<Result<_, _>>()?
+        };
+        let target = &stage.outputs[0];
+        validate_feature_shape(array_type(target)?, &actual_shape)?;
+        let output = unsafe { create_multi_array(&actual_shape, array_type(target)?.data_type)? };
+        let (kind, layout, pointer) = unsafe { multiarray_storage(output)? };
+        unsafe { write_array_storage(pointer, &layout, kind.element_size(), &result)? };
+        unsafe { validate_source_feature(target, output)? };
+        let value: *mut Object =
+            msg_send![class!(MLFeatureValue), featureValueWithMultiArray: output];
+        let owned: *mut Object = msg_send![value, retain];
+        if owned.is_null()
+            || values
+                .insert(target.name.clone(), ReleaseOnDrop(owned))
+                .is_some()
+        {
+            return Err(boundary_error(
+                "integer division did not produce a unique owned feature",
+            ));
+        }
+        Ok(())
+    }
+
     unsafe fn predict_typed_unary(
         &self,
         stage: &Stage,
@@ -1234,6 +1316,74 @@ unsafe fn validate_native_feature(
 mod tests {
     use super::*;
     use crate::protos::coreml::specification::{FeatureType, Pipeline};
+
+    #[test]
+    fn integer_division_plan_keeps_native_cast_producer_and_consumer_separate() {
+        use crate::converters::{CoremlMlProgramConverter, GraphConverter};
+        use crate::graph::{ConstantData, GraphInfo, Operand, OperandKind};
+        use crate::operator_enums::MLOperandDataType;
+        use crate::operators::Operation;
+        let operand = |name: &str, kind, data_type| Operand {
+            name: Some(name.into()),
+            kind,
+            descriptor: OperandDescriptor {
+                data_type,
+                shape: vec![Dimension::Static(2)],
+                pending_permutation: vec![],
+            },
+        };
+        let graph = GraphInfo {
+            operands: vec![
+                operand("source", OperandKind::Constant, DataType::Float32),
+                operand("left", OperandKind::Intermediate, DataType::Int32),
+                operand("right", OperandKind::Input, DataType::Int32),
+                operand("quotient", OperandKind::Intermediate, DataType::Int32),
+                operand("result", OperandKind::Output, DataType::Int32),
+            ],
+            constant_operand_ids_to_handles: [(
+                0,
+                ConstantData {
+                    data: [-7.0_f32, 7.0]
+                        .iter()
+                        .flat_map(|n| n.to_le_bytes())
+                        .collect(),
+                    label: None,
+                },
+            )]
+            .into(),
+            input_operands: vec![2],
+            output_operands: vec![4],
+            operations: vec![
+                Operation::Cast {
+                    input: 0,
+                    data_type: MLOperandDataType::Int32,
+                    outputs: vec![1],
+                    options: None,
+                },
+                Operation::Div {
+                    a: 1,
+                    b: 2,
+                    outputs: vec![3],
+                    options: None,
+                },
+                Operation::Identity {
+                    input: 3,
+                    outputs: vec![4],
+                    options: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+        let plan = SourcePlan::parse(&converted.data).unwrap().unwrap();
+        assert_eq!(plan.stages.len(), 3);
+        assert_eq!(plan.stages[0].execution, StageExecution::Native);
+        assert!(matches!(
+            plan.stages[1].execution,
+            StageExecution::IntegerDivision(_)
+        ));
+        assert_eq!(plan.stages[2].execution, StageExecution::Native);
+    }
 
     fn feature(name: &str) -> FeatureDescription {
         FeatureDescription {

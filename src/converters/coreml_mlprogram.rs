@@ -451,6 +451,7 @@ fn equivalent_output_names(graph: &LoweringGraph<'_>) -> HashMap<String, String>
         })
         .collect()
 }
+mod integer_division;
 mod precision;
 mod scalar_binary;
 
@@ -5868,9 +5869,10 @@ impl CoremlMlProgramConverter {
                 }
 
                 // MIL `reshape` declares `shape` as a required input. Always emit
-                // it, including the valid WebNN scalar-output case (`new_shape = []`)
+                // it. Logical scalar outputs use the same physical [1] tensor
+                // type as create_output_value and the native model boundary.
                 let shape_values = if new_shape.is_empty() {
-                    Vec::new()
+                    vec![1]
                 } else {
                     crate::operator_options::mldimensions_static_or_max(new_shape)
                 };
@@ -8020,8 +8022,8 @@ impl CoremlMlProgramConverter {
             }
 
             // Rank-0 (scalar) no-ops: transpose/tile/slice/expand/pad/reshape that map a
-            // 0D scalar to a 0D scalar. CoreML rejects those ops on rank-0 tensors, so emit
-            // an identity (input * 1) instead.
+            // 0D scalar to a 0D scalar. CoreML rejects those ops on rank-0 tensors,
+            // so emit an explicit view matching its physical [1] boundary.
             if matches!(
                 op_type_lower.as_str(),
                 "transpose" | "tile" | "slice" | "expand" | "pad" | "reshape"
@@ -8036,15 +8038,15 @@ impl CoremlMlProgramConverter {
                 let out_scalar = out_op
                     .map(|o| o.descriptor.shape.is_empty())
                     .unwrap_or(false);
-                let is_float = out_op
+                let supported_scalar = out_op
                     .map(|o| {
                         matches!(
                             o.descriptor.data_type,
-                            DataType::Float32 | DataType::Float16
+                            DataType::Float32 | DataType::Float16 | DataType::Int32
                         )
                     })
                     .unwrap_or(false);
-                if in_scalar && out_scalar && is_float {
+                if in_scalar && out_scalar && supported_scalar {
                     let in_name =
                         Self::output_name_for_operand(graph_info, in_id, &operand_name_overrides);
                     let (_out_name, out_type) =
@@ -10119,13 +10121,9 @@ impl CoremlMlProgramConverter {
                 }
             }
 
-            // Integer division: MIL `real_div` on integer operands has no
-            // reliable integer semantics — several CoreML compiler builds
-            // constant-fold it with float division (200/16 stays 12.5 through
-            // subsequent folded ops), corrupting e.g. packed-nibble unpack
-            // chains. Emit `floor_div`, which is integer-defined everywhere.
-            // (floor differs from ORT's truncation only for negative
-            // quotients, which no supported lowering produces.)
+            // Required Int32 division truncates toward zero, not negative
+            // infinity. Emit the complete expression so the runtime can prove
+            // and exactly evaluate it without reinterpreting other floor_div.
             if matches!(op, Operation::Div { .. })
                 && let Some(&div_in) = op.input_operands().first()
                 && let Some(div_in_op) = graph_info.operand(div_in)
@@ -10139,6 +10137,12 @@ impl CoremlMlProgramConverter {
                     Self::create_output_value(graph_info, out_id, &operand_name_overrides)?;
                 let names =
                     Self::input_names_for_operation(graph_info, op, &operand_name_overrides);
+                if div_in_op.descriptor.data_type == DataType::Int32 {
+                    Self::lower_int32_division(graph_info, &names, out_type, &mut main_block);
+                    continue;
+                }
+                // Other integer proxy paths retain their existing lowering;
+                // they are not classified as an exact Int32 WebNN operation.
                 let mut div_in_args = HashMap::new();
                 div_in_args.insert(
                     "x".to_string(),

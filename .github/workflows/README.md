@@ -19,6 +19,8 @@
 - TensorRT-RTX has no GPU runner. CI compiles the backend (`cargo check -F trtx-runtime
   --all-targets`); its WPT snapshots are regenerated locally with `make wpt-sync-trtx`.
 - macOS CI explicitly runs `make test-coreml-dtypes` with and without dynamic inputs.
+  The full `make test-coreml` suite also covers exact signed Int32 division; use
+  `make test-coreml-integer-division` for its focused lowering and runtime regressions.
   `make test-coreml-gelu` covers exact GELU precision, shapes, and compositions under
   both feature configurations, including all FP16 encodings under CPU/GPU/NPU requests
   and Float32 negative tails through the context's three tensor-storage modes.
