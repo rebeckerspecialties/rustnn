@@ -851,16 +851,26 @@ fn strict_comparator_matches_upstream_javascript_intermediate_budgets() {
     )
     .unwrap();
     assert_eq!(source.value, 18);
-    // This source callback omits an int32 budget. Do not substitute the
-    // float32 allowance, compatibility default, or an invented exact budget.
-    let error = wpt_js_loader::resolve_source_tolerance(
+    // The callback omits an int32 budget, but the browser comparator accepts
+    // equal integers before checking that budget and rejects unequal ones.
+    // Preserve that behavior instead of using the float allowance or failing
+    // before comparing the actual result.
+    let source = wpt_js_loader::resolve_source_tolerance(
         "div.https.any.js",
         "div int32 4D tensors",
         &json!({}),
     )
-    .unwrap_err();
-    assert!(
-        error.contains("Upstream tolerance callback returned no finite budget"),
-        "{error}"
-    );
+    .unwrap();
+    assert_eq!(source.metric_type, "ULP");
+    assert_eq!(source.value, 0);
+    for data_type in ["float16", "float32"] {
+        let source = wpt_js_loader::resolve_source_tolerance(
+            "div.https.any.js",
+            &format!("div {data_type} 1D tensors"),
+            &json!({}),
+        )
+        .unwrap();
+        assert_eq!(source.metric_type, "ULP");
+        assert_eq!(source.value, 2);
+    }
 }
