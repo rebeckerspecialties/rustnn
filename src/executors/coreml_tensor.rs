@@ -417,6 +417,8 @@ pub(crate) fn run_coreml_tensors(
                 guards.push(guard);
             }
         }
+        let _compact_input_owners =
+            input_views::bind(model.model, dict, &model.aliases.compact_input_views)?;
         let mut create_error: *mut Object = ptr::null_mut();
         let provider_alloc: *mut Object = msg_send![class!(MLDictionaryFeatureProvider), alloc];
         let provider: *mut Object =
