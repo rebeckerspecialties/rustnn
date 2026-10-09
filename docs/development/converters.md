@@ -162,10 +162,13 @@ Rules that hold for every converter:
   thread's flush mode. Source Float32 Sqrt uses an integer square-root/midpoint
   comparison, so a native kernel cannot flush its subnormal inputs before producing
   their normal roots. Source Float32 Exp uses binary64 evaluation and integer
-  Float32 rounding to retain representable subnormal tails. These cuts isolate
-  source Sqrt and Exp operations, not internal operations in other lowerings.
-  Other arithmetic children remain native. Constant GELU, Sqrt, and Exp inputs
-  retain checked original weight ranges; supported constant views are applied as bit
+  Float32 rounding to retain representable subnormal tails. Source Float32 Mul/Div
+  use bit-preserving binary64 input conversion and integer Float32 rounding, so a
+  subnormal operand is not flushed before contributing to a normal result. Runtime
+  broadcasting uses actual bounded shapes. These cuts isolate source operations,
+  not internal helper arithmetic in other lowerings; other children remain native.
+  Constant inputs retain checked original weight ranges or shared immediate storage;
+  supported constant views are applied as bit
   transport, not native arithmetic or a second serialized weight payload. Native constexpr
   and arithmetic producers are materialized before typed evaluation. These typed stages are installed
   by RustNN's CoreML executor, not by loading an exported model directly with `MLModel`.

@@ -13,8 +13,7 @@ use crate::protos::coreml::specification::{
 mod kernels;
 pub(super) use kernels::{Direction, cast};
 
-#[path = "coreml_binary32.rs"]
-mod binary32;
+use super::binary32;
 
 #[path = "coreml_exp.rs"]
 mod exp;
@@ -26,7 +25,7 @@ mod gelu;
 mod sqrt;
 
 #[path = "coreml_unary_constant.rs"]
-mod constant;
+pub(super) mod constant;
 pub(super) use constant::{ConstantUnary, classify_constant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -215,14 +214,14 @@ fn known_wire(mut bytes: &[u8], schema: Schema, depth: u8) -> Option<()> {
     Some(())
 }
 
-fn tensor(ty: &mil::ValueType) -> Option<&mil::TensorType> {
+pub(super) fn tensor(ty: &mil::ValueType) -> Option<&mil::TensorType> {
     match ty.r#type.as_ref()? {
         value_type::Type::TensorType(tensor) => Some(tensor),
         _ => None,
     }
 }
 
-fn array(
+pub(super) fn array(
     feature: &crate::protos::coreml::specification::FeatureDescription,
 ) -> Option<&ArrayFeatureType> {
     match feature.r#type.as_ref()?.r#type.as_ref()? {
@@ -231,7 +230,7 @@ fn array(
     }
 }
 
-fn compatible_shape(tensor: &mil::TensorType, array: &ArrayFeatureType) -> bool {
+pub(super) fn compatible_shape(tensor: &mil::TensorType, array: &ArrayFeatureType) -> bool {
     if !tensor.attributes.is_empty()
         || tensor.rank < 0
         || tensor.rank as usize != tensor.dimensions.len()
@@ -294,10 +293,14 @@ fn compatible_shape(tensor: &mil::TensorType, array: &ArrayFeatureType) -> bool 
 /// Conservatively keep programs with extra operations, attributes, unresolved
 /// types/shapes or unknown source fields native. No feature name/proxy dtype
 /// or hardware-generation heuristic establishes logical Cast provenance.
+pub(super) fn known_source(model: &Model, source: &[u8]) -> bool {
+    model.encoded_len() == source.len() && known_wire(source, Schema::Model, 0).is_some()
+}
+
 pub(super) fn classify(model: &Model, source: &[u8]) -> Option<Kind> {
     // Ordinary converter wire is canonical in encoded length. Extra unknown
     // fields or redundant wire encodings deliberately do not get a host path.
-    if model.encoded_len() != source.len() || known_wire(source, Schema::Model, 0).is_none() {
+    if !known_source(model, source) {
         return None;
     }
     let model::Type::MlProgram(program) = model.r#type.as_ref()? else {

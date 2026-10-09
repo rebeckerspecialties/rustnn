@@ -57,6 +57,10 @@ impl CompiledCoremlModel {
 mod load;
 use load::LoadTrace;
 pub use load::{CoremlLoadDiagnostics, CoremlLoadFailure, CoremlLoadRoute};
+#[path = "coreml_binary32.rs"]
+mod binary32;
+#[path = "coreml_float32_binary.rs"]
+mod float32_binary;
 #[path = "coreml_pipeline.rs"]
 mod pipeline;
 #[path = "coreml_typed_unary.rs"]
