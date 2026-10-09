@@ -10,6 +10,26 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Snapshot after prediction: loading routes can change arithmetic results even
+/// when the requested compute permissions and protobuf are identical.
+#[derive(Serialize)]
+#[cfg(any(test, all(target_os = "macos", feature = "coreml-runtime")))]
+struct LoadObservation {
+    phase: &'static str,
+    route: String,
+    requested_compute_units: &'static str,
+    loaded_compute_units: &'static str,
+    failures: Vec<LoadFailureObservation>,
+}
+
+#[derive(Serialize)]
+#[cfg(any(test, all(target_os = "macos", feature = "coreml-runtime")))]
+struct LoadFailureObservation {
+    route: String,
+    compute_units: Option<&'static str>,
+    reason: String,
+}
+
 #[derive(Clone, Deserialize)]
 struct Fixture {
     op: String,
@@ -254,14 +274,14 @@ mod native {
     use rustnn::operators::Operation;
     use serde_json::json;
 
-    fn predict(
+    pub(super) fn predict(
         policy: DeviceType,
         width: u32,
         input: &[u32],
         unary: Option<&str>,
         consumer: Option<&str>,
         geometry: &Geometry,
-    ) -> Result<Vec<u32>, String> {
+    ) -> Result<(Vec<u32>, LoadObservation), String> {
         let dtype = if width == 16 {
             DataType::Float16
         } else {
@@ -391,7 +411,27 @@ mod native {
         context
             .read_tensor(&output, &mut result)
             .map_err(|e| e.to_string())?;
-        Ok(result
+        let Some(rustnn::mlcontext::LoadDiagnostics::Coreml(load)) =
+            graph.rustnn_load_diagnostics()
+        else {
+            return Err("missing CoreML load diagnostics after prediction".into());
+        };
+        let load = LoadObservation {
+            phase: "after_prediction",
+            route: format!("{:?}", load.route),
+            requested_compute_units: load.requested_compute_units,
+            loaded_compute_units: load.loaded_compute_units,
+            failures: load
+                .failures
+                .iter()
+                .map(|failure| LoadFailureObservation {
+                    route: format!("{:?}", failure.route),
+                    compute_units: failure.compute_units,
+                    reason: failure.reason.clone(),
+                })
+                .collect(),
+        };
+        let bits = result
             .chunks_exact((width / 8) as usize)
             .map(|b| {
                 if width == 16 {
@@ -400,7 +440,8 @@ mod native {
                     u32::from_le_bytes(b.try_into().unwrap())
                 }
             })
-            .collect())
+            .collect();
+        Ok((bits, load))
     }
 
     pub fn run() -> Result<(), String> {
@@ -409,7 +450,7 @@ mod native {
         for policy in [DeviceType::Cpu, DeviceType::Gpu, DeviceType::Npu] {
             for fixture in fixtures() {
                 let geometry = fixture.geometry()?;
-                let actual = match predict(
+                let (actual, load) = match predict(
                     policy,
                     fixture.width,
                     &fixture.input_bits,
@@ -429,10 +470,10 @@ mod native {
                     .map(|(&a, &e)| compare(a, e, fixture.width, fixture.ulp_budget))
                     .collect();
                 if fixture.op == "softmax" {
-                    rows.push(json!({"requested_policy": format!("{policy:?}"), "op": fixture.op, "width": fixture.width, "shape": geometry.shape, "axis": geometry.axis, "input_bits": fixture.input_bits, "reference": "stable Decimal Softmax at 100/140 digits, rounded once to Float32", "standalone_ulp_budget": fixture.ulp_budget, "budget_source": "WPT getSoftmaxPrecisionTolerance: 3 * axis extent + 3; not a normative model-error contract", "checks": checks, "source_fidelity_observations": softmax_fidelity(&fixture, &actual)?, "fidelity_scope": "Reference-bit and row-sum observations, not additional pass criteria or a composed-model gate"}));
+                    rows.push(json!({"requested_policy": format!("{policy:?}"), "load": load, "op": fixture.op, "width": fixture.width, "shape": geometry.shape, "axis": geometry.axis, "input_bits": fixture.input_bits, "reference": "stable Decimal Softmax at 100/140 digits, rounded once to Float32", "standalone_ulp_budget": fixture.ulp_budget, "budget_source": "WPT getSoftmaxPrecisionTolerance: 3 * axis extent + 3; not a normative model-error contract", "checks": checks, "source_fidelity_observations": softmax_fidelity(&fixture, &actual)?, "fidelity_scope": "Reference-bit and row-sum observations, not additional pass criteria or a composed-model gate"}));
                     continue;
                 }
-                rows.push(json!({"requested_policy": format!("{policy:?}"), "op": fixture.op, "width": fixture.width, "input_bits": fixture.input_bits, "reference": "once-rounded Decimal unary", "standalone_ulp_budget": fixture.ulp_budget, "checks": checks}));
+                rows.push(json!({"requested_policy": format!("{policy:?}"), "load": load, "op": fixture.op, "width": fixture.width, "input_bits": fixture.input_bits, "reference": "once-rounded Decimal unary", "standalone_ulp_budget": fixture.ulp_budget, "checks": checks}));
                 if fixture.op != "exp" {
                     continue;
                 }
@@ -473,9 +514,9 @@ mod native {
                         ("composed", Some("exp"), &input, &expected),
                     ] {
                         match predict(policy, fixture.width, input, unary, Some(op), &Geometry::linear(input.len())) {
-                            Ok(result) => {
+                            Ok((result, load)) => {
                                 let checks: Vec<_> = result.iter().zip(expected).map(|(&a, &e)| compare(a, e, fixture.width, 0)).collect();
-                                rows.push(json!({"requested_policy": format!("{policy:?}"), "op": op, "width": fixture.width, "route": name, "input_bits": input, "producer_bits": producer, "reference": "exact power-of-two scaling of stored input (direct) or actual isolated producer (composed); local fidelity, not composed WPT budget", "checks": checks}));
+                                rows.push(json!({"requested_policy": format!("{policy:?}"), "load": load, "op": op, "width": fixture.width, "route": name, "input_bits": input, "producer_bits": producer, "reference": "exact power-of-two scaling of stored input (direct) or actual isolated producer (composed); local fidelity, not composed WPT budget", "checks": checks}));
                             }
                             Err(error) => errors.push(json!({"policy": format!("{policy:?}"), "op": op, "width": fixture.width, "route": name, "error": error})),
                         }
@@ -530,6 +571,64 @@ fn main() {
 mod tests {
     use super::*;
 
+    #[cfg(all(target_os = "macos", feature = "coreml-runtime"))]
+    #[test]
+    fn native_prediction_returns_completed_output_with_load_diagnostics() {
+        let (bits, load) = native::predict(
+            rustnn::backend_selection::DeviceType::Cpu,
+            32,
+            &[0, 0],
+            Some("softmax"),
+            None,
+            &Geometry {
+                shape: vec![1, 2],
+                axis: Some(1),
+            },
+        )
+        .unwrap();
+        assert_eq!(bits, [0.5f32.to_bits(); 2]);
+        assert_eq!(load.phase, "after_prediction");
+        assert!(!load.route.is_empty());
+        assert_eq!(load.requested_compute_units, "CPU_ONLY");
+        assert_eq!(load.loaded_compute_units, "CPU_ONLY");
+    }
+
+    #[test]
+    fn load_observation_keeps_route_permissions_and_fallback_history() {
+        let load = super::LoadObservation {
+            phase: "after_prediction",
+            route: "CompiledUrl".into(),
+            requested_compute_units: "CPU_AND_GPU",
+            loaded_compute_units: "CPU_AND_GPU",
+            failures: vec![super::LoadFailureObservation {
+                route: "InMemoryAsset".into(),
+                compute_units: None,
+                reason: "asset preparation failed".into(),
+            }],
+        };
+        assert_eq!(
+            serde_json::to_value(load).unwrap(),
+            serde_json::json!({
+                "phase": "after_prediction", "route": "CompiledUrl",
+                "requested_compute_units": "CPU_AND_GPU", "loaded_compute_units": "CPU_AND_GPU",
+                "failures": [{"route": "InMemoryAsset", "compute_units": null, "reason": "asset preparation failed"}]
+            })
+        );
+    }
+
+    #[test]
+    fn load_observation_retains_empty_fallback_history() {
+        let load = super::LoadObservation {
+            phase: "after_prediction",
+            route: "InMemoryAsset".into(),
+            requested_compute_units: "CPU_ONLY",
+            loaded_compute_units: "CPU_ONLY",
+            failures: vec![],
+        };
+        let json = serde_json::to_value(load).unwrap();
+        assert_eq!(json["failures"], serde_json::json!([]));
+        assert_eq!(json["phase"], "after_prediction");
+    }
     fn assert_value_decoding() {
         // Explicit binary64 encodings, not another Half/Float32 conversion.
         for (width, bits, expected) in [
