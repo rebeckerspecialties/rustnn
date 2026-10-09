@@ -5,12 +5,14 @@ const integerRanges = new Map([
 ]);
 
 // WPT's ULP comparator accepts equal primitive values before consulting its
-// budget. An undefined budget then rejects every unequal integer pair. Encode
-// that exact comparison, not a guessed operator tolerance. Restrict this to
+// budget. An undefined or NaN budget then rejects every unequal integer pair.
+// Encode that exact comparison, not a guessed operator tolerance. Infinity is
+// different: it accepts unequal values and must remain unchanged. Restrict this to
 // represented Number-valued integer arrays: floating-point rounding, scalar
 // wrapping and Number/BigInt coercion have different JavaScript semantics.
 export function normalizeSourceTolerance(tolerance, graph) {
-  if (tolerance?.metricType !== 'ULP' || tolerance.value !== undefined) {
+  if (tolerance?.metricType !== 'ULP' ||
+      (tolerance.value !== undefined && !Number.isNaN(tolerance.value))) {
     return tolerance;
   }
   const outputs = Object.values(graph?.expectedOutputs ?? {});
