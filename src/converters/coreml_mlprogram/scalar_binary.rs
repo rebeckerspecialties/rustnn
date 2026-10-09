@@ -36,6 +36,7 @@ impl CoremlMlProgramConverter {
                     | "mul"
                     | "real_div"
                     | "floor_div"
+                    | "mod"
                     | "pow"
                     | "maximum"
                     | "minimum"

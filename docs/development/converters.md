@@ -103,8 +103,19 @@ Rules that hold for every converter:
 ### CoreML
 
 - MIL has no rank-0 tensors at the boundary, no dilation in pooling, no `edge`/`reflection`
-  padding above two dimensions and no tensors of rank 6 and above; integer arithmetic runs in
-  float32.
+  padding above two dimensions and no tensors of rank 6 and above. Some native integer
+  arithmetic can round through float32; an integer MIL result type alone does not establish
+  full-range precision.
+- Int32 `div` lowers to a complete floor-quotient, remainder and sign-correction
+  expression. RustNN recognizes the entire checked expression and evaluates its
+  represented Int32 storage directly, preserving truncation toward zero without a
+  floating-point intermediate. Bare or unrelated `floor_div` operations retain their
+  own semantics. The native expression alone is not a qualified replacement: physical
+  A12/A13 tests exposed signed-quotient and full-range precision errors.
+  Original integer constants and exact views remain typed; other constant producers
+  materialize before the division stage. Scalar/broadcast and dynamic bindings use
+  the same checked kernel. Division by zero and `INT32_MIN / -1` return errors before
+  publishing output, rather than inventing results for unspecified cases.
 - Comparison results are `uint8`; `reduceLogSumExp` uses the max-shifted form; reductions with
   empty `axes` and `resample2d` on arbitrary axes are lowered explicitly.
 - Gather-family index normalization uses active indexed dimensions, not their declared maxima.

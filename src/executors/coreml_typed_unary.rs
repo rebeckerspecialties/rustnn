@@ -202,14 +202,18 @@ fn known_wire(mut bytes: &[u8], schema: Schema, depth: u8) -> Option<()> {
     Some(())
 }
 
-fn tensor(ty: &mil::ValueType) -> Option<&mil::TensorType> {
+pub(super) fn known_source(model: &Model, source: &[u8]) -> bool {
+    model.encoded_len() == source.len() && known_wire(source, Schema::Model, 0).is_some()
+}
+
+pub(super) fn tensor(ty: &mil::ValueType) -> Option<&mil::TensorType> {
     match ty.r#type.as_ref()? {
         value_type::Type::TensorType(tensor) => Some(tensor),
         _ => None,
     }
 }
 
-fn array(
+pub(super) fn array(
     feature: &crate::protos::coreml::specification::FeatureDescription,
 ) -> Option<&ArrayFeatureType> {
     match feature.r#type.as_ref()?.r#type.as_ref()? {
@@ -218,7 +222,7 @@ fn array(
     }
 }
 
-fn compatible_shape(tensor: &mil::TensorType, array: &ArrayFeatureType) -> bool {
+pub(super) fn compatible_shape(tensor: &mil::TensorType, array: &ArrayFeatureType) -> bool {
     if !tensor.attributes.is_empty()
         || tensor.rank < 0
         || tensor.rank as usize != tensor.dimensions.len()

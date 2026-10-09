@@ -80,32 +80,48 @@ fn constant(operation: &MilOperation) -> bool {
     operation.r#type == "const" || operation.r#type.starts_with("constexpr_")
 }
 
-fn constant_closure(operations: &[MilOperation]) -> HashSet<usize> {
+fn exact_unit_transport(operation: &MilOperation) -> bool {
     use crate::protos::coreml::mil_spec::{tensor_value, value};
-    let exact_unit_transport = |operation: &MilOperation| {
-        if !matches!(operation.r#type.as_str(), "mul" | "real_div")
-            || !operation.outputs.iter().all(|output| {
-                tensor(output).is_some_and(|value| value.data_type == MilDataType::Float32 as i32)
-            })
-        {
-            return false;
-        }
-        let Some(Binding::Value(value)) = operation
-            .inputs
-            .get("y")
-            .and_then(|argument| argument.arguments.first())
-            .and_then(|binding| binding.binding.as_ref())
-        else {
-            return false;
-        };
-        let Some(value::Value::ImmediateValue(value)) = &value.value else {
-            return false;
-        };
-        let Some(value::immediate_value::Value::Tensor(tensor)) = &value.value else {
-            return false;
-        };
-        matches!(&tensor.value, Some(tensor_value::Value::Floats(floats)) if floats.values.as_slice() == [1.0])
+    let integer = operation.r#type == "mul"
+        && operation.outputs.iter().all(|output| {
+            tensor(output).is_some_and(|ty| ty.data_type == MilDataType::Int32 as i32)
+        });
+    let floating = matches!(operation.r#type.as_str(), "mul" | "real_div")
+        && operation.outputs.iter().all(|output| {
+            tensor(output).is_some_and(|ty| ty.data_type == MilDataType::Float32 as i32)
+        });
+    if !integer && !floating {
+        return false;
+    }
+    let Some(Binding::Value(value)) = operation
+        .inputs
+        .get("y")
+        .and_then(|argument| argument.arguments.first())
+        .and_then(|binding| binding.binding.as_ref())
+    else {
+        return false;
     };
+    if integer
+        && (operation.inputs.len() != 2
+            || operation.inputs["y"].arguments.len() != 1
+            || !matches!(value.r#type.as_ref().and_then(|ty|ty.r#type.as_ref()), Some(value_type::Type::TensorType(ty)) if ty.data_type == MilDataType::Int32 as i32 && ty.rank == 0 && ty.dimensions.is_empty() && ty.attributes.is_empty()))
+    {
+        return false;
+    }
+    let Some(value::Value::ImmediateValue(value)) = &value.value else {
+        return false;
+    };
+    let Some(value::immediate_value::Value::Tensor(tensor)) = &value.value else {
+        return false;
+    };
+    if integer {
+        matches!(&tensor.value, Some(tensor_value::Value::Ints(ints)) if ints.values.as_slice() == [1])
+    } else {
+        matches!(&tensor.value, Some(tensor_value::Value::Floats(floats)) if floats.values.as_slice() == [1.0])
+    }
+}
+
+fn constant_closure(operations: &[MilOperation]) -> HashSet<usize> {
     let mut values = HashSet::new();
     let mut represented_half = HashSet::new();
     let mut closure = HashSet::new();
@@ -1391,6 +1407,50 @@ impl CoremlMlProgramConverter {
             }
         }
         let mut cuts = BTreeSet::new();
+        // Preserve the complete signed-division expression as one typed child.
+        // Only source WebNN Int32 Div outputs select these cuts; incidental
+        // floor_div operations in other lowerings retain native floor semantics.
+        let mut integer_constants = HashSet::new();
+        for (index, operation) in block.operations.iter().enumerate() {
+            if constant_operations.contains(&index)
+                && (matches!(
+                    operation.r#type.as_str(),
+                    "const" | "identity" | "reshape" | "transpose"
+                ) || exact_unit_transport(operation))
+                && operation.outputs.iter().all(|output| {
+                    tensor(output).is_some_and(|value| value.data_type == MilDataType::Int32 as i32)
+                })
+                && inputs(operation)
+                    .iter()
+                    .all(|name| integer_constants.contains(name))
+            {
+                integer_constants.extend(operation.outputs.iter().map(|value| value.name.clone()));
+            }
+        }
+        for operation in graph.operations.iter() {
+            if let Operation::Div { a, outputs, .. } = operation
+                && graph
+                    .operand(*a)
+                    .is_some_and(|operand| operand.descriptor.data_type == DataType::Int32)
+                && let Some(output) = outputs.first()
+                && let Some(&last) = producers.get(&operand_name(graph, *output))
+                && let Some(quotient) = named_input(&block.operations[last], "x")
+                && let Some(&first) = producers.get(quotient)
+            {
+                // Exact Int32 views are evaluated from original constant bytes.
+                // Other constant producers retain their own native semantics and
+                // materialize before this stage instead of disabling the guard.
+                for input in inputs(&block.operations[first]) {
+                    if !integer_constants.contains(&input)
+                        && let Some(producer) = producers.get(&input)
+                    {
+                        constant_operations.remove(producer);
+                    }
+                }
+                cuts.insert(first);
+                cuts.insert(last + 1);
+            }
+        }
         let graph_outputs: HashSet<_> = block.outputs.iter().cloned().collect();
         let float32_affine_layer_norm_inputs: HashSet<_> = graph
             .operations

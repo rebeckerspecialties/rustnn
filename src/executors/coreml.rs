@@ -57,6 +57,8 @@ impl CompiledCoremlModel {
 mod load;
 use load::LoadTrace;
 pub use load::{CoremlLoadDiagnostics, CoremlLoadFailure, CoremlLoadRoute};
+#[path = "coreml_integer_division.rs"]
+mod integer_division;
 #[path = "coreml_pipeline.rs"]
 mod pipeline;
 #[path = "coreml_typed_unary.rs"]
