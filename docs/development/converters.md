@@ -102,6 +102,9 @@ Rules that hold for every converter:
 
 ### CoreML
 
+- Convolution layout views belong to each input or filter argument, not to the
+  source operand. Reuse a view only for the same source binding and permutation;
+  other consumers and graph outputs retain their original logical layout.
 - MIL has no rank-0 tensors at the boundary, no dilation in pooling, no `edge`/`reflection`
   padding above two dimensions and no tensors of rank 6 and above; integer arithmetic runs in
   float32.
