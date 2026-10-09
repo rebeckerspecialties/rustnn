@@ -211,6 +211,11 @@ test-coreml-gather:
 test-coreml-dtypes:
 	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_dtypes -- $(TEST_FILTER) --test-threads=1
 
+.PHONY: test-coreml-int32-arg-selection
+test-coreml-int32-arg-selection:
+	$(CARGO) test --lib --no-default-features --features $(COREML_FEATURES) -- int32_arg --test-threads=1
+	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_int32_arg_selection -- $(TEST_FILTER) --test-threads=1
+
 .PHONY: test-coreml-integer-division
 test-coreml-integer-division:
 	$(CARGO) test --lib --no-default-features --features $(COREML_FEATURES) -- int32_binary --test-threads=1
@@ -578,6 +583,7 @@ help:
 	@echo "  test-coreml-integer-division - Test exact signed Int32 division and broadcasting"
 	@echo "  test-coreml-int32-copies - Test produced Int32 copies, shapes and owned storage"
 	@echo "  test-coreml-int32-selection - Test exact Int32 Min/Max, source proof and storage"
+	@echo "  test-coreml-int32-arg-selection - Test exact Int32 ArgMin/ArgMax and index outputs"
 	@echo "                       Set COREML_FEATURES=coreml-runtime to disable dynamic inputs"
 	@echo ""
 	@echo "LiteRT Conversion:"

@@ -128,6 +128,15 @@ Rules that hold for every converter:
   views, broadcasting and bounded actual shapes retain checked storage contracts;
   internal min/max helpers belonging to other lowerings remain native. Selection
   cannot overflow and does not assign overflow behavior to Add/Sub/Mul.
+- Source Int32 `argMin` and `argMax` preserve integer inputs and execute a checked
+  typed axis reduction in RustNN. Casting to float32 creates false ties between
+  adjacent large integers; direct native Int32 reductions reproduced those false
+  ties too. The complete reduction and exact constant views are source-proven
+  before using this path. Axis, bounded shapes and `keepDimensions` are validated;
+  scalar outputs retain their logical rank, and Int64 outputs widen the checked
+  Int32 index proxy. Genuine ties select the first winner locally; WebNN permits
+  any tied winner. Loading the exported model directly with `MLModel` does not
+  install this runtime stage.
 - Comparison results are `uint8`; `reduceLogSumExp` uses the max-shifted form; reductions with
   empty `axes` and `resample2d` on arbitrary axes are lowered explicitly.
 - Gather-family index normalization uses active indexed dimensions, not their declared maxima.

@@ -11245,10 +11245,10 @@ impl CoremlMlProgramConverter {
                 }
             }
 
-            // ArgMax/ArgMin: handle both int input types and int64 output type.
-            // CoreML reduce_argmax/reduce_argmin only accepts float input and produces int32.
-            // For int8/uint8/int32 inputs: cast to float32 first.
-            // For int64 output: cast the int32 result to int64.
+            // Keep Int32 ArgMax/ArgMin inputs exact rather than introducing false ties
+            // through Float32. The executor isolates these native Int32 reductions as
+            // proved typed stages; native kernels can also lose adjacent large integers.
+            // Other integer adaptations and the wider-output proxy are handled below.
             if op_type_lower == "argmax" || op_type_lower == "argmin" {
                 use crate::protos::coreml::mil_spec::DataType as MilDataType;
                 let output_id =
@@ -11271,11 +11271,7 @@ impl CoremlMlProgramConverter {
                     .map(|inp| {
                         matches!(
                             inp.descriptor.data_type,
-                            DataType::Int8
-                                | DataType::Uint8
-                                | DataType::Int32
-                                | DataType::Uint32
-                                | DataType::Int64
+                            DataType::Int8 | DataType::Uint8 | DataType::Uint32 | DataType::Int64
                         )
                     })
                     .unwrap_or(false);

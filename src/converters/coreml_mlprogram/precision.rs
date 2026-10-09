@@ -1473,6 +1473,28 @@ impl CoremlMlProgramConverter {
                 cuts.insert(index);
                 cuts.insert(index + 1);
             }
+            if let Operation::ArgMin { input, outputs, .. }
+            | Operation::ArgMax { input, outputs, .. } = operation
+                && graph
+                    .operand(*input)
+                    .is_some_and(|operand| operand.descriptor.data_type == DataType::Int32)
+                && let Some(output) = outputs.first()
+                && let Some(&index) = producers.get(&operand_name(graph, *output))
+                && matches!(
+                    block.operations[index].r#type.as_str(),
+                    "reduce_argmin" | "reduce_argmax"
+                )
+            {
+                for input in inputs(&block.operations[index]) {
+                    if !integer_constants.contains(&input)
+                        && let Some(producer) = producers.get(&input)
+                    {
+                        constant_operations.remove(producer);
+                    }
+                }
+                cuts.insert(index);
+                cuts.insert(index + 1);
+            }
         }
         let source_int32_copies: HashSet<_> = graph
             .operations

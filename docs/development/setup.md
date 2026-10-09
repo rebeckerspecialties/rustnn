@@ -57,6 +57,7 @@ Use the Makefile targets; they set feature flags and environment variables consi
 | `test-coreml-integer-division` | Exact signed Int32 division, scalar/broadcast combinations and dynamic binding mutation |
 | `test-coreml-int32-copies` | Exact arithmetic-produced Int32 Identity/same-type Cast, bounded shapes and independent output storage |
 | `test-coreml-int32-selection` | Exact signed Int32 Min/Max, constant/runtime broadcasting, source proof and storage modes |
+| `test-coreml-int32-arg-selection` | Exact Int32 ArgMin/ArgMax, axis/shape/source guards, scalar and Int64 outputs |
 | `test-coreml-gelu` | Exact GELU precision, shapes, constant closures and native compositions, including all Half encodings and Float32 negative tails |
 | `test-coreml-precision` | Native typed-boundary, Half layout, constant, fanout and bounded-dynamic regressions |
 | `test-coreml-pipeline` | Bounded child-runtime, exact Float32/Half Cast, typed-storage and shared-weight source-plan regressions |
