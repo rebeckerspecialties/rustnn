@@ -570,7 +570,7 @@ mod test {
     }
 
     #[test]
-    fn typed_graphs_use_one_local_compilation_path() {
+    fn native_typed_graphs_use_one_local_compilation_path() {
         use crate::executors::coreml::CoremlLoadRoute;
         use crate::mlcontext::LoadDiagnostics;
         for dtype in [
@@ -585,7 +585,9 @@ mod test {
             let input = builder
                 .input("input", &MLOperandDescriptor::new(dtype, vec![11]))
                 .unwrap();
-            let output = builder.identity(input).unwrap();
+            // Identity can use exact typed transport without native compilation.
+            // Neg still exercises the native loading route for every dtype.
+            let output = builder.neg(input).unwrap();
             let graph = builder
                 .build(&MLNamedOperands::from([("result", output)]))
                 .unwrap();

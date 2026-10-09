@@ -42,6 +42,7 @@ enum StageExecution {
     TypedUnary(typed_unary::Kind),
     ConstantGelu(Box<typed_unary::ConstantUnary>),
     IntegerDivision(Box<integer_division::Division>),
+    Int32Identity,
 }
 
 fn execution(model: &Model, wire: &[u8]) -> StageExecution {
@@ -51,6 +52,8 @@ fn execution(model: &Model, wire: &[u8]) -> StageExecution {
         StageExecution::ConstantGelu(Box::new(constant))
     } else if let Some(division) = integer_division::classify(model, wire) {
         StageExecution::IntegerDivision(Box::new(division))
+    } else if int32_identity::classify(model, wire) {
+        StageExecution::Int32Identity
     } else {
         StageExecution::Native
     }
@@ -1025,6 +1028,13 @@ impl PipelineModel {
                     }
                     return Ok(());
                 }
+                if stage.execution == StageExecution::Int32Identity {
+                    self.predict_int32_identity(stage, &mut values)?;
+                    for name in &stage.release_after {
+                        values.remove(name);
+                    }
+                    return Ok(());
+                }
                 let model = self.load_child(index)?;
                 let dictionary: *mut Object = msg_send![class!(NSMutableDictionary), dictionary];
                 let description: *mut Object = msg_send![model, modelDescription];
@@ -1139,6 +1149,33 @@ impl PipelineModel {
             }
             Ok(result)
         })
+    }
+
+    unsafe fn predict_int32_identity(
+        &self,
+        stage: &Stage,
+        values: &mut HashMap<String, ReleaseOnDrop>,
+    ) -> Result<(), GraphError> {
+        let source = &stage.inputs[0];
+        let target = &stage.outputs[0];
+        if values.contains_key(&target.name) {
+            return Err(boundary_error("Int32 Identity output already exists"));
+        }
+        let feature = values
+            .get(&source.name)
+            .ok_or_else(|| boundary_error("Int32 Identity source is absent"))?;
+        let array: *mut Object = msg_send![feature.0, multiArrayValue];
+        unsafe { validate_source_feature(source, array)? };
+        unsafe { validate_source_feature(target, array)? };
+        // Identity preserves the exact represented value. Retain this private
+        // feature across source last-use; public tensor destinations are still
+        // copied independently by the ordinary dispatch publication path.
+        let owned: *mut Object = msg_send![feature.0, retain];
+        if owned.is_null() {
+            return Err(boundary_error("Int32 Identity could not retain its source"));
+        }
+        values.insert(target.name.clone(), ReleaseOnDrop(owned));
+        Ok(())
     }
 
     unsafe fn predict_integer_division(
@@ -1338,7 +1375,7 @@ mod tests {
                 operand("left", OperandKind::Intermediate, DataType::Int32),
                 operand("right", OperandKind::Input, DataType::Int32),
                 operand("quotient", OperandKind::Intermediate, DataType::Int32),
-                operand("result", OperandKind::Output, DataType::Int32),
+                operand("result", OperandKind::Output, DataType::Float32),
             ],
             constant_operand_ids_to_handles: [(
                 0,
@@ -1366,8 +1403,9 @@ mod tests {
                     outputs: vec![3],
                     options: None,
                 },
-                Operation::Identity {
+                Operation::Cast {
                     input: 3,
+                    data_type: MLOperandDataType::Float32,
                     outputs: vec![4],
                     options: None,
                 },
@@ -2115,6 +2153,99 @@ mod tests {
             "NOT_APPLICABLE"
         );
         assert!(pipeline.diagnostics().failures.is_empty());
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn int32_identity_retains_validated_padded_storage_and_rejects_wrong_actual_shape() {
+        use crate::converters::{CoremlMlProgramConverter, GraphConverter};
+        let mut graph = cast_graph(vec![Dimension::Static(4)]);
+        graph.operands.truncate(2);
+        for operand in &mut graph.operands {
+            operand.descriptor.data_type = DataType::Int32;
+        }
+        graph.output_operands = vec![1];
+        graph.operations = vec![crate::operators::Operation::Identity {
+            input: 0,
+            outputs: vec![1],
+            options: None,
+        }];
+        let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+        let plan = SourcePlan::parse(&converted.data).unwrap().unwrap();
+        let model = PipelineModel::compile(plan, None, DeviceType::Cpu).unwrap();
+        assert_eq!(
+            model.plan.stages[0].execution,
+            StageExecution::Int32Identity
+        );
+        let expected = [16_777_217_i32, -16_777_217, i32::MIN, i32::MAX]
+            .into_iter()
+            .flat_map(i32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let mut backing = vec![0xdd_u8; 8 * 4];
+        let returned = autoreleasepool(|| unsafe {
+            let numbers = |values: &[i64]| {
+                let values: Vec<*mut Object> = values
+                    .iter()
+                    .map(|&n| {
+                        let value: *mut Object = msg_send![class!(NSNumber), numberWithLongLong:n];
+                        value
+                    })
+                    .collect();
+                let result: *mut Object =
+                    msg_send![class!(NSArray), arrayWithObjects:values.as_ptr() count:values.len()];
+                result
+            };
+            let mut error: *mut Object = ptr::null_mut();
+            let allocated: *mut Object = msg_send![class!(MLMultiArray), alloc];
+            let source: *mut Object = msg_send![allocated, initWithDataPointer:backing.as_mut_ptr().cast::<std::ffi::c_void>() shape:numbers(&[4]) dataType:NativeType::Int32.code() strides:numbers(&[2]) deallocator:ptr::null_mut::<Object>() error:&mut error];
+            assert!(
+                !source.is_null(),
+                "{}",
+                ns_error_to_string(error, "padded Int32 source")
+            );
+            let source = ReleaseOnDrop(source);
+            let (kind, layout, pointer) = multiarray_storage(source.0).unwrap();
+            write_array_storage(pointer, &layout, kind.element_size(), &expected).unwrap();
+            let feature: *mut Object =
+                msg_send![class!(MLFeatureValue), featureValueWithMultiArray:source.0];
+            let feature: *mut Object = msg_send![feature, retain];
+            let stage = &model.plan.stages[0];
+            let mut values =
+                HashMap::from([(stage.inputs[0].name.clone(), ReleaseOnDrop(feature))]);
+            model.predict_int32_identity(stage, &mut values).unwrap();
+            assert_eq!(
+                values[&stage.outputs[0].name].0, feature,
+                "the stage must retain the original owned feature"
+            );
+            values.remove(&stage.inputs[0].name);
+            drop(source);
+            let array: *mut Object = msg_send![values[&stage.outputs[0].name].0, multiArrayValue];
+            let (kind, layout, pointer) = multiarray_storage(array).unwrap();
+            let result = read_array_storage(pointer, &layout, kind.element_size());
+            let wrong = create_multi_array(&[3], NativeType::Int32.code()).unwrap();
+            let wrong: *mut Object =
+                msg_send![class!(MLFeatureValue), featureValueWithMultiArray:wrong];
+            let wrong: *mut Object = msg_send![wrong, retain];
+            let mut wrong_values =
+                HashMap::from([(stage.inputs[0].name.clone(), ReleaseOnDrop(wrong))]);
+            assert!(
+                model
+                    .predict_int32_identity(stage, &mut wrong_values)
+                    .is_err()
+            );
+            assert!(!wrong_values.contains_key(&stage.outputs[0].name));
+            result
+        });
+        assert_eq!(returned, expected);
+        assert!(
+            backing
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .enumerate()
+                .all(|(index, bytes)| index % 2 == 0 || *bytes == [0xdd; 4])
+        );
+        assert_eq!(model.cache_counts(), (0, 0));
     }
 
     #[cfg(target_vendor = "apple")]

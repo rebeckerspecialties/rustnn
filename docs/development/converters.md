@@ -116,6 +116,12 @@ Rules that hold for every converter:
   materialize before the division stage. Scalar/broadcast and dynamic bindings use
   the same checked kernel. Division by zero and `INT32_MIN / -1` return errors before
   publishing output, rather than inventing results for unspecified cases.
+- Source Int32 `identity` and same-type `cast` results are isolated as complete
+  typed copy stages, including values produced by earlier arithmetic. A checked
+  Identity child retains its original feature until its final consumer; public
+  tensor destinations still receive independent copies. This avoids native
+  Identity rounding without changing the arithmetic that produces or consumes
+  the value. Synthetic Int32 helpers inside narrow-integer lowerings are not split.
 - Comparison results are `uint8`; `reduceLogSumExp` uses the max-shifted form; reductions with
   empty `axes` and `resample2d` on arbitrary axes are lowered explicitly.
 - Gather-family index normalization uses active indexed dimensions, not their declared maxima.

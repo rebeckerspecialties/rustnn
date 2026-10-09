@@ -55,6 +55,7 @@ Use the Makefile targets; they set feature flags and environment variables consi
 | `test-coreml-gather` | Focused active-dimension gather regressions, including scalar indices; `TEST_FILTER` selects a test |
 | `test-coreml-dtypes` | Focused numeric boundary regressions for typed dispatch and the convenience API; CI runs with and without dynamic inputs |
 | `test-coreml-integer-division` | Exact signed Int32 division, scalar/broadcast combinations and dynamic binding mutation |
+| `test-coreml-int32-copies` | Exact arithmetic-produced Int32 Identity/same-type Cast, bounded shapes and independent output storage |
 | `test-coreml-gelu` | Exact GELU precision, shapes, constant closures and native compositions, including all Half encodings and Float32 negative tails |
 | `test-coreml-precision` | Native typed-boundary, Half layout, constant, fanout and bounded-dynamic regressions |
 | `test-coreml-pipeline` | Bounded child-runtime, exact Float32/Half Cast, typed-storage and shared-weight source-plan regressions |
