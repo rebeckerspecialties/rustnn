@@ -13158,6 +13158,51 @@ mod tests {
     }
 
     #[test]
+    fn shared_program_builder_reuses_original_immediate_constant_record() {
+        let mut graph = constant_copy_asset_graph();
+        graph.operands.truncate(2);
+        graph.operations.truncate(1);
+        graph.output_operands = vec![1];
+        graph.operands[1].kind = OperandKind::Output;
+        for operand in &mut graph.operands {
+            operand.descriptor.data_type = DataType::Int32;
+        }
+        graph
+            .constant_operand_ids_to_handles
+            .get_mut(&0)
+            .unwrap()
+            .data = [16_777_217i32, i32::MIN]
+            .into_iter()
+            .flat_map(i32::to_le_bytes)
+            .collect();
+        let graph = LoweringGraph::new(&graph).unwrap();
+        let mut weights = super::super::WeightFileBuilder::new();
+        let metadata: Vec<_> = (0..2)
+            .map(|_| {
+                let model = CoremlMlProgramConverter
+                    .convert_program(
+                        &graph,
+                        &graph.input_operands,
+                        &graph.output_operands,
+                        &graph.operations,
+                        &mut weights,
+                    )
+                    .unwrap();
+                model.description.unwrap().metadata.unwrap().user_defined
+                    [OUTPUT_CONSTANT_COPIES_METADATA_KEY]
+                    .clone()
+            })
+            .collect();
+        assert_eq!(metadata[0], metadata[1]);
+        let weights = weights.finalize();
+        assert_eq!(u32::from_le_bytes(weights[..4].try_into().unwrap()), 1);
+        assert_eq!(
+            &weights[128..136],
+            &graph.constant_operand_ids_to_handles[&0].data,
+        );
+    }
+
+    #[test]
     fn constant_copy_asset_rejects_dead_arithmetic_and_typed_boundaries() {
         let graph = constant_copy_asset_graph();
         let model = CoremlMlProgramConverter.convert(&graph).unwrap().data;
