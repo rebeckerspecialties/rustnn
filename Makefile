@@ -217,6 +217,11 @@ test-coreml-integer-division:
 	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_integer_division -- $(TEST_FILTER) --test-threads=1
 
 .PHONY: test-coreml-scalar-binary
+.PHONY: test-coreml-int32-copies
+test-coreml-int32-copies:
+	$(CARGO) test --lib --no-default-features --features $(COREML_FEATURES) -- int32_identity --test-threads=1
+	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_produced_int32_copy -- $(TEST_FILTER) --test-threads=1
+
 test-coreml-scalar-binary:
 	$(CARGO) test --lib --no-default-features --features $(COREML_FEATURES) -- scalar_binary --test-threads=1
 	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_scalar_binary -- $(TEST_FILTER) --test-threads=1
@@ -566,6 +571,7 @@ help:
 	@echo "  test-coreml-precision - Test explicit FP16 rounding and native Pipeline stage interfaces"
 	@echo "  test-coreml-scalar-binary - Test native scalar arithmetic and broadcasting"
 	@echo "  test-coreml-integer-division - Test exact signed Int32 division and broadcasting"
+	@echo "  test-coreml-int32-copies - Test produced Int32 copies, shapes and owned storage"
 	@echo "                       Set COREML_FEATURES=coreml-runtime to disable dynamic inputs"
 	@echo ""
 	@echo "LiteRT Conversion:"

@@ -1451,6 +1451,23 @@ impl CoremlMlProgramConverter {
                 cuts.insert(last + 1);
             }
         }
+        let source_int32_copies: HashSet<_> = graph
+            .operations
+            .iter()
+            .filter(|operation| match operation {
+                Operation::Identity { input, .. } | Operation::Cast { input, .. } => graph
+                    .operand(*input)
+                    .is_some_and(|operand| operand.descriptor.data_type == DataType::Int32),
+                _ => false,
+            })
+            .flat_map(|operation| operation.outputs())
+            .filter(|&&id| {
+                graph
+                    .operand(id)
+                    .is_some_and(|operand| operand.descriptor.data_type == DataType::Int32)
+            })
+            .map(|&id| operand_name(graph, id))
+            .collect();
         let graph_outputs: HashSet<_> = block.outputs.iter().cloned().collect();
         let float32_affine_layer_norm_inputs: HashSet<_> = graph
             .operations
@@ -1612,6 +1629,21 @@ impl CoremlMlProgramConverter {
                             .is_some_and(|value| value.data_type == MilDataType::Float16 as i32)
                 })
             {
+                cuts.insert(index + 1);
+            }
+            // Native Int32 Identity can round an arithmetic-produced value.
+            // Isolate source Int32 copies regardless of their producer/consumer.
+            // Synthetic Int32 identities inside narrow-integer lowerings retain
+            // those complete programs; constant closures retain materialization.
+            if operation.r#type == "identity"
+                && !constant_operations.contains(&index)
+                && operation.outputs.iter().all(|output| {
+                    source_int32_copies.contains(&output.name)
+                        && tensor(output)
+                            .is_some_and(|ty| ty.data_type == MilDataType::Int32 as i32)
+                })
+            {
+                cuts.insert(index);
                 cuts.insert(index + 1);
             }
             let protected = operation.outputs.iter().any(|output| {
