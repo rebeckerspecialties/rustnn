@@ -103,6 +103,31 @@ Apple's source-model compilation and specification-data asset APIs are unavailab
 watchOS. This executor rejects those routes explicitly rather than invoking unavailable
 selectors; offline compiled-child loading still requires separate integration.
 
+## Source-proven Float32 matrix products
+
+Qualified static Float32 matrix children use an exact host dot product with one
+round-to-nearest-even result per output. A bounded Float64 interval certifies a unique
+Float32 result; ambiguous intervals, nonfinite inputs or unsuitable host rounding use
+an exact signed-integer accumulator instead. Scratch is capped at 64 KiB. Original
+Float32 constant blobs and lossless views are borrowed, not transposed into a second
+learned-weight tensor; runtime operands use validated native strides.
+
+The converter marks only static, source-proven matrix closures. Dynamic extents,
+post-result layout adapters and unsupported constant arithmetic retain their native
+route. A marked source with corrupted descriptors, flags, views or weight spans is
+rejected rather than silently replacing the exact route with native arithmetic. The
+backend-independent `GraphInfo`, public types and original payloads are unchanged.
+
+`make test-coreml-matmul` covers signed cancellation, transpose/broadcast mappings,
+bounded scratch, rejection controls and 256 predictions feeding each actual output
+back as the next input. Its closed-form dyadic state oracle is independent of the
+matrix implementation. This stronger implementation-fidelity contract is distinct
+from WebNN's per-operation allowances: WPT deliberately excludes catastrophic
+cancellation ([WPT #38679](https://github.com/web-platform-tests/wpt/pull/38679)), while
+accumulator precision and composed budgets are discussed in
+[#948](https://github.com/webmachinelearning/webnn/issues/948) and
+[#950](https://github.com/webmachinelearning/webnn/issues/950).
+
 ## Tensor names
 
 Input and output names remain independent in the RustNN API, including names containing

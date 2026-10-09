@@ -59,6 +59,8 @@ use load::LoadTrace;
 pub use load::{CoremlLoadDiagnostics, CoremlLoadFailure, CoremlLoadRoute};
 #[path = "coreml_float_cast.rs"]
 mod float_cast;
+#[path = "coreml_matmul.rs"]
+mod matmul;
 #[path = "coreml_pipeline.rs"]
 mod pipeline;
 

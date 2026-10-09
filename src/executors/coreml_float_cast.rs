@@ -45,6 +45,9 @@ enum Schema {
     Immediate,
     TensorValue,
     Strings,
+    Blob,
+    Numbers,
+    ValueEntry,
 }
 
 enum WireType {
@@ -80,6 +83,9 @@ fn field_type(schema: Schema, field: u64) -> Option<WireType> {
         (S::Program, 1) => V,
         (S::Program, 2) => M(S::FunctionEntry),
         (S::Program, 3) => B,
+        (S::Program | S::Function | S::Block, 4) => M(S::ValueEntry),
+        (S::ValueEntry, 1) => B,
+        (S::ValueEntry, 2) => M(S::Value),
         (S::FunctionEntry, 1) | (S::BlockEntry, 1) | (S::ArgumentEntry, 1) => B,
         (S::FunctionEntry, 2) => M(S::Function),
         (S::BlockEntry, 2) => M(S::Block),
@@ -92,6 +98,7 @@ fn field_type(schema: Schema, field: u64) -> Option<WireType> {
         (S::Operation, 1) => B,
         (S::Operation, 2) => M(S::ArgumentEntry),
         (S::Operation, 3) => M(S::NamedType),
+        (S::Operation, 5) => M(S::ValueEntry),
         (S::Argument, 1) => M(S::Binding),
         (S::Binding, 1) => B,
         (S::Binding, 2) => M(S::Value),
@@ -105,8 +112,13 @@ fn field_type(schema: Schema, field: u64) -> Option<WireType> {
         (S::ConstantDimension, 1) | (S::UnknownDimension, 1) => V,
         (S::Value, 1) => B,
         (S::Value, 3) => M(S::Immediate),
+        (S::Value, 5) => M(S::Blob),
         (S::Immediate, 1) => M(S::TensorValue),
         (S::TensorValue, 4) => M(S::Strings),
+        (S::TensorValue, 1..=3) => M(S::Numbers),
+        (S::Numbers, 1) => P,
+        (S::Blob, 1) => B,
+        (S::Blob, 2) => V,
         (S::Strings, 1) => B,
         _ => return None,
     })
@@ -152,6 +164,10 @@ fn known_wire(mut bytes: &[u8], schema: Schema, depth: u8) -> Option<()> {
         }
     }
     Some(())
+}
+
+pub(super) fn known_matmul_wire(source: &[u8]) -> bool {
+    known_wire(source, Schema::Model, 0).is_some()
 }
 
 fn tensor(ty: &mil::ValueType) -> Option<&mil::TensorType> {

@@ -36,10 +36,11 @@ struct Stage {
     execution: StageExecution,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 enum StageExecution {
     Native,
     FloatCast(float_cast::Direction),
+    ExactMatmul(Box<matmul::Plan>),
 }
 
 pub(super) struct SourcePlan {
@@ -313,6 +314,33 @@ impl SourcePlan {
     pub(super) fn parse(bytes: &[u8]) -> Result<Option<Self>, GraphError> {
         let model = Model::decode(bytes)
             .map_err(|error| boundary_error(format!("invalid CoreML source: {error}")))?;
+        if let Some(plan) = matmul::classify(&model, bytes)? {
+            let description = model
+                .description
+                .as_ref()
+                .expect("classifier checks description");
+            let inputs = arrays(&description.input)?;
+            let outputs = arrays(&description.output)?;
+            return Ok(Some(Self {
+                aliases: source_aliases(description)?,
+                constant_copy_metadata: Self::constant_copy_metadata(description),
+                stages: vec![Stage {
+                    source: bytes.to_vec(),
+                    inputs: description.input.clone(),
+                    outputs: description.output.clone(),
+                    release_after: inputs
+                        .keys()
+                        .filter(|name| !outputs.contains_key(*name))
+                        .cloned()
+                        .collect(),
+                    has_weights: matches!(plan.left.source, matmul::Source::Blob { .. })
+                        || matches!(plan.right.source, matmul::Source::Blob { .. }),
+                    execution: StageExecution::ExactMatmul(Box::new(plan)),
+                }],
+                inputs,
+                outputs,
+            }));
+        }
         if matches!(model.r#type, Some(model::Type::MlProgram(_)))
             && let Some(direction) = float_cast::classify(&model, bytes)
         {
@@ -416,8 +444,12 @@ impl SourcePlan {
                 outputs: child_description.output.clone(),
                 release_after: vec![],
                 has_weights: program_weights(program)?,
-                execution: float_cast::classify(child, wire)
-                    .map_or(StageExecution::Native, StageExecution::FloatCast),
+                execution: if let Some(plan) = matmul::classify(child, wire)? {
+                    StageExecution::ExactMatmul(Box::new(plan))
+                } else {
+                    float_cast::classify(child, wire)
+                        .map_or(StageExecution::Native, StageExecution::FloatCast)
+                },
             });
         }
         for (name, feature) in &outputs {
@@ -581,6 +613,7 @@ pub(crate) struct PipelineModel {
     source_root: tempfile::TempDir,
     device: DeviceType,
     weights: Option<Rc<MappedWeights>>,
+    scratch: RefCell<matmul::kernel::certified::Scratch>,
 }
 
 impl std::fmt::Debug for PipelineModel {
@@ -642,6 +675,16 @@ impl PipelineModel {
         } else {
             None
         };
+        for stage in &plan.stages {
+            if let StageExecution::ExactMatmul(plan) = &stage.execution {
+                for operand in [&plan.left, &plan.right] {
+                    if !matches!(operand.source, matmul::Source::Input(_)) {
+                        // Reject every source span/view before any MLModel load.
+                        operand.constant(mapped.as_deref().map(MappedWeights::bytes))?;
+                    }
+                }
+            }
+        }
         if let Some(metadata) = plan.constant_copy_metadata.take() {
             let storage = mapped
                 .as_ref()
@@ -677,6 +720,7 @@ impl PipelineModel {
             source_root: root,
             device,
             weights: mapped,
+            scratch: RefCell::new(matmul::kernel::certified::Scratch::default()),
         };
         // Establish an actual successful load, without compiling the opaque
         // Pipeline or retaining all children. Later children remain lazy.
@@ -989,6 +1033,13 @@ impl PipelineModel {
                     }
                     return Ok(());
                 }
+                if let StageExecution::ExactMatmul(plan) = &stage.execution {
+                    self.predict_matmul(stage, plan, &mut values)?;
+                    for name in &stage.release_after {
+                        values.remove(name);
+                    }
+                    return Ok(());
+                }
                 let model = self.load_child(index)?;
                 let dictionary: *mut Object = msg_send![class!(NSMutableDictionary), dictionary];
                 let description: *mut Object = msg_send![model, modelDescription];
@@ -1141,7 +1192,123 @@ impl PipelineModel {
         }
         Ok(())
     }
+
+    unsafe fn matmul_operand<'a>(
+        &'a self,
+        operand: &'a matmul::Operand,
+        values: &'a HashMap<String, ReleaseOnDrop>,
+    ) -> Result<matmul::kernel::TensorView<'a>, GraphError> {
+        let (data, shape, strides) = match &operand.source {
+            matmul::Source::Blob { .. } | matmul::Source::Immediate(_) => {
+                operand.constant(self.weights.as_deref().map(MappedWeights::bytes))?
+            }
+            matmul::Source::Input(name) => {
+                let feature = values.get(name).ok_or_else(|| {
+                    boundary_error(format!("exact matrix operand `{name}` is absent"))
+                })?;
+                let array: *mut Object = msg_send![feature.0, multiArrayValue];
+                let (kind, layout, pointer) = unsafe { multiarray_storage(array)? };
+                if kind != NativeType::Float32 {
+                    return Err(boundary_error("exact matrix operand is not native Float32"));
+                }
+                let span = layout
+                    .shape
+                    .iter()
+                    .zip(&layout.strides)
+                    .try_fold(0usize, |n, (&d, &s)| {
+                        d.saturating_sub(1)
+                            .checked_mul(s)
+                            .and_then(|x| n.checked_add(x))
+                    })
+                    .and_then(|x| x.checked_add(1))
+                    .ok_or_else(|| boundary_error("native matrix span overflow"))?;
+                if !(pointer as usize).is_multiple_of(4)
+                    || span
+                        .checked_mul(4)
+                        .is_none_or(|bytes| bytes > isize::MAX as usize)
+                {
+                    return Err(boundary_error("unaligned/overflow native matrix span"));
+                }
+                let (shape, strides) = operand.geometry(&layout.shape, &layout.strides)?;
+                // SAFETY: original native MLMultiArray owns the validated typed
+                // span and its feature remains live through this stage.
+                let data = unsafe { std::slice::from_raw_parts(pointer.cast::<f32>(), span) };
+                (data, shape, strides)
+            }
+        };
+        matmul::kernel::TensorView::strided(data, &shape, &strides)
+            .map_err(|e| boundary_error(e.to_string()))
+    }
+
+    unsafe fn predict_matmul(
+        &self,
+        stage: &Stage,
+        plan: &matmul::Plan,
+        values: &mut HashMap<String, ReleaseOnDrop>,
+    ) -> Result<(), GraphError> {
+        let shape: Vec<_> = plan
+            .output_shape
+            .iter()
+            .map(|&x| {
+                i64::try_from(x).map_err(|_| boundary_error("matrix output dimension overflows"))
+            })
+            .collect::<Result<_, _>>()?;
+        let output = unsafe { create_multi_array(&shape, NativeType::Float32.code())? };
+        let (kind, layout, pointer) = unsafe { multiarray_storage(output)? };
+        if kind != NativeType::Float32
+            || !layout.contiguous
+            || !(pointer as usize).is_multiple_of(4)
+        {
+            return Err(boundary_error("exact matrix output backing differs"));
+        }
+        unsafe { validate_source_feature(&stage.outputs[0], output)? };
+        {
+            let left = unsafe { self.matmul_operand(&plan.left, values)? };
+            let right = unsafe { self.matmul_operand(&plan.right, values)? };
+            let mut scratch = self
+                .scratch
+                .try_borrow_mut()
+                .map_err(|_| boundary_error("reentrant exact matrix execution"))?;
+            // SAFETY: new native output is disjoint from immutable inputs and
+            // weights; positive native shape/count/layout were checked above.
+            let result =
+                unsafe { std::slice::from_raw_parts_mut(pointer.cast::<f32>(), layout.count) };
+            let report = matmul::kernel::certified::matmul_into(
+                &left,
+                &right,
+                matmul::kernel::Options {
+                    transpose_a: plan.transpose_left,
+                    transpose_b: plan.transpose_right,
+                },
+                result,
+                &mut scratch,
+            )
+            .map_err(|e| boundary_error(e.to_string()))?;
+            if report.shape != plan.output_shape
+                || report.checked_outputs != layout.count
+                || report.integer_fallbacks > report.checked_outputs
+                || report.scratch_bytes > 65536
+            {
+                return Err(boundary_error("exact matrix execution report differs"));
+            }
+        }
+        let value: *mut Object =
+            msg_send![class!(MLFeatureValue),featureValueWithMultiArray:output];
+        let owned: *mut Object = msg_send![value, retain];
+        if owned.is_null()
+            || values
+                .insert(plan.output.clone(), ReleaseOnDrop(owned))
+                .is_some()
+        {
+            return Err(boundary_error("exact matrix output was not unique"));
+        }
+        Ok(())
+    }
 }
+
+#[cfg(test)]
+#[path = "coreml_matmul_integration_tests.rs"]
+mod integration_tests;
 
 unsafe fn validate_source_feature(
     feature: &FeatureDescription,
@@ -1199,6 +1366,198 @@ unsafe fn validate_native_feature(
 mod tests {
     use super::*;
     use crate::protos::coreml::specification::{FeatureType, Pipeline};
+
+    // This composes the mapped-constant and exact-contraction repairs: separate
+    // tests cannot establish that a fanout keeps the same original weight owner.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn exact_matmul_and_constant_copy_fanout_share_the_original_mapping() {
+        use crate::converters::{CoremlMlProgramConverter, GraphConverter};
+        use crate::graph::{ConstantData, GraphInfo, Operand, OperandKind};
+        use crate::operators::Operation;
+
+        let operand = |name: &str, kind, shape: &[u32]| Operand {
+            name: Some(name.into()),
+            kind,
+            descriptor: OperandDescriptor {
+                data_type: DataType::Float32,
+                shape: shape.iter().copied().map(Dimension::Static).collect(),
+                pending_permutation: vec![],
+            },
+        };
+        let mut right_bits = [1_u32, 0x8000_0000, 0x3f80_0001, 0xbf80_0001].repeat(768);
+        right_bits[..12].copy_from_slice(&[
+            0x4b80_0000,
+            0xcb80_0000,
+            0x4b80_0000,
+            0xcb80_0000,
+            0x3f80_0000,
+            0xbf80_0000,
+            0x4000_0000,
+            0xc000_0000,
+            0xcb80_0000,
+            0x4b80_0000,
+            0xcb80_0000,
+            0x4b80_0000,
+        ]);
+        let expected_copy = right_bits
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let mut graph = GraphInfo {
+            operands: vec![
+                operand("left", OperandKind::Input, &[1, 768]),
+                operand("original right", OperandKind::Constant, &[768, 4]),
+                operand("projection", OperandKind::Output, &[1, 4]),
+                operand("first copy", OperandKind::Output, &[768, 4]),
+                operand("second copy", OperandKind::Output, &[768, 4]),
+            ],
+            input_operands: vec![0],
+            output_operands: vec![2, 3, 4],
+            operations: vec![
+                Operation::Matmul {
+                    a: 0,
+                    b: 1,
+                    outputs: vec![2],
+                    options: None,
+                },
+                Operation::Identity {
+                    input: 1,
+                    outputs: vec![3],
+                    options: None,
+                },
+                Operation::Identity {
+                    input: 3,
+                    outputs: vec![4],
+                    options: None,
+                },
+            ],
+            ..Default::default()
+        };
+        graph.constant_operand_ids_to_handles.insert(
+            1,
+            ConstantData {
+                data: expected_copy.clone(),
+                label: None,
+            },
+        );
+        let input_descriptor = graph.operands[0].descriptor.clone();
+        let outputs = graph
+            .output_operands
+            .iter()
+            .map(|&id| {
+                let operand = &graph.operands[id as usize];
+                (operand.name.clone().unwrap(), operand.descriptor.clone())
+            })
+            .collect::<HashMap<_, _>>();
+        let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+        drop(graph);
+        let mut left = vec![0_f32; 768];
+        left[..3].fill(1.0);
+        let left_bytes = left
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let inputs = HashMap::from([(
+            "left".into(),
+            CoremlByteInput {
+                data: &left_bytes,
+                descriptor: &input_descriptor,
+            },
+        )]);
+        // These exact dyadic sums are 2^24 + {1,2} - 2^24, with both signs.
+        let expected_projection = [1_f32, -1.0, 2.0, -2.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let weak = autoreleasepool(|| {
+            let model = compile_model(
+                converted.data,
+                converted.weights_data,
+                DeviceType::Cpu,
+                false,
+            )
+            .unwrap();
+            let CompiledCoremlModel::Pipeline(pipeline) = &model else {
+                panic!("exact Matmul with constant fanout must remain a Pipeline")
+            };
+            let mapping = pipeline.weights.as_ref().unwrap();
+            let weak = Rc::downgrade(mapping);
+            let matrices = pipeline
+                .plan
+                .stages
+                .iter()
+                .filter_map(|stage| {
+                    if let StageExecution::ExactMatmul(plan) = &stage.execution {
+                        Some(plan)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(matrices.len(), 1);
+            let matmul::Source::Blob {
+                metadata_offset, ..
+            } = &matrices[0].right.source
+            else {
+                panic!("exact Matmul must retain the original RHS source blob")
+            };
+            let ranges = crate::converters::weight_ranges(mapping.bytes()).unwrap();
+            assert_eq!(
+                ranges.len(),
+                1,
+                "fanout must not duplicate the original weight record"
+            );
+            let source_span = ranges[&(*metadata_offset as u64)].clone();
+            let (right, shape, _) = matrices[0].right.constant(Some(mapping.bytes())).unwrap();
+            assert_eq!(shape, [768, 4]);
+            assert_eq!(
+                right.as_ptr().cast::<u8>(),
+                mapping.bytes()[source_span.clone()].as_ptr()
+            );
+            assert_eq!(pipeline.plan.aliases.constant_copies.len(), 2);
+            for copy in pipeline.plan.aliases.constant_copies.values() {
+                let CoremlWeightStorage::Mapped(owner) = &copy.bytes.storage else {
+                    panic!("constant copies must share the original mapped owner")
+                };
+                assert!(Rc::ptr_eq(mapping, owner));
+                assert_eq!(copy.bytes.range, source_span);
+                assert_eq!(&*copy.bytes, expected_copy);
+            }
+            let mut invalid = outputs.clone();
+            invalid.get_mut("second copy").unwrap().data_type = DataType::Int32;
+            let reject = || {
+                let error = run_coreml_bytes(&model, &inputs, &invalid)
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    error.contains(
+                        "proven constant output `second copy` has inconsistent descriptors or bytes"
+                    ),
+                    "{error}"
+                );
+            };
+            reject();
+            for _ in 0..2 {
+                let mut result = run_coreml_bytes(&model, &inputs, &outputs).unwrap();
+                assert_eq!(result["projection"], expected_projection);
+                assert_eq!(result["first copy"], expected_copy);
+                assert_eq!(result["second copy"], expected_copy);
+                result.get_mut("first copy").unwrap()[0] ^= 0xff;
+                assert_eq!(result["second copy"], expected_copy);
+                reject();
+            }
+            assert_eq!(
+                run_coreml_bytes(&model, &inputs, &outputs).unwrap()["projection"],
+                expected_projection
+            );
+            weak
+        });
+        assert!(
+            weak.upgrade().is_none(),
+            "mapping must not outlive the model"
+        );
+    }
 
     fn feature(name: &str) -> FeatureDescription {
         FeatureDescription {

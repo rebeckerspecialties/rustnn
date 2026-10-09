@@ -156,6 +156,10 @@ Rules that hold for every converter:
   The bounded executor retains original child bytes and typed outputs until their last
   consumer, with one loaded native child and shared source weights. Complete known-wire
   float Cast children use exact host narrowing/widening; arithmetic children remain native.
+- Static Float32 matrix children record `rustnn.webnn.exact_f32_matmul=1` only for
+  qualified constant/view closures. Execution validates the complete known-wire source
+  before using the certified exact host kernel. Dynamic, post-layout and unsupported
+  constant closures remain native; invalid marked sources fail closed.
 - Affected Half widening layouts use compact private features. Original high-rank inputs
   declare `rustnn.webnn.compact_input_views`; contiguous storage is viewed with its owner
   retained, while padded storage is copied as raw Half bytes. Dynamic restoration uses

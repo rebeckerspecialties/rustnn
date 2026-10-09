@@ -32,6 +32,9 @@
 - `make test-coreml-pipeline` focuses on the bounded child executor, source-proven Cast,
   actual typed shapes, buffer lifetimes and shared-weight repacking. Its unit tests also run
   through `make test-coreml`; `make lint-coreml` checks the CoreML feature surface strictly.
+- `make test-coreml-matmul` covers source selection, exact matrix-product certification,
+  cancellation and signed 256-step actual-output carry. These tests also run through
+  `make test-coreml`; their stronger implementation-fidelity gates are separate from WPT budgets.
 - Linux and macOS CI explicitly run `make test-wpt-tolerance`; WPT jobs also check
   strict comparator parity against the pinned upstream JavaScript helpers.
 - The documentation site combines three generated parts: MkDocs pages from `docs/`, rustdoc from
