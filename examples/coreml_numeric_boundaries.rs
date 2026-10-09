@@ -30,6 +30,23 @@ struct LoadFailureObservation {
     reason: String,
 }
 
+#[cfg(any(test, all(target_os = "macos", feature = "coreml-runtime")))]
+fn valid_load_configuration(
+    expected: &str,
+    route: &str,
+    requested: &str,
+    loaded: &str,
+    has_failures: bool,
+) -> bool {
+    requested == expected
+        && !has_failures
+        && match route {
+            "TypedHost" => loaded == "NOT_APPLICABLE",
+            "CompiledUrl" | "InMemoryAsset" => loaded == requested,
+            _ => false,
+        }
+}
+
 #[derive(Clone, Deserialize)]
 struct Fixture {
     op: String,
@@ -357,8 +374,19 @@ mod native {
         else {
             return Err("missing CoreML load diagnostics".into());
         };
-        if load.requested_compute_units != load.loaded_compute_units {
-            return Err(format!("policy changed during loading: {load:?}"));
+        let expected_permission = match policy {
+            DeviceType::Cpu => "CPU_ONLY",
+            DeviceType::Gpu => "CPU_AND_GPU",
+            DeviceType::Npu => "CPU_AND_NE",
+        };
+        if !valid_load_configuration(
+            expected_permission,
+            &format!("{:?}", load.route),
+            load.requested_compute_units,
+            load.loaded_compute_units,
+            !load.failures.is_empty(),
+        ) {
+            return Err(format!("invalid loading configuration: {load:?}"));
         }
         let td = MLTensorDescriptor::new(
             mltype,
@@ -416,6 +444,15 @@ mod native {
         else {
             return Err("missing CoreML load diagnostics after prediction".into());
         };
+        if !valid_load_configuration(
+            expected_permission,
+            &format!("{:?}", load.route),
+            load.requested_compute_units,
+            load.loaded_compute_units,
+            !load.failures.is_empty(),
+        ) {
+            return Err(format!("invalid configuration after prediction: {load:?}"));
+        }
         let load = LoadObservation {
             phase: "after_prediction",
             route: format!("{:?}", load.route),
@@ -570,6 +607,45 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn load_configuration_keeps_requested_permissions_and_distinguishes_typed_host() {
+        for permission in ["CPU_ONLY", "CPU_AND_GPU", "CPU_AND_NE", "ALL"] {
+            for route in ["CompiledUrl", "InMemoryAsset"] {
+                assert!(valid_load_configuration(
+                    permission, route, permission, permission, false
+                ));
+            }
+            assert!(valid_load_configuration(
+                permission,
+                "TypedHost",
+                permission,
+                "NOT_APPLICABLE",
+                false
+            ));
+        }
+    }
+
+    #[test]
+    fn load_configuration_rejects_changed_permissions_and_fallback_history() {
+        for (route, requested, loaded, failures) in [
+            ("TypedHost", "CPU_ONLY", "CPU_ONLY", false),
+            ("CompiledUrl", "CPU_ONLY", "NOT_APPLICABLE", false),
+            ("InMemoryAsset", "CPU_ONLY", "NOT_APPLICABLE", false),
+            ("CompiledUrl", "CPU_ONLY", "CPU_AND_GPU", false),
+            ("TypedHost", "CPU_AND_GPU", "NOT_APPLICABLE", false),
+            ("CompiledUrl", "CPU_AND_GPU", "CPU_AND_GPU", false),
+            ("CompiledUrl", "CPU_ONLY", "CPU_ONLY", true),
+            ("InMemoryAsset", "CPU_ONLY", "CPU_ONLY", true),
+            ("TypedHost", "CPU_ONLY", "NOT_APPLICABLE", true),
+            ("Unknown", "CPU_ONLY", "CPU_ONLY", false),
+        ] {
+            assert!(
+                !valid_load_configuration("CPU_ONLY", route, requested, loaded, failures),
+                "accepted {route}/{requested}/{loaded}/failures={failures}"
+            );
+        }
+    }
 
     #[cfg(all(target_os = "macos", feature = "coreml-runtime"))]
     #[test]

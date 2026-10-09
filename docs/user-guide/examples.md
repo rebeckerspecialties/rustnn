@@ -4,6 +4,9 @@
 model checkpoint. Use `make diagnose-coreml-boundaries` on macOS to record Exp
 producer/consumer and Sqrt/GELU boundary results. The [test guide](../testing/wpt-test-guide.md#reduced-numerical-boundary-diagnostics)
 explains its raw-bit output and separate fidelity properties.
+The diagnostic checks the requested permissions before and after prediction and
+rejects native fallback. A typed host stage reports `NOT_APPLICABLE` for native
+compute permissions; it is not attributed to GPU or Neural Engine execution.
 
 ## Example programs
 
