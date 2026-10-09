@@ -41,6 +41,7 @@ enum StageExecution {
     Native,
     TypedUnary(typed_unary::Kind),
     ConstantUnary(Box<typed_unary::ConstantUnary>),
+    Float32Binary(Box<float32_binary::Binary>),
 }
 
 fn execution(model: &Model, wire: &[u8]) -> StageExecution {
@@ -48,6 +49,8 @@ fn execution(model: &Model, wire: &[u8]) -> StageExecution {
         StageExecution::TypedUnary(kind)
     } else if let Some(constant) = typed_unary::classify_constant(model, wire) {
         StageExecution::ConstantUnary(Box::new(constant))
+    } else if let Some(binary) = float32_binary::classify(model, wire) {
+        StageExecution::Float32Binary(Box::new(binary))
     } else {
         StageExecution::Native
     }
@@ -671,7 +674,12 @@ impl PipelineModel {
         }
         for stage in &mut plan.stages {
             if let StageExecution::ConstantUnary(constant) = &mut stage.execution {
-                constant.resolve(mapped.as_deref().map(MappedWeights::bytes))?;
+                constant
+                    .input
+                    .resolve(mapped.as_deref().map(MappedWeights::bytes))?;
+            }
+            if let StageExecution::Float32Binary(binary) = &mut stage.execution {
+                binary.resolve(mapped.as_deref().map(MappedWeights::bytes))?;
             }
         }
         let diagnostics = LoadTrace::new(device).finish(
@@ -1015,6 +1023,13 @@ impl PipelineModel {
                     }
                     return Ok(());
                 }
+                if let StageExecution::Float32Binary(binary) = &stage.execution {
+                    self.predict_float32_binary(stage, binary, &mut values)?;
+                    for name in &stage.release_after {
+                        values.remove(name);
+                    }
+                    return Ok(());
+                }
                 let model = self.load_child(index)?;
                 let dictionary: *mut Object = msg_send![class!(NSMutableDictionary), dictionary];
                 let description: *mut Object = msg_send![model, modelDescription];
@@ -1141,26 +1156,89 @@ impl PipelineModel {
         let (actual_shape, bytes) =
             if let StageExecution::ConstantUnary(constant) = &stage.execution {
                 (
-                    constant.shape.clone(),
-                    constant.bytes(self.weights.as_deref().map(MappedWeights::bytes))?,
+                    constant.input.shape.clone(),
+                    constant
+                        .input
+                        .bytes(self.weights.as_deref().map(MappedWeights::bytes))?,
                 )
             } else {
                 let source = &stage.inputs[0];
-                let feature = values.get(&source.name).ok_or_else(|| {
-                    boundary_error(format!("typed unary stage lacks source `{}`", source.name))
-                })?;
-                let array: *mut Object = msg_send![feature.0, multiArrayValue];
-                unsafe { validate_source_feature(source, array)? };
-                let (kind, layout, pointer) = unsafe { multiarray_storage(array)? };
-                let shape = layout.shape.iter().map(|&size| size as i64).collect();
-                let bytes = unsafe { read_array_storage(pointer, &layout, kind.element_size()) };
+                let (shape, bytes) = unsafe { self.read_typed_input(source, values)? };
                 (shape, std::borrow::Cow::Owned(bytes))
             };
         validate_feature_shape(array_type(target)?, &actual_shape)?;
         let result = typed_unary::evaluate(&bytes, operation).map_err(boundary_error)?;
-        let output = unsafe { create_multi_array(&actual_shape, array_type(target)?.data_type)? };
+        unsafe { self.publish_typed_output(target, &actual_shape, &result, values) }
+    }
+
+    unsafe fn read_typed_input(
+        &self,
+        source: &FeatureDescription,
+        values: &HashMap<String, ReleaseOnDrop>,
+    ) -> Result<(Vec<i64>, Vec<u8>), GraphError> {
+        let feature = values
+            .get(&source.name)
+            .ok_or_else(|| boundary_error(format!("typed stage lacks source `{}`", source.name)))?;
+        let array: *mut Object = msg_send![feature.0, multiArrayValue];
+        unsafe { validate_source_feature(source, array)? };
+        let (kind, layout, pointer) = unsafe { multiarray_storage(array)? };
+        let shape = layout.shape.iter().map(|&size| size as i64).collect();
+        let bytes = unsafe { read_array_storage(pointer, &layout, kind.element_size()) };
+        Ok((shape, bytes))
+    }
+
+    unsafe fn predict_float32_binary(
+        &self,
+        stage: &Stage,
+        binary: &float32_binary::Binary,
+        values: &mut HashMap<String, ReleaseOnDrop>,
+    ) -> Result<(), GraphError> {
+        let (left_shape, left) =
+            unsafe { self.read_float32_binary_input(stage, &binary.left, values)? };
+        let (right_shape, right) =
+            unsafe { self.read_float32_binary_input(stage, &binary.right, values)? };
+        let (shape, result) =
+            float32_binary::evaluate(&left, &left_shape, &right, &right_shape, binary.kind)
+                .map_err(boundary_error)?;
+        unsafe { self.publish_typed_output(&stage.outputs[0], &shape, &result, values) }
+    }
+
+    unsafe fn read_float32_binary_input<'a>(
+        &'a self,
+        stage: &Stage,
+        input: &'a float32_binary::Input,
+        values: &HashMap<String, ReleaseOnDrop>,
+    ) -> Result<(Vec<i64>, std::borrow::Cow<'a, [u8]>), GraphError> {
+        match input {
+            float32_binary::Input::Runtime(name) => {
+                let feature = stage
+                    .inputs
+                    .iter()
+                    .find(|input| &input.name == name)
+                    .ok_or_else(|| {
+                        boundary_error("Float32 binary input lacks a source descriptor")
+                    })?;
+                let (shape, bytes) = unsafe { self.read_typed_input(feature, values)? };
+                Ok((shape, std::borrow::Cow::Owned(bytes)))
+            }
+            float32_binary::Input::Constant(input) => Ok((
+                input.shape.clone(),
+                input.bytes(self.weights.as_deref().map(MappedWeights::bytes))?,
+            )),
+        }
+    }
+
+    unsafe fn publish_typed_output(
+        &self,
+        target: &FeatureDescription,
+        shape: &[i64],
+        result: &[u8],
+        values: &mut HashMap<String, ReleaseOnDrop>,
+    ) -> Result<(), GraphError> {
+        validate_feature_shape(array_type(target)?, shape)?;
+        let output = unsafe { create_multi_array(shape, array_type(target)?.data_type)? };
         let (kind, layout, pointer) = unsafe { multiarray_storage(output)? };
-        unsafe { write_array_storage(pointer, &layout, kind.element_size(), &result)? };
+        unsafe { write_array_storage(pointer, &layout, kind.element_size(), result)? };
         unsafe { validate_source_feature(target, output)? };
         let value: *mut Object =
             msg_send![class!(MLFeatureValue), featureValueWithMultiArray: output];
@@ -1171,7 +1249,7 @@ impl PipelineModel {
                 .is_some()
         {
             return Err(boundary_error(
-                "typed unary stage did not produce a unique owned feature",
+                "typed stage did not produce a unique owned feature",
             ));
         }
         Ok(())

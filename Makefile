@@ -228,6 +228,11 @@ test-coreml-sqrt:
 test-coreml-exp:
 	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_exp_float32 -- $(TEST_FILTER) --test-threads=1
 
+.PHONY: test-coreml-float32-binary
+test-coreml-float32-binary:
+	$(CARGO) test --lib --no-default-features --features $(COREML_FEATURES) -- coreml::float32_binary --test-threads=1
+	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_float32_binary -- $(TEST_FILTER) --test-threads=1
+
 .PHONY: test-coreml-precision
 test-coreml-precision:
 	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_precision_pipeline -- $(TEST_FILTER) --test-threads=1

@@ -1384,6 +1384,32 @@ impl CoremlMlProgramConverter {
                     .is_some_and(|&kind| operation.r#type == kind)
             })
         };
+        let float32_binary_results: HashMap<_, _> = graph
+            .operations
+            .iter()
+            .filter_map(|operation| {
+                let kind = match operation {
+                    Operation::Mul { .. } => "mul",
+                    Operation::Div { .. } => "real_div",
+                    _ => return None,
+                };
+                Some((operation.outputs(), kind))
+            })
+            .flat_map(|(outputs, kind)| outputs.iter().map(move |&id| (id, kind)))
+            .filter(|&(id, _)| {
+                graph
+                    .operand(id)
+                    .is_some_and(|value| value.descriptor.data_type == DataType::Float32)
+            })
+            .map(|(id, kind)| (operand_name(graph, id), kind))
+            .collect();
+        let source_binary = |operation: &MilOperation| {
+            operation.outputs.iter().any(|output| {
+                float32_binary_results
+                    .get(&output.name)
+                    .is_some_and(|&kind| operation.r#type == kind)
+            })
+        };
         let mut constant_operations = constant_closure(&block.operations);
         // A typed unary child can read original floating constants and exact
         // views/casts, but does not evaluate native constexpr operations or
@@ -1408,12 +1434,14 @@ impl CoremlMlProgramConverter {
             }
         }
         for operation in &block.operations {
-            if (operation.r#type == "gelu" || source_unary(operation))
-                && let Some(input) = named_input(operation, "x")
-                && native_constants.contains(input)
-                && let Some(producer) = producers.get(input)
-            {
-                constant_operations.remove(producer);
+            if operation.r#type == "gelu" || source_unary(operation) || source_binary(operation) {
+                for input in inputs(operation) {
+                    if native_constants.contains(&input)
+                        && let Some(producer) = producers.get(&input)
+                    {
+                        constant_operations.remove(producer);
+                    }
+                }
             }
         }
         let mut cuts = BTreeSet::new();
@@ -1482,6 +1510,13 @@ impl CoremlMlProgramConverter {
             // must preserve representable tails within its accuracy budget.
             // Do not alter internal unary operations in other lowerings.
             if source_unary(operation) {
+                cuts.insert(index);
+                cuts.insert(index + 1);
+            }
+            // Tiny Float32 operands can contribute a normal Mul/Div result.
+            // Isolate only actual WebNN binary operations, not similarly named
+            // helper arithmetic inside unrelated native lowerings.
+            if source_binary(operation) {
                 cuts.insert(index);
                 cuts.insert(index + 1);
             }

@@ -1,6 +1,7 @@
-//! Source-proven constant inputs for typed floating-point unary children.
+//! Shared source-proven constant inputs for typed floating-point children.
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use super::*;
 use crate::error::GraphError;
@@ -8,7 +9,7 @@ use crate::protos::coreml::specification::{FeatureDescription, FeatureType};
 
 #[derive(Debug, Clone, PartialEq)]
 enum Storage {
-    Immediate(Vec<u8>),
+    Immediate(Arc<[u8]>),
     Blob {
         offset: u64,
         width: usize,
@@ -20,6 +21,13 @@ enum Storage {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConstantUnary {
     pub kind: Kind,
+    pub input: ConstantInput,
+}
+
+/// A checked floating constant and exact view plan. Cloning this plan shares
+/// immediate storage; blob ranges borrow the Pipeline's existing mapping.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConstantInput {
     storage: Storage,
     pub shape: Vec<i64>,
     transforms: Vec<Transform>,
@@ -35,7 +43,7 @@ enum Transform {
     },
 }
 
-impl ConstantUnary {
+impl ConstantInput {
     pub fn resolve(&mut self, weights: Option<&[u8]>) -> Result<(), GraphError> {
         let Storage::Blob {
             offset,
@@ -46,7 +54,7 @@ impl ConstantUnary {
             return Ok(());
         };
         let invalid = || GraphError::CoremlRuntimeFailed {
-            reason: "typed unary constant does not match its original weight record".into(),
+            reason: "typed floating constant does not match its original weight record".into(),
         };
         let weights = weights.ok_or_else(invalid)?;
         let ranges = crate::converters::weight_ranges(weights)?;
@@ -62,10 +70,10 @@ impl ConstantUnary {
 
     pub fn bytes<'a>(&'a self, weights: Option<&'a [u8]>) -> Result<Cow<'a, [u8]>, GraphError> {
         let invalid = || GraphError::CoremlRuntimeFailed {
-            reason: "typed unary constant does not match its original weight record".into(),
+            reason: "typed floating constant does not match its original weight record".into(),
         };
         let bytes = match &self.storage {
-            Storage::Immediate(bytes) => bytes.as_slice(),
+            Storage::Immediate(bytes) => bytes.as_ref(),
             Storage::Resolved(range) => weights
                 .and_then(|bytes| bytes.get(range.clone()))
                 .ok_or_else(invalid)?,
@@ -205,7 +213,7 @@ fn unary_view(
 }
 
 pub fn classify_constant(model: &Model, source: &[u8]) -> Option<ConstantUnary> {
-    if model.encoded_len() != source.len() || known_wire(source, Schema::Model, 0).is_none() {
+    if !known_source(model, source) {
         return None;
     }
     let model::Type::MlProgram(program) = model.r#type.as_ref()? else {
@@ -240,62 +248,110 @@ pub fn classify_constant(model: &Model, source: &[u8]) -> Option<ConstantUnary> 
         }
     }
     let constant = &block.operations[0];
-    if constant.r#type != "const"
-        || !constant.inputs.is_empty()
-        || !constant.blocks.is_empty()
-        || constant.outputs.len() != 1
-        || constant.attributes.len() != 1
+    let mut constant_input = ConstantInput::parse(constant)?;
+    let mut input = &constant.outputs[0];
+    for operation in &block.operations[1..block.operations.len() - 1] {
+        constant_input = constant_input.view(model, input, operation)?;
+        input = &operation.outputs[0];
+    }
+    let operation = block.operations.last()?;
+    let kind = unary_view(model, input, operation)?;
+    if !matches!(kind, Kind::Gelu | Kind::Sqrt | Kind::Exp) {
+        return None;
+    }
+    let description = model.description.as_ref()?;
+    let output = &operation.outputs[0];
+    if !description.input.is_empty()
+        || description.output.len() != 1
+        || block.outputs[0] != output.name
+        || description.output[0].name != output.name
+        || description.output[0].r#type.as_ref()?.is_optional
     {
         return None;
     }
-    let value = constant.attributes.get("val")?;
-    let input = &constant.outputs[0];
-    if input.name.is_empty() || value.r#type != input.r#type {
+    let output_type = tensor(output.r#type.as_ref()?)?;
+    let array = array(&description.output[0])?;
+    if array.data_type != 65568 || !compatible_shape(output_type, array) {
         return None;
     }
-    let ty = tensor(input.r#type.as_ref()?)?;
-    let dimensions = shape(ty)?;
-    let width: usize = match ty.data_type {
-        10 => 2,
-        11 => 4,
-        _ => return None,
-    };
-    let length = dimensions
-        .iter()
-        .try_fold(width, |size, &extent| size.checked_mul(extent as usize))?;
-    let storage = match value.value.as_ref()? {
-        value::Value::BlobFileValue(blob)
-            if blob.file_name == "@model_path/weights/weights.bin" =>
+    Some(ConstantUnary {
+        kind,
+        input: constant_input,
+    })
+}
+
+impl ConstantInput {
+    pub fn parse(constant: &mil::Operation) -> Option<Self> {
+        if constant.r#type != "const"
+            || !constant.inputs.is_empty()
+            || !constant.blocks.is_empty()
+            || constant.outputs.len() != 1
+            || constant.attributes.len() != 1
         {
-            Storage::Blob {
-                offset: blob.offset,
-                width,
-                length,
-            }
+            return None;
         }
-        value::Value::ImmediateValue(value) => {
-            let value::immediate_value::Value::Tensor(value) = value.value.as_ref()? else {
-                return None;
-            };
-            let bytes = match value.value.as_ref()? {
-                tensor_value::Value::Floats(value) if width == 4 => value
-                    .values
-                    .iter()
-                    .flat_map(|value| value.to_bits().to_ne_bytes())
-                    .collect::<Vec<_>>(),
-                tensor_value::Value::Bytes(value) if width == 2 => value.values.to_vec(),
-                _ => return None,
-            };
-            if bytes.len() != length {
-                return None;
-            }
-            Storage::Immediate(bytes)
+        let value = constant.attributes.get("val")?;
+        let input = &constant.outputs[0];
+        if input.name.is_empty() || value.r#type != input.r#type {
+            return None;
         }
-        _ => return None,
-    };
-    let mut input = input;
-    let mut transforms = Vec::new();
-    for operation in &block.operations[1..block.operations.len() - 1] {
+        let ty = tensor(input.r#type.as_ref()?)?;
+        let dimensions = shape(ty)?;
+        let width: usize = match ty.data_type {
+            10 => 2,
+            11 => 4,
+            _ => return None,
+        };
+        let length = dimensions
+            .iter()
+            .try_fold(width, |size, &extent| size.checked_mul(extent as usize))?;
+        let storage = match value.value.as_ref()? {
+            value::Value::BlobFileValue(blob)
+                if blob.file_name == "@model_path/weights/weights.bin" =>
+            {
+                Storage::Blob {
+                    offset: blob.offset,
+                    width,
+                    length,
+                }
+            }
+            value::Value::ImmediateValue(value) => {
+                let value::immediate_value::Value::Tensor(value) = value.value.as_ref()? else {
+                    return None;
+                };
+                let bytes = match value.value.as_ref()? {
+                    tensor_value::Value::Floats(value) if width == 4 => value
+                        .values
+                        .iter()
+                        .flat_map(|value| value.to_bits().to_ne_bytes())
+                        .collect::<Vec<_>>(),
+                    tensor_value::Value::Bytes(value) if width == 2 => value.values.to_vec(),
+                    _ => return None,
+                };
+                if bytes.len() != length {
+                    return None;
+                }
+                Storage::Immediate(bytes.into())
+            }
+            _ => return None,
+        };
+        Some(Self {
+            storage,
+            shape: if dimensions.is_empty() {
+                vec![1]
+            } else {
+                dimensions
+            },
+            transforms: Vec::new(),
+        })
+    }
+
+    pub fn view(
+        &self,
+        model: &Model,
+        input: &mil::NamedValueType,
+        operation: &mil::Operation,
+    ) -> Option<Self> {
         if operation.outputs.len() != 1
             || !operation.blocks.is_empty()
             || !operation.attributes.is_empty()
@@ -316,12 +372,13 @@ pub fn classify_constant(model: &Model, source: &[u8]) -> Option<ConstantUnary> 
         if elements(&source_shape)? != elements(&target_shape)? {
             return None;
         }
+        let mut result = self.clone();
         match operation.r#type.as_str() {
             "cast" => {
                 let Some(Kind::FloatCast(direction)) = unary_view(model, input, operation) else {
                     return None;
                 };
-                transforms.push(Transform::Cast(direction));
+                result.transforms.push(Transform::Cast(direction));
             }
             "identity" if operation.inputs.len() == 1 && source == target => {}
             "reshape" if operation.inputs.len() == 2 && source.data_type == target.data_type => {
@@ -354,7 +411,7 @@ pub fn classify_constant(model: &Model, source: &[u8]) -> Option<ConstantUnary> 
                     }
                     seen[source_axis] = true;
                 }
-                transforms.push(Transform::Transpose {
+                result.transforms.push(Transform::Transpose {
                     shape: source_shape.iter().map(|&n| n as usize).collect(),
                     permutation,
                     width: if source.data_type == 10 { 2 } else { 4 },
@@ -367,40 +424,13 @@ pub fn classify_constant(model: &Model, source: &[u8]) -> Option<ConstantUnary> 
                     && unit(operation, "y") => {}
             _ => return None,
         }
-        input = output;
+        result.shape = if target_shape.is_empty() {
+            vec![1]
+        } else {
+            target_shape
+        };
+        Some(result)
     }
-    let operation = block.operations.last()?;
-    let kind = unary_view(model, input, operation)?;
-    if !matches!(kind, Kind::Gelu | Kind::Sqrt | Kind::Exp) {
-        return None;
-    }
-    let description = model.description.as_ref()?;
-    let output = &operation.outputs[0];
-    if !description.input.is_empty()
-        || description.output.len() != 1
-        || block.outputs[0] != output.name
-        || description.output[0].name != output.name
-        || description.output[0].r#type.as_ref()?.is_optional
-    {
-        return None;
-    }
-    let output_type = tensor(output.r#type.as_ref()?)?;
-    let array = array(&description.output[0])?;
-    if array.data_type != 65568 || !compatible_shape(output_type, array) {
-        return None;
-    }
-    let dimensions = shape(tensor(input.r#type.as_ref()?)?)?;
-    let shape = if dimensions.is_empty() {
-        vec![1]
-    } else {
-        dimensions
-    };
-    Some(ConstantUnary {
-        kind,
-        storage,
-        shape,
-        transforms,
-    })
 }
 
 fn named_input<'a>(operation: &'a mil::Operation, name: &str) -> Option<&'a str> {
@@ -455,6 +485,25 @@ mod tests {
     use crate::converters::WeightFileBuilder;
 
     #[test]
+    fn constant_plan_clones_share_immediate_storage() {
+        let source = ConstantInput {
+            storage: Storage::Immediate(vec![0_u8; 5 * 1024 * 1024].into()),
+            shape: vec![5 * 1024 * 1024 / 4],
+            transforms: vec![],
+        };
+        let clone = source.clone();
+        let (Storage::Immediate(left), Storage::Immediate(right)) =
+            (&source.storage, &clone.storage)
+        else {
+            unreachable!()
+        };
+        assert!(Arc::ptr_eq(left, right));
+        assert!(matches!(clone.bytes(None).unwrap(), Cow::Borrowed(_)));
+        drop(source);
+        assert_eq!(clone.bytes(None).unwrap().len(), 5 * 1024 * 1024);
+    }
+
+    #[test]
     fn constant_shapes_do_not_truncate_at_the_arm64_32_storage_boundary() {
         // Exercise the 32-bit limit even when this test runs on a 64-bit Mac.
         let limit = u64::from(u32::MAX);
@@ -493,8 +542,7 @@ mod tests {
         let mut builder = WeightFileBuilder::new();
         let offset = builder.add_weight(0, 2, &payload).unwrap();
         let weights = builder.finalize();
-        let source = ConstantUnary {
-            kind: Kind::Gelu,
+        let source = ConstantInput {
             storage: Storage::Blob {
                 offset,
                 width: 4,
