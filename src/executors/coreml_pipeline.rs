@@ -1367,6 +1367,198 @@ mod tests {
     use super::*;
     use crate::protos::coreml::specification::{FeatureType, Pipeline};
 
+    // This composes the mapped-constant and exact-contraction repairs: separate
+    // tests cannot establish that a fanout keeps the same original weight owner.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn exact_matmul_and_constant_copy_fanout_share_the_original_mapping() {
+        use crate::converters::{CoremlMlProgramConverter, GraphConverter};
+        use crate::graph::{ConstantData, GraphInfo, Operand, OperandKind};
+        use crate::operators::Operation;
+
+        let operand = |name: &str, kind, shape: &[u32]| Operand {
+            name: Some(name.into()),
+            kind,
+            descriptor: OperandDescriptor {
+                data_type: DataType::Float32,
+                shape: shape.iter().copied().map(Dimension::Static).collect(),
+                pending_permutation: vec![],
+            },
+        };
+        let mut right_bits = [1_u32, 0x8000_0000, 0x3f80_0001, 0xbf80_0001].repeat(768);
+        right_bits[..12].copy_from_slice(&[
+            0x4b80_0000,
+            0xcb80_0000,
+            0x4b80_0000,
+            0xcb80_0000,
+            0x3f80_0000,
+            0xbf80_0000,
+            0x4000_0000,
+            0xc000_0000,
+            0xcb80_0000,
+            0x4b80_0000,
+            0xcb80_0000,
+            0x4b80_0000,
+        ]);
+        let expected_copy = right_bits
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let mut graph = GraphInfo {
+            operands: vec![
+                operand("left", OperandKind::Input, &[1, 768]),
+                operand("original right", OperandKind::Constant, &[768, 4]),
+                operand("projection", OperandKind::Output, &[1, 4]),
+                operand("first copy", OperandKind::Output, &[768, 4]),
+                operand("second copy", OperandKind::Output, &[768, 4]),
+            ],
+            input_operands: vec![0],
+            output_operands: vec![2, 3, 4],
+            operations: vec![
+                Operation::Matmul {
+                    a: 0,
+                    b: 1,
+                    outputs: vec![2],
+                    options: None,
+                },
+                Operation::Identity {
+                    input: 1,
+                    outputs: vec![3],
+                    options: None,
+                },
+                Operation::Identity {
+                    input: 3,
+                    outputs: vec![4],
+                    options: None,
+                },
+            ],
+            ..Default::default()
+        };
+        graph.constant_operand_ids_to_handles.insert(
+            1,
+            ConstantData {
+                data: expected_copy.clone(),
+                label: None,
+            },
+        );
+        let input_descriptor = graph.operands[0].descriptor.clone();
+        let outputs = graph
+            .output_operands
+            .iter()
+            .map(|&id| {
+                let operand = &graph.operands[id as usize];
+                (operand.name.clone().unwrap(), operand.descriptor.clone())
+            })
+            .collect::<HashMap<_, _>>();
+        let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+        drop(graph);
+        let mut left = vec![0_f32; 768];
+        left[..3].fill(1.0);
+        let left_bytes = left
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let inputs = HashMap::from([(
+            "left".into(),
+            CoremlByteInput {
+                data: &left_bytes,
+                descriptor: &input_descriptor,
+            },
+        )]);
+        // These exact dyadic sums are 2^24 + {1,2} - 2^24, with both signs.
+        let expected_projection = [1_f32, -1.0, 2.0, -2.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let weak = autoreleasepool(|| {
+            let model = compile_model(
+                converted.data,
+                converted.weights_data,
+                DeviceType::Cpu,
+                false,
+            )
+            .unwrap();
+            let CompiledCoremlModel::Pipeline(pipeline) = &model else {
+                panic!("exact Matmul with constant fanout must remain a Pipeline")
+            };
+            let mapping = pipeline.weights.as_ref().unwrap();
+            let weak = Rc::downgrade(mapping);
+            let matrices = pipeline
+                .plan
+                .stages
+                .iter()
+                .filter_map(|stage| {
+                    if let StageExecution::ExactMatmul(plan) = &stage.execution {
+                        Some(plan)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(matrices.len(), 1);
+            let matmul::Source::Blob {
+                metadata_offset, ..
+            } = &matrices[0].right.source
+            else {
+                panic!("exact Matmul must retain the original RHS source blob")
+            };
+            let ranges = crate::converters::weight_ranges(mapping.bytes()).unwrap();
+            assert_eq!(
+                ranges.len(),
+                1,
+                "fanout must not duplicate the original weight record"
+            );
+            let source_span = ranges[&(*metadata_offset as u64)].clone();
+            let (right, shape, _) = matrices[0].right.constant(Some(mapping.bytes())).unwrap();
+            assert_eq!(shape, [768, 4]);
+            assert_eq!(
+                right.as_ptr().cast::<u8>(),
+                mapping.bytes()[source_span.clone()].as_ptr()
+            );
+            assert_eq!(pipeline.plan.aliases.constant_copies.len(), 2);
+            for copy in pipeline.plan.aliases.constant_copies.values() {
+                let CoremlWeightStorage::Mapped(owner) = &copy.bytes.storage else {
+                    panic!("constant copies must share the original mapped owner")
+                };
+                assert!(Rc::ptr_eq(mapping, owner));
+                assert_eq!(copy.bytes.range, source_span);
+                assert_eq!(&*copy.bytes, expected_copy);
+            }
+            let mut invalid = outputs.clone();
+            invalid.get_mut("second copy").unwrap().data_type = DataType::Int32;
+            let reject = || {
+                let error = run_coreml_bytes(&model, &inputs, &invalid)
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    error.contains(
+                        "proven constant output `second copy` has inconsistent descriptors or bytes"
+                    ),
+                    "{error}"
+                );
+            };
+            reject();
+            for _ in 0..2 {
+                let mut result = run_coreml_bytes(&model, &inputs, &outputs).unwrap();
+                assert_eq!(result["projection"], expected_projection);
+                assert_eq!(result["first copy"], expected_copy);
+                assert_eq!(result["second copy"], expected_copy);
+                result.get_mut("first copy").unwrap()[0] ^= 0xff;
+                assert_eq!(result["second copy"], expected_copy);
+                reject();
+            }
+            assert_eq!(
+                run_coreml_bytes(&model, &inputs, &outputs).unwrap()["projection"],
+                expected_projection
+            );
+            weak
+        });
+        assert!(
+            weak.upgrade().is_none(),
+            "mapping must not outlive the model"
+        );
+    }
+
     fn feature(name: &str) -> FeatureDescription {
         FeatureDescription {
             name: name.into(),
