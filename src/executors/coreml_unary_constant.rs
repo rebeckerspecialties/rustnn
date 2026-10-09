@@ -1,4 +1,4 @@
-//! Source-proven constant inputs for typed GELU children.
+//! Source-proven constant inputs for typed floating-point unary children.
 
 use std::borrow::Cow;
 
@@ -19,6 +19,7 @@ enum Storage {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConstantUnary {
+    pub kind: Kind,
     storage: Storage,
     pub shape: Vec<i64>,
     transforms: Vec<Transform>,
@@ -45,7 +46,7 @@ impl ConstantUnary {
             return Ok(());
         };
         let invalid = || GraphError::CoremlRuntimeFailed {
-            reason: "typed GELU constant does not match its original weight record".into(),
+            reason: "typed unary constant does not match its original weight record".into(),
         };
         let weights = weights.ok_or_else(invalid)?;
         let ranges = crate::converters::weight_ranges(weights)?;
@@ -61,7 +62,7 @@ impl ConstantUnary {
 
     pub fn bytes<'a>(&'a self, weights: Option<&'a [u8]>) -> Result<Cow<'a, [u8]>, GraphError> {
         let invalid = || GraphError::CoremlRuntimeFailed {
-            reason: "typed GELU constant does not match its original weight record".into(),
+            reason: "typed unary constant does not match its original weight record".into(),
         };
         let bytes = match &self.storage {
             Storage::Immediate(bytes) => bytes.as_slice(),
@@ -369,7 +370,8 @@ pub fn classify_constant(model: &Model, source: &[u8]) -> Option<ConstantUnary> 
         input = output;
     }
     let operation = block.operations.last()?;
-    if unary_view(model, input, operation) != Some(Kind::Gelu) {
+    let kind = unary_view(model, input, operation)?;
+    if !matches!(kind, Kind::Gelu | Kind::Sqrt) {
         return None;
     }
     let description = model.description.as_ref()?;
@@ -394,6 +396,7 @@ pub fn classify_constant(model: &Model, source: &[u8]) -> Option<ConstantUnary> 
         dimensions
     };
     Some(ConstantUnary {
+        kind,
         storage,
         shape,
         transforms,
@@ -491,6 +494,7 @@ mod tests {
         let offset = builder.add_weight(0, 2, &payload).unwrap();
         let weights = builder.finalize();
         let source = ConstantUnary {
+            kind: Kind::Gelu,
             storage: Storage::Blob {
                 offset,
                 width: 4,

@@ -220,6 +220,10 @@ test-coreml-scalar-binary:
 test-coreml-gelu:
 	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_gelu --test test_coreml_gelu_precision --test test_coreml_gelu_float32 -- $(TEST_FILTER) --test-threads=1
 
+.PHONY: test-coreml-sqrt
+test-coreml-sqrt:
+	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_sqrt_float32 -- $(TEST_FILTER) --test-threads=1
+
 .PHONY: test-coreml-precision
 test-coreml-precision:
 	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_precision_pipeline -- $(TEST_FILTER) --test-threads=1
