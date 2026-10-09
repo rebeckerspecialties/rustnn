@@ -42,6 +42,7 @@ enum StageExecution {
     TypedUnary(typed_unary::Kind),
     ConstantGelu(Box<typed_unary::ConstantUnary>),
     Int32Binary(Box<int32_binary::Binary>),
+    Int32Arg(Box<int32_arg::Reduction>),
     Int32Identity,
 }
 
@@ -52,6 +53,8 @@ fn execution(model: &Model, wire: &[u8]) -> StageExecution {
         StageExecution::ConstantGelu(Box::new(constant))
     } else if let Some(division) = int32_binary::classify(model, wire) {
         StageExecution::Int32Binary(Box::new(division))
+    } else if let Some(reduction) = int32_arg::classify(model, wire) {
+        StageExecution::Int32Arg(Box::new(reduction))
     } else if int32_identity::classify(model, wire) {
         StageExecution::Int32Identity
     } else {
@@ -1035,6 +1038,13 @@ impl PipelineModel {
                     }
                     return Ok(());
                 }
+                if let StageExecution::Int32Arg(reduction) = &stage.execution {
+                    self.predict_int32_arg(stage, reduction, &mut values)?;
+                    for name in &stage.release_after {
+                        values.remove(name);
+                    }
+                    return Ok(());
+                }
                 let model = self.load_child(index)?;
                 let dictionary: *mut Object = msg_send![class!(NSMutableDictionary), dictionary];
                 let description: *mut Object = msg_send![model, modelDescription];
@@ -1178,53 +1188,80 @@ impl PipelineModel {
         Ok(())
     }
 
+    fn read_int32_input<'a>(
+        &self,
+        stage: &Stage,
+        input: &'a int32_binary::Input,
+        values: &HashMap<String, ReleaseOnDrop>,
+    ) -> Result<(Vec<usize>, std::borrow::Cow<'a, [u8]>), GraphError> {
+        match input {
+            int32_binary::Input::Constant { bytes, shape } => {
+                Ok((shape.clone(), std::borrow::Cow::Borrowed(bytes)))
+            }
+            int32_binary::Input::Runtime(name) => {
+                let source = stage
+                    .inputs
+                    .iter()
+                    .find(|input| input.name == *name)
+                    .ok_or_else(|| boundary_error("integer stage lacks source description"))?;
+                let feature = values.get(name).ok_or_else(|| {
+                    boundary_error(format!("integer stage lacks source `{name}`"))
+                })?;
+                let array: *mut Object = unsafe { msg_send![feature.0, multiArrayValue] };
+                unsafe { validate_source_feature(source, array)? };
+                let (kind, layout, pointer) = unsafe { multiarray_storage(array)? };
+                let bytes = unsafe { read_array_storage(pointer, &layout, kind.element_size()) };
+                Ok((layout.shape, std::borrow::Cow::Owned(bytes)))
+            }
+        }
+    }
     unsafe fn predict_int32_binary(
         &self,
         stage: &Stage,
         binary: &int32_binary::Binary,
         values: &mut HashMap<String, ReleaseOnDrop>,
     ) -> Result<(), GraphError> {
-        fn read<'a>(
-            stage: &Stage,
-            input: &'a int32_binary::Input,
-            values: &HashMap<String, ReleaseOnDrop>,
-        ) -> Result<(Vec<usize>, std::borrow::Cow<'a, [u8]>), GraphError> {
-            match input {
-                int32_binary::Input::Constant { bytes, shape } => {
-                    Ok((shape.clone(), std::borrow::Cow::Borrowed(bytes)))
-                }
-                int32_binary::Input::Runtime(name) => {
-                    let source = stage
-                        .inputs
-                        .iter()
-                        .find(|input| input.name == *name)
-                        .ok_or_else(|| boundary_error("integer binary lacks source description"))?;
-                    let feature = values.get(name).ok_or_else(|| {
-                        boundary_error(format!("integer binary lacks source `{name}`"))
-                    })?;
-                    let array: *mut Object = unsafe { msg_send![feature.0, multiArrayValue] };
-                    unsafe { validate_source_feature(source, array)? };
-                    let (kind, layout, pointer) = unsafe { multiarray_storage(array)? };
-                    let bytes =
-                        unsafe { read_array_storage(pointer, &layout, kind.element_size()) };
-                    Ok((layout.shape, std::borrow::Cow::Owned(bytes)))
-                }
-            }
-        }
-        let (left_shape, left) = read(stage, &binary.left, values)?;
-        let (right_shape, right) = read(stage, &binary.right, values)?;
+        let (left_shape, left) = self.read_int32_input(stage, &binary.left, values)?;
+        let (right_shape, right) = self.read_int32_input(stage, &binary.right, values)?;
         // Evaluate privately: zero/overflow errors must not publish a partial output.
         let (shape, result) =
             int32_binary::evaluate(binary.kind, &left, &left_shape, &right, &right_shape)
                 .map_err(boundary_error)?;
+        unsafe { self.publish_int32_output(stage, shape, &result, values) }
+    }
+
+    unsafe fn predict_int32_arg(
+        &self,
+        stage: &Stage,
+        reduction: &int32_arg::Reduction,
+        values: &mut HashMap<String, ReleaseOnDrop>,
+    ) -> Result<(), GraphError> {
+        let (shape, input) = self.read_int32_input(stage, &reduction.input, values)?;
+        let (shape, result) = int32_arg::evaluate(
+            &input,
+            &shape,
+            reduction.axis,
+            reduction.keep_dimensions,
+            reduction.maximum,
+        )
+        .map_err(boundary_error)?;
+        unsafe { self.publish_int32_output(stage, shape, &result, values) }
+    }
+
+    unsafe fn publish_int32_output(
+        &self,
+        stage: &Stage,
+        shape: Vec<usize>,
+        result: &[u8],
+        values: &mut HashMap<String, ReleaseOnDrop>,
+    ) -> Result<(), GraphError> {
         let actual_shape: Vec<i64> = if shape.is_empty() {
             vec![1]
         } else {
             shape
                 .into_iter()
                 .map(|n| {
-                    i64::try_from(n)
-                        .map_err(|_| boundary_error("integer binary extent exceeds i64"))
+                    i64::try_from(n).map_err(|_| boundary_error("integer stage extent exceeds i64"))
                 })
                 .collect::<Result<_, _>>()?
         };
@@ -1232,7 +1269,7 @@ impl PipelineModel {
         validate_feature_shape(array_type(target)?, &actual_shape)?;
         let output = unsafe { create_multi_array(&actual_shape, array_type(target)?.data_type)? };
         let (kind, layout, pointer) = unsafe { multiarray_storage(output)? };
-        unsafe { write_array_storage(pointer, &layout, kind.element_size(), &result)? };
+        unsafe { write_array_storage(pointer, &layout, kind.element_size(), result)? };
         unsafe { validate_source_feature(target, output)? };
         let value: *mut Object =
             msg_send![class!(MLFeatureValue), featureValueWithMultiArray: output];
@@ -1243,7 +1280,7 @@ impl PipelineModel {
                 .is_some()
         {
             return Err(boundary_error(
-                "integer binary did not produce a unique owned feature",
+                "integer stage did not produce a unique owned feature",
             ));
         }
         Ok(())

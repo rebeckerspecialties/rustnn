@@ -31,7 +31,7 @@ pub(super) enum Kind {
     Maximum,
 }
 
-fn named<'a>(operation: &'a mil::Operation, key: &str) -> Option<&'a str> {
+pub(super) fn named<'a>(operation: &'a mil::Operation, key: &str) -> Option<&'a str> {
     let [binding] = operation.inputs.get(key)?.arguments.as_slice() else {
         return None;
     };
@@ -41,7 +41,7 @@ fn named<'a>(operation: &'a mil::Operation, key: &str) -> Option<&'a str> {
     }
 }
 
-fn immediate<'a>(operation: &'a mil::Operation, key: &str) -> Option<&'a mil::Value> {
+pub(super) fn immediate<'a>(operation: &'a mil::Operation, key: &str) -> Option<&'a mil::Value> {
     let [binding] = operation.inputs.get(key)?.arguments.as_slice() else {
         return None;
     };
@@ -51,7 +51,7 @@ fn immediate<'a>(operation: &'a mil::Operation, key: &str) -> Option<&'a mil::Va
     }
 }
 
-fn ints(value: &mil::Value) -> Option<&[i32]> {
+pub(super) fn ints(value: &mil::Value) -> Option<&[i32]> {
     let ty = tensor(value.r#type.as_ref()?)?;
     let shape = static_shape(ty)?;
     let value::Value::ImmediateValue(value) = value.value.as_ref()? else {
@@ -97,7 +97,7 @@ fn elements(shape: &[usize]) -> Option<usize> {
         .filter(|&n| n <= usize::MAX / 4)
 }
 
-fn storage_fits(array: &ArrayFeatureType, max_bytes: u64) -> bool {
+pub(super) fn storage_fits(array: &ArrayFeatureType, max_bytes: u64) -> bool {
     let fits = |shape: &[i64]| {
         !shape.is_empty()
             && shape
@@ -178,7 +178,11 @@ fn transpose(
     Some(result)
 }
 
-fn output(operation: &mil::Operation, kind: &str, keys: &[&str]) -> Option<mil::NamedValueType> {
+pub(super) fn output(
+    operation: &mil::Operation,
+    kind: &str,
+    keys: &[&str],
+) -> Option<mil::NamedValueType> {
     if operation.r#type != kind
         || !operation.blocks.is_empty()
         || !operation.attributes.is_empty()
@@ -257,43 +261,15 @@ fn broadcast(left: &mil::TensorType, right: &mil::TensorType) -> Option<Vec<mil:
     Some(result)
 }
 
-/// Accept only a complete known-wire binary program and its exact Int32 views.
-/// Division requires the full quotient/remainder correction, never a bare
-/// floor_div. Min/Max require typed signed selection, not arbitrary arithmetic.
-pub(super) fn classify(model: &Model, source: &[u8]) -> Option<Binary> {
-    if !known_source(model, source) {
-        return None;
-    }
-    let model::Type::MlProgram(program) = model.r#type.as_ref()? else {
-        return None;
-    };
-    if program.version != 1 || program.functions.len() != 1 || !program.attributes.is_empty() {
-        return None;
-    }
-    let function = program.functions.get("main")?;
-    if function.opset != "CoreML7"
-        || function.block_specializations.len() != 1
-        || !function.attributes.is_empty()
-        || function.inputs.len() > 2
-    {
-        return None;
-    }
-    let block = function.block_specializations.get(&function.opset)?;
-    let (kind, tail_length) = match block.operations.last()?.r#type.as_str() {
-        "minimum" => (Kind::Minimum, 1),
-        "maximum" => (Kind::Maximum, 1),
-        "add" => (Kind::Divide, 7),
-        _ => return None,
-    };
-    if !block.inputs.is_empty()
-        || !block.attributes.is_empty()
-        || block.outputs.len() != 1
-        || block.operations.len() < tail_length
-    {
-        return None;
-    }
-    let description = model.description.as_ref()?;
-    if description.input.len() != function.inputs.len() || description.output.len() != 1 {
+pub(super) type ProvenInputs = HashMap<String, (mil::NamedValueType, Input)>;
+
+/// Prove the exact Int32 input/constant-view closure shared by integer stages.
+pub(super) fn proven_inputs(
+    function: &mil::Function,
+    description: &crate::protos::coreml::specification::ModelDescription,
+    prefix: &[mil::Operation],
+) -> Option<ProvenInputs> {
+    if description.input.len() != function.inputs.len() {
         return None;
     }
     let mut values = HashMap::new();
@@ -318,9 +294,6 @@ pub(super) fn classify(model: &Model, source: &[u8]) -> Option<Binary> {
             return None;
         }
     }
-    let (prefix, tail) = block
-        .operations
-        .split_at(block.operations.len() - tail_length);
     for operation in prefix {
         if !operation.blocks.is_empty() || operation.outputs.len() != 1 {
             return None;
@@ -406,6 +379,52 @@ pub(super) fn classify(model: &Model, source: &[u8]) -> Option<Binary> {
             return None;
         }
     }
+    Some(values)
+}
+
+/// Accept only a complete known-wire binary program and its exact Int32 views.
+/// Division requires the full quotient/remainder correction, never a bare
+/// floor_div. Min/Max require typed signed selection, not arbitrary arithmetic.
+pub(super) fn classify(model: &Model, source: &[u8]) -> Option<Binary> {
+    if !known_source(model, source) {
+        return None;
+    }
+    let model::Type::MlProgram(program) = model.r#type.as_ref()? else {
+        return None;
+    };
+    if program.version != 1 || program.functions.len() != 1 || !program.attributes.is_empty() {
+        return None;
+    }
+    let function = program.functions.get("main")?;
+    if function.opset != "CoreML7"
+        || function.block_specializations.len() != 1
+        || !function.attributes.is_empty()
+        || function.inputs.len() > 2
+    {
+        return None;
+    }
+    let block = function.block_specializations.get(&function.opset)?;
+    let (kind, tail_length) = match block.operations.last()?.r#type.as_str() {
+        "minimum" => (Kind::Minimum, 1),
+        "maximum" => (Kind::Maximum, 1),
+        "add" => (Kind::Divide, 7),
+        _ => return None,
+    };
+    if !block.inputs.is_empty()
+        || !block.attributes.is_empty()
+        || block.outputs.len() != 1
+        || block.operations.len() < tail_length
+    {
+        return None;
+    }
+    let description = model.description.as_ref()?;
+    if description.input.len() != function.inputs.len() || description.output.len() != 1 {
+        return None;
+    }
+    let (prefix, tail) = block
+        .operations
+        .split_at(block.operations.len() - tail_length);
+    let values = proven_inputs(function, description, prefix)?;
     let left_name = named(&tail[0], "x")?;
     let right_name = named(&tail[0], "y")?;
     let nodes = if kind == Kind::Divide {

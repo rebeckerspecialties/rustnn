@@ -22,6 +22,7 @@
   The full `make test-coreml` suite also covers exact signed Int32 division; use
   `make test-coreml-integer-division` for its focused lowering and runtime regressions;
   `make test-coreml-int32-selection` covers full-range Min/Max and their typed storage paths.
+  `make test-coreml-int32-arg-selection` covers full-range ArgMin/ArgMax, axes and index outputs.
   `make test-coreml-gelu` covers exact GELU precision, shapes, and compositions under
   both feature configurations, including all FP16 encodings under CPU/GPU/NPU requests
   and Float32 negative tails through the context's three tensor-storage modes.
