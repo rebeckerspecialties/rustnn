@@ -140,6 +140,23 @@ Rules that hold for every converter:
   or compacts only the required ranges, then supplies independently owned results. Standalone
   compiled models require the original weights sidecar. The valid native graph still
   runs; arithmetic-derived outputs are not reconstructed from inputs or constants.
+- Float16 `gelu` widens to float32 for MIL `gelu(mode="EXACT")`, then rounds back to
+  float16. Native float16 GELU can exceed WebNN's error bound under accelerator-enabled
+  policies. This preserves the public dtype and shape without forcing CPU execution;
+  float32 GELU is unchanged. Deferred layout transposes are emitted after the final cast.
+  Arithmetic and typed boundaries compile locally from a URL while retaining the requested
+  compute policy. Only input-free single programs made entirely of proven constant copies
+  prefer an in-memory asset, avoiding a BNNS URL constant-fold crash without changing the
+  arithmetic loading path.
+- Typed precision boundaries use native Pipeline children when CoreML can eliminate a
+  real Half narrowing or fuse a widened kernel back into Half arithmetic. Child interfaces
+  carry live results only; constants are rematerialized from the shared weight blob rather
+  than carried through every stage. Public descriptors and the backend-independent graph
+  remain unchanged. Private scalar and Boolean interfaces use explicit rank/type adapters.
+- Affected Half widening layouts use compact private features. Original high-rank inputs
+  declare `rustnn.webnn.compact_input_views`; contiguous storage is viewed with its owner
+  retained, while padded storage is copied as raw Half bytes. Dynamic restoration uses
+  the actual input shape and retains its declared bounds, not maximum-size substitution.
 - The internal `shape` extension lowers to MIL `shape`, retaining its native int32 result
   inside CoreML and widening the public int64 result at readback. Imported shape tensors
   retain their type and rank through the shared `unsqueeze` inference path.
