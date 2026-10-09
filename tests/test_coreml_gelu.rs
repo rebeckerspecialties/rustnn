@@ -255,10 +255,7 @@ fn gelu_float16_lowering_preserves_half_boundaries_and_float32_evaluation() {
 
     let converted = CoremlMlProgramConverter.convert(&graph()).unwrap();
     let model = specification::Model::decode(converted.data.as_slice()).unwrap();
-    let specification::model::Type::MlProgram(program) = model.r#type.unwrap() else {
-        panic!("expected MLProgram");
-    };
-    let block = &program.functions["main"].block_specializations["CoreML7"];
+    let block = gelu_pipeline_block(model);
     assert_eq!(
         block
             .operations
@@ -377,10 +374,7 @@ fn gelu_float16_temporaries_do_not_shadow_graph_names() {
     }
     let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
     let model = specification::Model::decode(converted.data.as_slice()).unwrap();
-    let specification::model::Type::MlProgram(program) = model.r#type.unwrap() else {
-        panic!("expected MLProgram");
-    };
-    let block = &program.functions["main"].block_specializations["CoreML7"];
+    let block = gelu_pipeline_block(model);
     assert_eq!(
         block.operations[0].outputs[0].name,
         "result_gelu_input_fp32_1_2"
@@ -390,4 +384,29 @@ fn gelu_float16_temporaries_do_not_shadow_graph_names() {
         "result_gelu_result_fp32_1_1"
     );
     assert_eq!(block.outputs, ["result"]);
+}
+
+fn gelu_pipeline_block(
+    model: rustnn::protos::coreml::specification::Model,
+) -> rustnn::protos::coreml::mil_spec::Block {
+    use rustnn::protos::coreml::{mil_spec, specification};
+    let specification::model::Type::Pipeline(pipeline) = model.r#type.unwrap() else {
+        panic!("expected precision Pipeline");
+    };
+    assert_eq!(
+        pipeline.models.len(),
+        3,
+        "separate widen, GELU, and narrow stages"
+    );
+    let mut combined = mil_spec::Block::default();
+    for child in pipeline.models {
+        let specification::model::Type::MlProgram(program) = child.r#type.unwrap() else {
+            panic!("expected MLProgram child");
+        };
+        let block = &program.functions["main"].block_specializations["CoreML7"];
+        assert_eq!(block.operations.len(), 1);
+        combined.operations.extend(block.operations.iter().cloned());
+        combined.outputs = block.outputs.clone();
+    }
+    combined
 }

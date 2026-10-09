@@ -142,8 +142,9 @@ Rules that hold for every converter:
   runs; arithmetic-derived outputs are not reconstructed from inputs or constants.
 - Float16 `gelu` widens to float32 for MIL `gelu(mode="EXACT")`, then rounds back to
   float16. Native float16 GELU can exceed WebNN's error bound under accelerator-enabled
-  policies. This preserves the public dtype and shape without forcing CPU execution;
-  float32 GELU is unchanged. Deferred layout transposes are emitted after the final cast.
+  policies. Deferred layout transposes are emitted after the final cast. Float32 EXACT
+  GELU is isolated as a typed stage, including when nested in a larger graph: native
+  Float32 kernels can lose its negative tail through cancellation in `1 + erf(x)`.
   Arithmetic and typed boundaries compile locally from a URL while retaining the requested
   compute policy. Only input-free single programs made entirely of proven constant copies
   prefer an in-memory asset, avoiding a BNNS URL constant-fold crash without changing the
@@ -155,7 +156,14 @@ Rules that hold for every converter:
   remain unchanged. Private scalar and Boolean interfaces use explicit rank/type adapters.
   The bounded executor retains original child bytes and typed outputs until their last
   consumer, with one loaded native child and shared source weights. Complete known-wire
-  float Cast children use exact host narrowing/widening; arithmetic children remain native.
+  float Cast children use exact host narrowing/widening. Source-proven Float32 EXACT
+  GELU uses a host binary64 complementary-error-function evaluation with integer
+  Float32 input/output conversion, preserving subnormal rounding independently of the
+  thread's flush mode. Other arithmetic children remain native. Constant GELU inputs
+  retain checked original weight ranges; supported constant views are applied as bit
+  transport, not native arithmetic or a second serialized weight payload. Native constexpr
+  and arithmetic producers are materialized before GELU. These typed stages are installed
+  by RustNN's CoreML executor, not by loading an exported model directly with `MLModel`.
 - Affected Half widening layouts use compact private features. Original high-rank inputs
   declare `rustnn.webnn.compact_input_views`; contiguous storage is viewed with its owner
   retained, while padded storage is copied as raw Half bytes. Dynamic restoration uses

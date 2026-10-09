@@ -44,10 +44,24 @@ fn block(graph: &GraphInfo) -> mil_spec::Block {
     let model = specification::Model::decode(converted.data.as_slice()).unwrap();
     // Precision promotion must not raise the existing platform requirement.
     assert_eq!(model.specification_version, 9);
-    let specification::model::Type::MlProgram(program) = model.r#type.unwrap() else {
-        panic!("expected MLProgram");
-    };
-    program.functions["main"].block_specializations["CoreML7"].clone()
+    match model.r#type.unwrap() {
+        specification::model::Type::MlProgram(program) => {
+            program.functions["main"].block_specializations["CoreML7"].clone()
+        }
+        specification::model::Type::Pipeline(pipeline) => {
+            let mut combined = mil_spec::Block::default();
+            for child in pipeline.models {
+                let specification::model::Type::MlProgram(program) = child.r#type.unwrap() else {
+                    panic!("expected MLProgram child");
+                };
+                let block = &program.functions["main"].block_specializations["CoreML7"];
+                combined.operations.extend(block.operations.iter().cloned());
+                combined.outputs = block.outputs.clone();
+            }
+            combined
+        }
+        _ => panic!("expected MLProgram or precision Pipeline"),
+    }
 }
 
 fn tensor_type(value: &mil_spec::NamedValueType) -> &mil_spec::TensorType {
@@ -60,7 +74,7 @@ fn tensor_type(value: &mil_spec::NamedValueType) -> &mil_spec::TensorType {
 }
 
 #[test]
-fn gelu_float32_keeps_native_evaluation_without_boundary_casts() {
+fn gelu_float32_preserves_exact_unary_source_without_boundary_casts() {
     let block = block(&graph(DataType::Float32, vec![Dimension::Static(11)]));
     assert_eq!(block.operations.len(), 1);
     assert_eq!(block.operations[0].r#type, "gelu");
