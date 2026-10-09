@@ -211,10 +211,12 @@ test-coreml-gather:
 test-coreml-dtypes:
 	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_dtypes -- $(TEST_FILTER) --test-threads=1
 
-.PHONY: test-coreml-scalar-binary
-test-coreml-scalar-binary:
-	$(CARGO) test --lib --no-default-features --features $(COREML_FEATURES) -- scalar_binary --test-threads=1
-	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_scalar_binary -- $(TEST_FILTER) --test-threads=1
+.PHONY: test-coreml-scalar-binary test-coreml-scalar-shapes
+test-coreml-scalar-binary: test-coreml-scalar-shapes
+
+test-coreml-scalar-shapes:
+	$(CARGO) test --lib --no-default-features --features $(COREML_FEATURES) -- scalar_inputs --test-threads=1
+	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_scalar_binary --test test_coreml_scalar_unary -- $(TEST_FILTER) --test-threads=1
 
 .PHONY: test-coreml-gelu
 test-coreml-gelu:

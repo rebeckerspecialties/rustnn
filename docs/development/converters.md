@@ -112,6 +112,10 @@ Rules that hold for every converter:
   an axis-specific squeeze removes only the indexed dimension afterward. This avoids native
   scalar-index gather failures while retaining dynamic extents and unrelated singleton axes.
   A scalar result keeps the `[1]` CoreML boundary representation without changing the WebNN rank.
+- Scalar constants retain their rank-zero representation for operator parameters. Unary
+  elementwise tensor consumers and all-scalar binary consumers use a shared, consumer-local
+  `[1]` view when required by the native tensor output. Other parameter consumers keep the
+  original scalar. This rule applies to standalone exported models as well as Rust dispatch.
 - Float16 weights go to the weight blob written by `weight_file_builder.rs` and returned as
   `weights_data`.
 - WebNN names need not be MIL identifiers, and its input/output namespaces are independent.
