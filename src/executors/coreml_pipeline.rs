@@ -1975,9 +1975,13 @@ mod tests {
             typed_unary::Kind::FloatCast(typed_unary::Direction::Narrow),
             typed_unary::Kind::Gelu,
             typed_unary::Kind::Sqrt,
+            typed_unary::Kind::Exp,
         ] {
             let mut graph = cast_graph(vec![Dimension::Static(6)]);
-            if matches!(operation, typed_unary::Kind::Gelu | typed_unary::Kind::Sqrt) {
+            if matches!(
+                operation,
+                typed_unary::Kind::Gelu | typed_unary::Kind::Sqrt | typed_unary::Kind::Exp
+            ) {
                 graph.operands.truncate(2);
                 graph.operands[1].descriptor.data_type = DataType::Float32;
                 graph.output_operands = vec![1];
@@ -1987,8 +1991,14 @@ mod tests {
                         options: None,
                         outputs: vec![1],
                     }
-                } else {
+                } else if operation == typed_unary::Kind::Sqrt {
                     crate::operators::Operation::Sqrt {
+                        input: 0,
+                        options: None,
+                        outputs: vec![1],
+                    }
+                } else {
+                    crate::operators::Operation::Exp {
                         input: 0,
                         options: None,
                         outputs: vec![1],

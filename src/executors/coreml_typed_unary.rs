@@ -13,6 +13,12 @@ use crate::protos::coreml::specification::{
 mod kernels;
 pub(super) use kernels::{Direction, cast};
 
+#[path = "coreml_binary32.rs"]
+mod binary32;
+
+#[path = "coreml_exp.rs"]
+mod exp;
+
 #[path = "coreml_gelu.rs"]
 mod gelu;
 
@@ -28,6 +34,7 @@ pub(super) enum Kind {
     FloatCast(Direction),
     Gelu,
     Sqrt,
+    Exp,
 }
 
 pub(super) fn evaluate(bytes: &[u8], kind: Kind) -> Result<Vec<u8>, &'static str> {
@@ -35,6 +42,7 @@ pub(super) fn evaluate(bytes: &[u8], kind: Kind) -> Result<Vec<u8>, &'static str
         Kind::FloatCast(direction) => cast(bytes, direction),
         Kind::Gelu => gelu::evaluate(bytes),
         Kind::Sqrt => sqrt::evaluate(bytes),
+        Kind::Exp => exp::evaluate(bytes),
     }
 }
 
@@ -314,12 +322,17 @@ pub(super) fn classify(model: &Model, source: &[u8]) -> Option<Kind> {
         return None;
     }
     let operation = &block.operations[0];
-    if matches!(operation.r#type.as_str(), "gelu" | "sqrt") && function.opset != "CoreML7" {
+    if matches!(operation.r#type.as_str(), "gelu" | "sqrt" | "exp") && function.opset != "CoreML7" {
         return None;
     }
-    if !matches!(operation.r#type.as_str(), "cast" | "gelu" | "sqrt")
+    if !matches!(operation.r#type.as_str(), "cast" | "gelu" | "sqrt" | "exp")
         || operation.outputs.len() != 1
-        || operation.inputs.len() != if operation.r#type == "sqrt" { 1 } else { 2 }
+        || operation.inputs.len()
+            != if matches!(operation.r#type.as_str(), "sqrt" | "exp") {
+                1
+            } else {
+                2
+            }
         || !operation.blocks.is_empty()
         || !operation.attributes.is_empty()
     {
@@ -358,6 +371,7 @@ pub(super) fn classify(model: &Model, source: &[u8]) -> Option<Kind> {
         ),
         ("gelu", 11, 11) => (Kind::Gelu, 65568, 65568, Some(("mode", "EXACT"))),
         ("sqrt", 11, 11) => (Kind::Sqrt, 65568, 65568, None),
+        ("exp", 11, 11) => (Kind::Exp, 65568, 65568, None),
         _ => return None,
     };
     let canonical_shape = |ty: &mil::TensorType| {
@@ -609,52 +623,86 @@ mod tests {
     }
 
     #[test]
-    fn sqrt_requires_complete_float32_source_provenance() {
-        let model = sqrt_model();
-        assert_eq!(classify(&model, &model.encode_to_vec()), Some(Kind::Sqrt));
-        for mutation in 0..5 {
-            let mut changed = model.clone();
-            let model::Type::MlProgram(program) = changed.r#type.as_mut().unwrap() else {
-                unreachable!()
-            };
-            let function = program.functions.get_mut("main").unwrap();
-            let block = function.block_specializations.get_mut("CoreML7").unwrap();
-            match mutation {
-                0 => {
-                    block.operations[0]
-                        .inputs
-                        .insert("extra".into(), Default::default());
-                }
-                1 => {
-                    block.operations[0].outputs[0].r#type = Some(tensor_type(10));
-                }
-                2 => {
-                    block.operations.push(block.operations[0].clone());
-                }
-                3 => {
-                    function.inputs[0].r#type = Some(tensor_type(10));
-                }
-                4 => {
-                    changed.description.as_mut().unwrap().input[0]
-                        .r#type
-                        .as_mut()
-                        .unwrap()
-                        .is_optional = true;
-                }
-                _ => unreachable!(),
+    fn sqrt_and_exp_require_complete_float32_source_provenance() {
+        for kind in [Kind::Sqrt, Kind::Exp] {
+            let mut model = sqrt_model();
+            if kind == Kind::Exp {
+                let model::Type::MlProgram(program) = model.r#type.as_mut().unwrap() else {
+                    unreachable!()
+                };
+                program
+                    .functions
+                    .get_mut("main")
+                    .unwrap()
+                    .block_specializations
+                    .get_mut("CoreML7")
+                    .unwrap()
+                    .operations[0]
+                    .r#type = "exp".into();
             }
+            assert_eq!(classify(&model, &model.encode_to_vec()), Some(kind));
+            for mutation in 0..5 {
+                let mut changed = model.clone();
+                let model::Type::MlProgram(program) = changed.r#type.as_mut().unwrap() else {
+                    unreachable!()
+                };
+                let function = program.functions.get_mut("main").unwrap();
+                let block = function.block_specializations.get_mut("CoreML7").unwrap();
+                match mutation {
+                    0 => {
+                        block.operations[0]
+                            .inputs
+                            .insert("extra".into(), Default::default());
+                    }
+                    1 => {
+                        block.operations[0].outputs[0].r#type = Some(tensor_type(10));
+                    }
+                    2 => {
+                        block.operations.push(block.operations[0].clone());
+                    }
+                    3 => {
+                        function.inputs[0].r#type = Some(tensor_type(10));
+                    }
+                    4 => {
+                        changed.description.as_mut().unwrap().input[0]
+                            .r#type
+                            .as_mut()
+                            .unwrap()
+                            .is_optional = true;
+                    }
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    classify(&changed, &changed.encode_to_vec()),
+                    None,
+                    "mutation {mutation}"
+                );
+            }
+            let mut unknown = model.encode_to_vec();
+            unknown.extend([0xf8, 0x7f, 0x01]);
             assert_eq!(
-                classify(&changed, &changed.encode_to_vec()),
-                None,
-                "mutation {mutation}"
+                classify(&Model::decode(unknown.as_slice()).unwrap(), &unknown),
+                None
             );
         }
-        let mut unknown = model.encode_to_vec();
-        unknown.extend([0xf8, 0x7f, 0x01]);
-        assert_eq!(
-            classify(&Model::decode(unknown.as_slice()).unwrap(), &unknown),
-            None
-        );
+    }
+
+    #[test]
+    fn exp_proved_float32_program_has_an_accuracy_preserving_stage() {
+        let mut model = sqrt_model();
+        let model::Type::MlProgram(program) = model.r#type.as_mut().unwrap() else {
+            unreachable!()
+        };
+        program
+            .functions
+            .get_mut("main")
+            .unwrap()
+            .block_specializations
+            .get_mut("CoreML7")
+            .unwrap()
+            .operations[0]
+            .r#type = "exp".into();
+        assert_eq!(classify(&model, &model.encode_to_vec()), Some(Kind::Exp));
     }
 
     #[test]

@@ -371,7 +371,7 @@ pub fn classify_constant(model: &Model, source: &[u8]) -> Option<ConstantUnary> 
     }
     let operation = block.operations.last()?;
     let kind = unary_view(model, input, operation)?;
-    if !matches!(kind, Kind::Gelu | Kind::Sqrt) {
+    if !matches!(kind, Kind::Gelu | Kind::Sqrt | Kind::Exp) {
         return None;
     }
     let description = model.description.as_ref()?;
