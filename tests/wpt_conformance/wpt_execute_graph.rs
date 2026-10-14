@@ -180,7 +180,25 @@ fn is_operand_ref(value: &serde_json::Value, operand_names: &HashSet<String>) ->
     value.as_str().is_some_and(|s| operand_names.contains(s))
 }
 
+fn is_floating_option(key: &str) -> bool {
+    #[derive(serde::Deserialize)]
+    struct NumericFields {
+        #[serde(rename = "floatOptions")]
+        float_options: Vec<String>,
+    }
+    static FLOAT_OPTIONS: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
+        let fields: NumericFields =
+            serde_json::from_str(include_str!("../../scripts/wpt_bridge/numeric-fields.json"))
+                .expect("valid shared WPT numeric-field contract");
+        fields.float_options
+    });
+    FLOAT_OPTIONS.iter().any(|field| field == key)
+}
+
 fn normalize_option_value(op_name: &str, key: &str, value: serde_json::Value) -> serde_json::Value {
+    if is_floating_option(key) && value.as_str() == Some("-0") {
+        return serde_json::json!(-0.0f64);
+    }
     if op_name == "pad"
         && key == "mode"
         && let Some(arr) = value.as_array()
@@ -369,7 +387,10 @@ pub fn build_method_args(
 
         // Non-operand scalar method arguments (axis, steps, etc.) go into options for
         // OperationExtras extraction during invoke.
-        options.insert(option_json_key(op_name, &key), value);
+        options.insert(
+            option_json_key(op_name, &key),
+            normalize_option_value(op_name, &key, value),
+        );
     }
 
     if op_name == "pad" {
@@ -1611,6 +1632,7 @@ pub fn append_webnn_graph_text(msg: String, webnn_text: Option<&str>) -> String 
 pub struct WptExecuteArtifacts {
     pub outputs: HashMap<String, WptActualOutput>,
     pub webnn_text: Option<String>,
+    pub intermediate_descriptors: serde_json::Value,
 }
 
 /// Build a backend-agnostic graph from a WPT graph without creating a native runtime context.
@@ -1705,6 +1727,7 @@ pub fn compile_wpt_graph(graph: &WptGraph) -> Result<rustnn::GraphInfo, String> 
 pub fn execute_wpt_graph(
     context: &mut MLContext,
     graph: &WptGraph,
+    capture_intermediates: bool,
 ) -> Result<WptExecuteArtifacts, String> {
     let mut builder = MLGraphBuilder::new(context).map_err(|e| e.to_string())?;
     let mut operand_map: HashMap<String, MLOperand> = HashMap::new();
@@ -1797,6 +1820,24 @@ pub fn execute_wpt_graph(
 
     let webnn_text = builder.rustnn_webnn_text_for_outputs(&build_outputs);
 
+    let mut intermediate_descriptors = serde_json::Map::new();
+    if capture_intermediates {
+        for (name, &operand) in &operand_map {
+            let shape = builder
+                .rustnn_operand_shape(operand)
+                .map_err(|e| e.to_string())?;
+            let data_type = builder
+                .rustnn_operand_data_type(operand)
+                .map_err(|e| e.to_string())?;
+            intermediate_descriptors.insert(
+                name.clone(),
+                serde_json::json!({
+                    "shape": shape, "dataType": data_type
+                }),
+            );
+        }
+    }
+
     let mut ml_graph = builder
         .build(&build_outputs)
         .map_err(|e| append_webnn_graph_text(e.to_string(), webnn_text.as_deref()))?;
@@ -1850,5 +1891,6 @@ pub fn execute_wpt_graph(
     Ok(WptExecuteArtifacts {
         outputs,
         webnn_text,
+        intermediate_descriptors: intermediate_descriptors.into(),
     })
 }

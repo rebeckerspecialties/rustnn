@@ -60,6 +60,10 @@ values for dynamic dimensions that share a name. `examples/smollm_mlcontext.rs` 
 cache this way. The checked legacy executors (`run_onnx_with_inputs_checked` and friends)
 apply the same rules to one-shot runs; see [Flexible Input Shapes](../development/flexible-input-shapes.md).
 
+`rustnn_set_tensor_capacity` returns `Error::TensorCapacityError` on every backend
+if the requested storage is smaller than the tensor's active shape. Rejection leaves
+the shape and stored values unchanged; resize the active shape before reducing capacity.
+
 ## Saving and exporting graphs
 
 | Goal | Call |
@@ -111,6 +115,16 @@ start cold. Details are in [TensorRT-RTX](../integration/tensorrt.md).
 | `builder.rustnn_operand_shape(op)` | Shape of an operand while recording |
 | `cargo run --features onnx-runtime -- graph.webnn --export-dot graph.dot` | Graph structure as Graphviz |
 | `make test-wpt-op OP=<operation>` | Runs the WPT conformance cases of one operation, printing expected and actual values on failure |
+
+### Spans
+
+- rustnn emits spans for a [`tracing`](https://docs.rs/tracing) subscriber: one per context, graph
+  or file, and one per call. The CLI installs a subscriber filtered by `RUST_LOG` — the same
+  variable that carries its `log` output, so one stream shows both — while a library user installs
+  their own.
+- Targets are module paths, so a subscriber can filter as narrowly as `rustnn::backends::caching`.
+- A public operation that fails records an `ERROR` event carrying the error on its span before
+  returning it, so filtering at `error` shows failures with the operation's fields.
 
 ## Threads
 

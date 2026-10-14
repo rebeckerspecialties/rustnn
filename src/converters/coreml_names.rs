@@ -33,7 +33,7 @@ pub(crate) fn encode(name: &str) -> Cow<'_, str> {
     Cow::Owned(encoded)
 }
 
-#[cfg(any(feature = "coreml-runtime", test))]
+#[cfg(test)]
 pub(crate) fn decode(name: &str) -> Cow<'_, str> {
     let Some(hex) = name.strip_prefix(PREFIX) else {
         return Cow::Borrowed(name);

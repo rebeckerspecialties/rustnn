@@ -70,9 +70,18 @@ fn build_coreml_protos() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", feature = "coreml-runtime"))]
+#[cfg(feature = "coreml-runtime")]
 fn build_coreml_shim() {
-    // On macOS with the CoreML runtime, compile the Objective-C++ exception
+    // Build scripts run on the host: select by the Cargo target, not the host's
+    // cfg. In particular, watchOS cannot compile source models with this API.
+    if !matches!(
+        env::var("CARGO_CFG_TARGET_OS").as_deref(),
+        Ok("macos" | "ios")
+    ) {
+        return;
+    }
+
+    // On supported Apple targets, compile the Objective-C++ exception
     // firewall (see src/executors/coreml_shim.mm). It catches Objective-C and
     // C++ exceptions raised by CoreML before they can unwind across the
     // `extern "C"` objc_msgSend boundary and abort the process.
@@ -150,10 +159,57 @@ fn embed_wpt_corpus() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Make the prebuilt LiteRT libraries findable: rpath on Unix, DLLs beside the binaries on Windows.
+fn forward_litert_lib_dir() {
+    let Ok(dir) = env::var("DEP_LITERT_LIB_DIR") else {
+        return;
+    };
+    println!("cargo:rerun-if-env-changed=DEP_LITERT_LIB_DIR");
+
+    match env::var("CARGO_CFG_TARGET_FAMILY").as_deref() {
+        Ok("unix") => println!("cargo:rustc-link-arg=-Wl,-rpath,{dir}"),
+        Ok("windows") => copy_litert_dlls(Path::new(&dir)),
+        _ => {}
+    }
+}
+
+/// Copy the prebuilt DLLs beside the executables, where the Windows loader looks.
+fn copy_litert_dlls(dir: &Path) {
+    let out_dir = env::var("OUT_DIR").unwrap();
+    let profile_dir = Path::new(&out_dir)
+        .ancestors()
+        .nth(3)
+        .unwrap()
+        .to_path_buf();
+
+    let entries = fs::read_dir(dir).expect("failed to read DEP_LITERT_LIB_DIR");
+    for entry in entries.flatten() {
+        let source = entry.path();
+        if source.extension().and_then(|e| e.to_str()) != Some("dll") {
+            continue;
+        }
+        for dest_dir in [
+            profile_dir.clone(),
+            profile_dir.join("deps"),
+            profile_dir.join("examples"),
+        ] {
+            fs::create_dir_all(&dest_dir).unwrap();
+            let dest = dest_dir.join(entry.file_name());
+            fs::copy(&source, &dest).unwrap_or_else(|error| {
+                panic!(
+                    "failed to copy {} to {}: {error}",
+                    source.display(),
+                    dest.display()
+                )
+            });
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Only compile CoreML protos - ONNX protos come from webnn-onnx-utils
     build_coreml_protos()?;
-    #[cfg(all(target_os = "macos", feature = "coreml-runtime"))]
+    #[cfg(feature = "coreml-runtime")]
     build_coreml_shim();
     embed_wpt_corpus()?;
 
@@ -164,6 +220,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=protos");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=OUT_DIR");
+
+    // Let the binaries find the prebuilt LiteRT libraries at run time.
+    forward_litert_lib_dir();
 
     create_source_hash(&[
         "src/converters/trtx.rs",
