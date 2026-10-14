@@ -9,7 +9,8 @@ export function createWptHarnessStubs() {
   const sandbox = {
     globalThis: null,
     Float32Array,
-    Float16Array,
+    ...(typeof globalThis.Float16Array === 'function'
+      ? {Float16Array: globalThis.Float16Array} : {}),
     Int8Array,
     Uint8Array,
     Int16Array,

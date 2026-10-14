@@ -10,5 +10,7 @@
 pub mod cann;
 #[cfg(feature = "coreml-runtime")]
 pub mod coreml;
+#[cfg(feature = "coreml-runtime")]
+mod coreml_dtype;
 #[cfg(feature = "onnx-runtime")]
 pub mod onnx;

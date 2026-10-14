@@ -25,9 +25,9 @@ use crate::graph_recorder::GraphRecorder;
 use crate::mlcontext::{MLGraph, MLNamedOperands, MLOperand, MLOperandDescriptor, MLTensor};
 use crate::operator_enums::MLOperandDataType;
 use crate::operator_options::{
-    MLArgMinMaxOptions, MLBatchNormalizationOptions, MLClampOptions, MLConstantOptions,
-    MLConv2dOptions, MLConvTranspose2dOptions, MLCumulativeSumOptions, MLDimension, MLEluOptions,
-    MLGatherOptions, MLGemmOptions, MLGruCellOptions, MLGruOptions, MLHardSigmoidOptions,
+    MLArgMinMaxOptions, MLBatchNormalizationOptions, MLClampOptions, MLConv2dOptions,
+    MLConvTranspose2dOptions, MLCumulativeSumOptions, MLDimension, MLEluOptions, MLGatherOptions,
+    MLGemmOptions, MLGruCellOptions, MLGruOptions, MLHardSigmoidOptions,
     MLInstanceNormalizationOptions, MLLayerNormalizationOptions, MLLeakyReluOptions,
     MLLinearOptions, MLLstmCellOptions, MLLstmOptions, MLOperatorOptions, MLPadOptions,
     MLPool2dOptions, MLReduceOptions, MLResample2dOptions, MLReverseOptions, MLScatterOptions,
@@ -251,51 +251,6 @@ fn preserve_input_shape(
 ) -> Result<OperandDescriptor> {
     let operand = get_operand(input, graph)?;
     Ok(operand.descriptor.clone())
-}
-
-fn constant_shape(
-    operation: &Operation,
-    options: Option<&MLConstantOptions>,
-) -> Result<OperandDescriptor> {
-    let options = options.ok_or_else(|| {
-        Box::new(ShapeInferenceError::MissingOptions {
-            operation: operation.clone(),
-        })
-    })?;
-    let shape = options
-        .shape
-        .as_ref()
-        .ok_or_else(|| {
-            Box::new(ShapeInferenceError::InferError {
-                op_name: "constant",
-                operation: operation.clone(),
-                source: GraphError::ShapeInferenceFailed {
-                    reason: "constant is missing its required shape".to_string(),
-                },
-            })
-        })?
-        .iter()
-        .copied()
-        .map(Dimension::Static)
-        .collect();
-    let data_type = match options.data_type.to_ascii_lowercase().as_str() {
-        "float32" => DataType::Float32,
-        "float16" => DataType::Float16,
-        "int32" => DataType::Int32,
-        "uint32" => DataType::Uint32,
-        "int64" => DataType::Int64,
-        "uint64" => DataType::Uint64,
-        "int8" => DataType::Int8,
-        "uint8" => DataType::Uint8,
-        "int4" => DataType::Int4,
-        "uint4" => DataType::Uint4,
-        _ => DataType::Float32,
-    };
-    Ok(OperandDescriptor {
-        data_type,
-        shape,
-        pending_permutation: vec![],
-    })
 }
 
 fn matmul_shape(
@@ -1673,7 +1628,6 @@ fn shape_inference_single_output(
             graph,
         ),
 
-        Operation::Constant { options, .. } => constant_shape(operation, options.as_ref()),
         Operation::Conv2d {
             input,
             filter,
@@ -2134,6 +2088,23 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
     /// outputs, but it borrows the builder read-only: the output names are handed to the exporter
     /// as an override, so neither the graph nor its constant weight bytes are copied or mutated, and
     /// the builder can still be built afterwards.
+    // `operands`/`operations` come from the recorder at entry; they are 0 only on the path whose
+    // recorder is already taken, which fails right after with `GraphAlreadyBuilt`.
+    #[tracing::instrument(
+        name = "save_graph",
+        skip_all,
+        err,
+        level = "info",
+        fields(
+            path = %path.as_ref().display(),
+            output_names = ?crate::instrumentation::Names(outputs),
+            operands = self.recorder.as_ref().map_or(0, |g| g.graph().operands.len()),
+            operations = self
+                .recorder
+                .as_ref()
+                .map_or(0, |g| g.graph().operations.len()),
+        )
+    )]
     pub fn rustnn_save_webnn(
         &self,
         outputs: &MLNamedOperands,
@@ -2191,6 +2162,12 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
     /// Fails when `outputs` is empty, names an input or constant, or maps two names to one
     /// operand. Output names become the keys that [`MLContext::dispatch`] expects.
     /*async*/
+    #[tracing::instrument(
+        skip_all,
+        err,
+        level = "info",
+        fields(output_names = ?crate::instrumentation::Names(outputs))
+    )]
     pub fn build(
         &mut self,
         outputs: &'_ MLNamedOperands,
@@ -2233,7 +2210,6 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
 
             graph.mark_output(operand.id as u32, name.to_string())?;
         }
-        debug!("Building graph with {} operands", graph.operands.len());
         // Verbose info for small graphs
         if graph.operands.len() < 20 {
             trace!("Building graph:\n{graph:#?}");
@@ -2250,7 +2226,12 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
             });
         }
 
-        graph.into_graph().map_err(Into::into)
+        let graph = graph.into_graph()?;
+        tracing::info!(
+            operands = graph.operands.len(),
+            operations = graph.operations.len()
+        );
+        Ok(graph)
     }
 
     /// Debug tool to check operand shape
@@ -2563,17 +2544,6 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
         input,
         filter
     );
-
-    /// Former name of [`Self::conv2d_with_options`], kept for compatibility.
-    #[deprecated(note = "renamed to conv2d_with_options")]
-    pub fn conv2_with_options(
-        &mut self,
-        input: MLOperand,
-        filter: MLOperand,
-        options: MLConv2dOptions,
-    ) -> Result<MLOperand> {
-        self.conv2d_with_options(input, filter, options)
-    }
 
     impl_binary_op!(
         /// 2-D transposed (fractionally strided) convolution.
