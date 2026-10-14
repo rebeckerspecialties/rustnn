@@ -112,6 +112,7 @@ pub mod converters;
 pub mod debug;
 pub mod error;
 pub mod executors;
+mod float16;
 pub mod graph;
 mod graph_recorder;
 pub mod graphviz;
