@@ -71,15 +71,12 @@ jobs:
       - name: Cache cargo build
         uses: actions/cache@v4
         with:
-          path: target
-          key: ${{ runner.os }}-wpt-${{ matrix.backend.id }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache litert-sys libraries
-        if: matrix.backend.id == 'litert'
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/litert-sys
-          key: ${{ runner.os }}-litert-sys
+          # Cargo can reuse litert-sys build-script output without downloading
+          # its libraries again. Restore both together to keep linker paths valid.
+          path: |
+            target
+            ${{ matrix.backend.id == 'litert' && '~/.cache/litert-sys' || '' }}
+          key: ${{ runner.os }}-${{ runner.arch }}-wpt-${{ matrix.backend.id }}-cargo-v2-${{ hashFiles('Cargo.lock') }}
 
       - name: Fetch WPT corpus
         run: node scripts/fetch_wpt.mjs
