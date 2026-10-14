@@ -15,8 +15,8 @@ crate and runs it with the CPU, GPU or NPU accelerator.
   `~/.cache/litert-sys/<version>/<target triple>/` on the first build. `LITERT_LIB_DIR` points at
   a local build instead, `LITERT_CACHE_DIR` moves the cache and `LITERT_NO_DOWNLOAD` fails
   instead of downloading (air-gapped CI).
-- At run time the libraries must be on the loader path. `make test-wpt-litert` sets
-  `LD_LIBRARY_PATH` to the cache directory; do the same for your own binaries.
+- At run time the binaries built here find the libraries without extra setup: `build.rs` records
+  an rpath from `DEP_LITERT_LIB_DIR` on Unix and copies the DLLs beside the binaries on Windows.
 
 ## Selection and devices
 
@@ -38,12 +38,17 @@ delegate does not support.
 
 ## Operation and data type policy
 
-Recurrent operations (`gru`, `gruCell`, `lstm`, `lstmCell`) are rejected by
-`backends::litert::unsupported_ops`. `dtype_unsupported_for_op` rejects data types the TFLite
-kernels lack for a given operation: outside `float32` and `float16` only the comparison,
-logical, `isNaN`/`isInfinite`, `scatterElements` and `where` operations accept `int32` and
-`uint8`, and the quantization operations accept their integer types. The WPT harness applies
-the same policy to skip trials up front.
+An operation the converter cannot lower fails the conversion with
+`unsupported operation: <operation>`, which is how the recurrent operations (`gru`,
+`gruCell`, `lstm`, `lstmCell`) and `scatterElements` with non-constant indices are reported.
+`datatype_to_tflite` rejects data types the TFLite schema lacks, which is `uint4` today; the
+WPT harness skips trials whose dtypes its own list omits.
+
+Two limits come from the runtime rather than from the schema. No operand can be `uint64`: the
+LiteRT model loader has no tensor type for it, so such a graph fails to compile with
+"Element type not currently supported". And `convTranspose2d` with dilations other than 1 is
+rejected by the converter, because `TRANSPOSE_CONV` carries no dilation factors and the
+option would otherwise be dropped silently.
 
 ## Testing
 

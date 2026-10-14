@@ -99,6 +99,45 @@ fn push_backend_trials(
 fn main() {
     pretty_env_logger::init();
 
+    // Spans and events for the `log`-only runs this harness makes: same switch as the CLI, and
+    // nothing is printed unless `RUST_LOG` asks for it.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::builder()
+                .with_default_directive(tracing_subscriber::filter::LevelFilter::OFF.into())
+                .with_env_var("RUST_LOG")
+                .from_env_lossy(),
+        )
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+        .try_init();
+
+    // A build without any backend feature has nothing to test; only a compiled-in backend
+    // that fails to come up is an error (for example a missing ONNX Runtime library).
+    const BACKEND_FEATURE_ENABLED: bool = cfg!(any(
+        feature = "onnx-runtime",
+        feature = "trtx-runtime",
+        feature = "trtx-runtime-mock",
+        feature = "litert-runtime",
+        feature = "cann-runtime",
+        feature = "cann-runtime-mock",
+        all(target_os = "macos", feature = "coreml-runtime")
+    ));
+    if !BACKEND_FEATURE_ENABLED {
+        eprintln!(
+            "[WPT] no backend feature enabled; skipping the conformance trials (build with --features onnx-runtime, trtx-runtime, litert-runtime or coreml-runtime)."
+        );
+        return;
+    }
+
+    eprintln!(
+        "[WPT] comparison: {}",
+        if wpt_conformance::wpt_config::strict_wpt_tolerance() {
+            "strict upstream tolerance (no local ULP or absolute floors)"
+        } else {
+            "compatibility tolerance (local ULP and absolute floors enabled)"
+        }
+    );
+
     let args = Arguments::from_args();
     let wpt_dir = default_wpt_dir();
 
@@ -133,21 +172,6 @@ fn main() {
 
     let backends = WptBackend::selected();
     if backends.is_empty() {
-        // A build without any backend feature has nothing to test; only a compiled-in backend
-        // that fails to come up is an error (for example a missing ONNX Runtime library).
-        const BACKEND_FEATURE_ENABLED: bool = cfg!(any(
-            feature = "onnx-runtime",
-            feature = "trtx-runtime",
-            feature = "trtx-runtime-mock",
-            feature = "litert-runtime",
-            all(target_os = "macos", feature = "coreml-runtime")
-        ));
-        if !BACKEND_FEATURE_ENABLED {
-            eprintln!(
-                "[WPT] no backend feature enabled; skipping the conformance trials (build with --features onnx-runtime, trtx-runtime, litert-runtime or coreml-runtime)."
-            );
-            return;
-        }
         eprintln!(
             "No WPT backends available (enable onnx-runtime, trtx-runtime, coreml-runtime, ...)."
         );
