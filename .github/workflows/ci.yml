@@ -4,7 +4,6 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
 
 env:
   # Pinned on every platform: the distro package and brew both drift, and the
