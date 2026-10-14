@@ -961,6 +961,34 @@ pub fn infer_global_pool_shape(
     Ok(output_shape)
 }
 
+/// Infer global-pooling alias output dimensions without freezing batch/channel bounds.
+///
+/// Only the two spatial dimensions become static ones. Batch and channel
+/// dimensions retain their original identities and dynamic bounds.
+pub fn infer_global_pool_shape_dimensions(
+    input_shape: &[Dimension],
+    layout: InputLayout,
+) -> Result<Vec<Dimension>, GraphError> {
+    if input_shape.len() != 4 {
+        return Err(GraphError::ShapeInferenceFailed {
+            reason: format!(
+                "Global pooling input must be 4D, got {}D tensor {:?}",
+                input_shape.len(),
+                input_shape
+            ),
+        });
+    }
+    let mut output_shape = input_shape.to_vec();
+    let axes = match layout {
+        InputLayout::Nchw => [2, 3],
+        InputLayout::Nhwc => [1, 2],
+    };
+    for axis in axes {
+        output_shape[axis] = Dimension::Static(1);
+    }
+    Ok(output_shape)
+}
+
 /// Infer the output shape for batchNormalization
 /// Batch normalization output has the same shape as input
 pub fn infer_batch_normalization_shape(input_shape: &[u32]) -> Result<Vec<u32>, GraphError> {

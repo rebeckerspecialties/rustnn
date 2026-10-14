@@ -4188,14 +4188,22 @@ impl CoremlMlProgramConverter {
             }
 
             // Global pooling operations (reduce over spatial dimensions)
-            Operation::GlobalAveragePool { .. } | Operation::GlobalMaxPool { .. } => {
+            Operation::GlobalAveragePool { options, .. }
+            | Operation::GlobalMaxPool { options, .. } => {
                 if !input_names.is_empty() {
                     inputs.insert("x".to_string(), Self::create_argument(&input_names[0]));
                 }
-                // Global pooling reduces over spatial dimensions (2, 3) for NCHW format
+                let axes = if options
+                    .as_ref()
+                    .is_some_and(|options| options.layout.eq_ignore_ascii_case("nhwc"))
+                {
+                    [1, 2]
+                } else {
+                    [2, 3]
+                };
                 inputs.insert(
                     "axes".to_string(),
-                    Self::create_immediate_int_array(&[2, 3]),
+                    Self::create_immediate_int_array(&axes),
                 );
                 // Keep dimensions to maintain rank
                 inputs.insert("keep_dims".to_string(), Self::create_immediate_bool(true));
