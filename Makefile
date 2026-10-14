@@ -8,6 +8,7 @@ COREML_PATH ?= target/graph.mlmodel
 COREMLC_PATH ?= target/graph.mlmodelc
 COREML_FEATURES ?= coreml-runtime,dynamic-inputs
 NUMERIC_BOUNDARY_REPORT ?= target/coreml-numeric-boundaries.json
+COREML_KV_CONFIG ?=
 TEST_FILTER ?=
 LITERT_PATH ?= target/graph.tflite
 CANN_PATH ?= target/graph.cann
@@ -104,7 +105,7 @@ CANN_CROSS_ENV = CC_aarch64_unknown_linux_ohos=$(OHOS_SDK_NATIVE)/llvm/bin/clang
 	coverage coverage-html coverage-lcov coverage-open coverage-clean \
 	docs-serve docs-build docs-clean ci-docs docs-api docs-backend-ops docs-backend-ops-check \
 	fetch-wpt require-wpt-cache test-wpt test-wpt-trtx test-wpt-litert test-wpt-coreml \
-	test-wpt-coreml-report build-coreml test-coreml test-wpt-op test-wpt-report test-wpt-cann \
+	test-wpt-coreml-report build-coreml test-coreml benchmark-coreml-kv test-wpt-op test-wpt-report test-wpt-cann \
 	wpt-sync-onnx wpt-sync-litert wpt-sync-coreml wpt-sync-trtx wpt-sync-cann \
 	webnn-chromedriver test-webnn-wpt-chrome test-webnn-wpt-chrome-headless \
 	onnxruntime-download trtxruntime-download onnx onnx-validate coreml coreml-validate litert cann \
@@ -185,11 +186,7 @@ test-wpt-trtx: onnxruntime-download trtxruntime-download
 	$(ORT_ENV_VARS) $(TRT_ENV_VARS) $(CARGO) test --test run_wpt_conformance --features "onnx-runtime,trtx-runtime" -- trtx --test-threads 1
 
 test-wpt-litert:
-	@HOST_TRIPLE=$$(rustc -vV 2>/dev/null | grep host: | cut -d' ' -f2); \
-	LITERT_LIB_DIR="$${HOME}/.cache/litert-sys/v0.10.2/$${HOST_TRIPLE}"; \
-	LD_LIBRARY_PATH="$$LITERT_LIB_DIR:$$LD_LIBRARY_PATH" \
-	LIBRARY_PATH="$$LITERT_LIB_DIR:$$LIBRARY_PATH" \
-	WPT_REPORT_JSON="$(WPT_REPORT_LITERT_JSON)" \
+	@WPT_REPORT_JSON="$(WPT_REPORT_LITERT_JSON)" \
 	$(CARGO) test --test run_wpt_conformance --features "litert-runtime" -- litert --test-threads=1
 
 test-wpt-coreml:
@@ -222,6 +219,10 @@ diagnose-coreml-boundaries: test-numeric-boundaries
 	@mkdir -p "$(dir $(NUMERIC_BOUNDARY_REPORT))"
 	$(CARGO) run --no-default-features --features $(COREML_FEATURES) --example coreml_numeric_boundaries > "$(NUMERIC_BOUNDARY_REPORT)"
 
+.PHONY: test-coreml-tensor-reuse
+test-coreml-tensor-reuse:
+	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_tensor_reuse -- $(TEST_FILTER) --test-threads=1
+
 # Build every target, including examples and the separately run WPT harness.
 build-coreml:
 	$(CARGO) build --all-targets --no-default-features --features $(COREML_FEATURES)
@@ -230,6 +231,14 @@ build-coreml:
 # have their own targets and corpus/device setup; do not run them here.
 test-coreml:
 	$(CARGO) test --lib --bins --test 'test_*' --no-default-features --features $(COREML_FEATURES) -- $(TEST_FILTER) --test-threads=1
+
+# Defaults to self-contained attention/cache chaining with an independent oracle.
+benchmark-coreml-kv:
+	CARGO_PROFILE_RELEASE_LTO=false $(CARGO) run --release --features coreml-runtime,dynamic-inputs --example coreml_kv_benchmark -- $(if $(COREML_KV_CONFIG),"$(COREML_KV_CONFIG)",--self-contained)
+
+.PHONY: test-coreml-kv-benchmark
+test-coreml-kv-benchmark:
+	$(CARGO) test --example coreml_kv_benchmark --no-default-features --features $(COREML_FEATURES)
 
 test-wpt-coreml-report:
 	@mkdir -p reports
@@ -252,11 +261,7 @@ WPT_BACKEND ?= onnx
 test-wpt-report: fetch-wpt onnxruntime-download
 	@mkdir -p reports
 	$(MAKE) test-wpt-tolerance-parity
-	@HOST_TRIPLE=$$(rustc -vV 2>/dev/null | grep host: | cut -d' ' -f2); \
-	LITERT_LIB_DIR="$${HOME}/.cache/litert-sys/v0.10.2/$${HOST_TRIPLE}"; \
-	LD_LIBRARY_PATH="$$LITERT_LIB_DIR:$$LD_LIBRARY_PATH" \
-	LIBRARY_PATH="$$LITERT_LIB_DIR:$$LIBRARY_PATH" \
-	RUST_BACKTRACE=1 WPT_REPORT_JSON=reports/wpt-conformance.json $(ORT_ENV_VARS) $(CARGO) test --test run_wpt_conformance --features $(WPT_BACKEND)-runtime -- --test-threads 1
+	@RUST_BACKTRACE=1 WPT_REPORT_JSON=reports/wpt-conformance.json $(ORT_ENV_VARS) $(CARGO) test --test run_wpt_conformance --features $(WPT_BACKEND)-runtime -- --test-threads 1
 
 # ONNX: onnx_expected_failures.txt.
 wpt-sync-onnx: fetch-wpt
@@ -525,6 +530,7 @@ help:
 	@echo "CoreML Conversion:"
 	@echo "  coreml             - Convert graph to CoreML format"
 	@echo "  coreml-validate    - Convert and validate CoreML graph"
+	@echo "  benchmark-coreml-kv - Measure KV-cache reuse with COREML_KV_CONFIG=..."
 	@echo "  build-coreml       - Build all targets with CoreML and dynamic inputs (macOS)"
 	@echo "  test-coreml        - Run CoreML unit/integration tests (optional TEST_FILTER=triangular)"
 	@echo "                       Set COREML_FEATURES=coreml-runtime to disable dynamic inputs"

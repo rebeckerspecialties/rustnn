@@ -159,6 +159,9 @@ pub(crate) fn normalize_option_key(wpt_name: &str, op_type: &str, key: &str) -> 
 fn parse_number(v: &serde_json::Value) -> Option<f64> {
     match v {
         serde_json::Value::Number(n) => n.as_f64(),
+        // The bridge preserves negative zero explicitly; parsing it as an
+        // integer first would silently discard its sign again.
+        serde_json::Value::String(s) if s == "-0" => Some(-0.0),
         serde_json::Value::String(s) => {
             let t = s.trim_end_matches('n');
             t.parse::<i64>()
@@ -588,6 +591,7 @@ pub fn expected_output_to_f64(spec: &WptTensorSpec) -> Result<Vec<f64>, String> 
         value
             .as_f64()
             .or_else(|| match value.as_str() {
+                Some("-0") => Some(-0.0),
                 Some("NaN") => Some(f64::NAN),
                 Some("Infinity") => Some(f64::INFINITY),
                 Some("-Infinity") => Some(f64::NEG_INFINITY),
