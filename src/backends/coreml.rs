@@ -544,9 +544,10 @@ mod test {
         assert!(super::supports_output_backings(&graph));
     }
 
+    use crate::executors::coreml::CoremlLoadRoute;
     use crate::mlcontext::{
-        Backend, MLContext, MLContextOptions, MLNamedOperands, MLNamedTensors, MLOperandDescriptor,
-        MLPowerPreference, MLTensorDescriptor,
+        Backend, LoadDiagnostics, MLContext, MLContextOptions, MLGraph, MLNamedOperands,
+        MLNamedTensors, MLOperandDescriptor, MLPowerPreference, MLTensorDescriptor,
     };
     use crate::mlgraphbuilder::MLGraphBuilder;
     use crate::operator_enums::MLOperandDataType;
@@ -590,6 +591,13 @@ mod test {
             };
             assert_eq!(diagnostic.route, CoremlLoadRoute::CompiledUrl);
         }
+    }
+
+    #[test]
+    fn coreml_graph_and_compiled_model_are_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<super::CoremlGraph>();
+        assert_send::<crate::executors::coreml::CompiledCoremlModel>();
     }
 
     #[test]
@@ -890,6 +898,105 @@ mod test {
         let mut result = vec![0.0f32; 4];
         context.read_tensor(&out, &mut result).unwrap();
         assert_eq!(result, &[1.0f32, 3., 1., 5.]);
+    }
+
+    fn load_route(graph: &MLGraph<'_>) -> CoremlLoadRoute {
+        let Some(LoadDiagnostics::Coreml(diagnostics)) = graph.rustnn_load_diagnostics() else {
+            panic!("CoreML graph did not report load diagnostics");
+        };
+        diagnostics.route
+    }
+
+    #[test]
+    fn coreml_in_memory_model_dispatch_and_drop_on_another_thread() {
+        let _ = pretty_env_logger::try_init();
+        let Some(mut context) = coreml_context() else {
+            return;
+        };
+
+        let desc = MLOperandDescriptor::new(MLOperandDataType::Float32, [4].to_vec());
+        let expected = [11.0f32, 22., 33., 44.];
+        let mut graph = {
+            let mut builder = MLGraphBuilder::new(&mut context).unwrap();
+            // Only proven constant copies use the asset route after typed
+            // arithmetic boundaries move to URL compilation. This also moves
+            // the retained constant owner and feature bindings across threads.
+            let constant = builder
+                .constant_from_bytes(&desc, bytemuck::cast_slice(&expected).to_vec())
+                .unwrap();
+            let out = builder.identity(constant).unwrap();
+            let mut outputs = MLNamedOperands::new();
+            outputs.insert("out", out);
+            builder.build(&outputs).unwrap()
+        };
+        assert_eq!(load_route(&graph), CoremlLoadRoute::InMemoryAsset);
+
+        let mut io_desc = MLTensorDescriptor::from_operand_descriptor(&desc);
+        io_desc.set_writable(true);
+        io_desc.set_readable(true);
+        let out = context.create_tensor(&io_desc).unwrap();
+
+        // Moving the context, graph and tensors into the closure only compiles
+        // while they are `Send`; the model is released on this thread.
+        let result = std::thread::spawn(move || {
+            context
+                .dispatch(
+                    &mut graph,
+                    &MLNamedTensors::new(),
+                    &MLNamedTensors::from([("out", &out)]),
+                )
+                .unwrap();
+            let mut result = vec![0.0f32; 4];
+            context.read_tensor(&out, &mut result).unwrap();
+            result
+        })
+        .join()
+        .unwrap();
+        assert_eq!(result, expected);
+    }
+
+    /// Same lifecycle for the compiled-URL route (int32 neg selects it),
+    /// including the temporary `.mlmodelc` cleanup on the receiving thread.
+    #[test]
+    fn coreml_url_model_dispatch_and_drop_on_another_thread() {
+        let _ = pretty_env_logger::try_init();
+        let Some(mut context) = coreml_context() else {
+            return;
+        };
+
+        let desc = MLOperandDescriptor::new(MLOperandDataType::Int32, [4].to_vec());
+        let mut graph = {
+            let mut builder = MLGraphBuilder::new(&mut context).unwrap();
+            let x = builder.input("x", &desc).unwrap();
+            let out = builder.neg(x).unwrap();
+            let mut outputs = MLNamedOperands::new();
+            outputs.insert("out", out);
+            builder.build(&outputs).unwrap()
+        };
+        assert_eq!(load_route(&graph), CoremlLoadRoute::CompiledUrl);
+
+        let mut io_desc = MLTensorDescriptor::from_operand_descriptor(&desc);
+        io_desc.set_writable(true);
+        io_desc.set_readable(true);
+        let x = context.create_tensor(&io_desc).unwrap();
+        let out = context.create_tensor(&io_desc).unwrap();
+        context.write_tensor(&x, &[1i32, -2, 3, -4]).unwrap();
+
+        let result = std::thread::spawn(move || {
+            context
+                .dispatch(
+                    &mut graph,
+                    &MLNamedTensors::from([("x", &x)]),
+                    &MLNamedTensors::from([("out", &out)]),
+                )
+                .unwrap();
+            let mut result = vec![0i32; 4];
+            context.read_tensor(&out, &mut result).unwrap();
+            result
+        })
+        .join()
+        .unwrap();
+        assert_eq!(result, [-1, 2, -3, 4]);
     }
 
     #[test]
