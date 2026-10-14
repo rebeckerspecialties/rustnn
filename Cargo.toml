@@ -218,6 +218,8 @@ webnn-onnx-utils = { git = "https://github.com/rustnn/webnn-onnx-utils", branch 
 
 cudarc = { version = "0.19", features = ["cuda-13020"], optional = true }
 log = "0.4.29"
+tracing = { version = "0.1.44", default-features = false, features = ["attributes", "std"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 pretty_env_logger = { version = "0.5.0", optional = true }
 seahash = "4.1.0"
 dirs = "7.0.0"
@@ -240,8 +242,8 @@ objc = { version = "0.2", optional = true, features = [
 block = { version = "0.1", optional = true }
 pollster = { version = "1.0.1", optional = true }
 
-[target.'cfg(target_os = "macos")'.dependencies]
-# For macOS, explicitly enable the "exception" feature
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+# Native CoreML targets require Objective-C exception handling.
 objc = { version = "0.2", optional = true, features = ["exception"] }
 
 [build-dependencies]
@@ -252,6 +254,7 @@ cc = "1.0"
 seahash = "4.1.0"
 
 [dev-dependencies]
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
 safetensors = "0.8"
 half = "2.4"
 image = { version = "0.25", default-features = false, features = [
