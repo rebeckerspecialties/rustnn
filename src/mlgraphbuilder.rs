@@ -1,9 +1,11 @@
 //! WebNN `MLGraphBuilder`: records operations into a [`GraphInfo`] and compiles it.
 //!
-//! Every WebNN builder method exists in two forms: `op(...)` with default options and
+//! Most operation methods have two forms: `op(...)` with default options and
 //! `op_with_options(..., options)` taking the matching `ML*Options` struct from
 //! [`crate::operator_options`]. Snake case replaces the JavaScript camel case
 //! (`conv_transpose2d`, `reduce_log_sum_exp`); `where` is `where_` because it is a keyword.
+//! Recurrent operations expose only the `_with_options` form. Consult each method for its
+//! required operands and arguments; optional operand fields use [`crate::operator_options::OperandIndex`].
 //! Shape inference runs when an operation is recorded, so shape errors surface immediately as
 //! [`GraphBuilderError::ShapeInferenceError`].
 //!
@@ -2084,10 +2086,30 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
     /// written to `<stem>.safetensors` next to `path` and referenced from the `.webnn` file via
     /// `@weights(...)`, so the pair round-trips through [`crate::load_graph_from_path`].
     ///
+    /// Int4 and Uint4 constants use the shared packed-U8 SafeTensors extension; see
+    /// the [graph-file guide](crate::loader).
+    ///
     /// Like [`Self::build`], this takes the graph's `outputs` to finalize which operands are graph
     /// outputs, but it borrows the builder read-only: the output names are handed to the exporter
     /// as an override, so neither the graph nor its constant weight bytes are copied or mutated, and
     /// the builder can still be built afterwards.
+    // `operands`/`operations` come from the recorder at entry; they are 0 only on the path whose
+    // recorder is already taken, which fails right after with `GraphAlreadyBuilt`.
+    #[tracing::instrument(
+        name = "save_graph",
+        skip_all,
+        err,
+        level = "info",
+        fields(
+            path = %path.as_ref().display(),
+            output_names = ?crate::instrumentation::Names(outputs),
+            operands = self.recorder.as_ref().map_or(0, |g| g.graph().operands.len()),
+            operations = self
+                .recorder
+                .as_ref()
+                .map_or(0, |g| g.graph().operations.len()),
+        )
+    )]
     pub fn rustnn_save_webnn(
         &self,
         outputs: &MLNamedOperands,
@@ -2145,6 +2167,12 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
     /// Fails when `outputs` is empty, names an input or constant, or maps two names to one
     /// operand. Output names become the keys that [`MLContext::dispatch`] expects.
     /*async*/
+    #[tracing::instrument(
+        skip_all,
+        err,
+        level = "info",
+        fields(output_names = ?crate::instrumentation::Names(outputs))
+    )]
     pub fn build(
         &mut self,
         outputs: &'_ MLNamedOperands,
@@ -2187,7 +2215,6 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
 
             graph.mark_output(operand.id as u32, name.to_string())?;
         }
-        debug!("Building graph with {} operands", graph.operands.len());
         // Verbose info for small graphs
         if graph.operands.len() < 20 {
             trace!("Building graph:\n{graph:#?}");
@@ -2204,7 +2231,12 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
             });
         }
 
-        graph.into_graph().map_err(Into::into)
+        let graph = graph.into_graph()?;
+        tracing::info!(
+            operands = graph.operands.len(),
+            operations = graph.operations.len()
+        );
+        Ok(graph)
     }
 
     /// Debug tool to check operand shape

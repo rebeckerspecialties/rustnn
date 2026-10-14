@@ -172,13 +172,13 @@ fields retain their zero-conversion semantics, and string labels are unchanged.
 The test-only JSON dependency enables round-trip binary64 parsing so finite source
 numbers also retain their original JavaScript precision. Production JSON parsing is unchanged.
 
-This follow-up is staged for WPT [#63150](https://github.com/web-platform-tests/wpt/pull/63150)
+The corpus pin includes merged WPT [#63150](https://github.com/web-platform-tests/wpt/pull/63150)
 and [#63151](https://github.com/web-platform-tests/wpt/pull/63151), which correct
-signed FP16 distance and binary64 rounding. They must land before the pinned
-corpus is updated and this follow-up is submitted upstream; the current fetch pin is unchanged.
-Use `WPT_DIR` to select the explicitly recorded revised source when validating this branch.
-The old pinned helpers are not interchangeable with the revised adapter: migrate the
-adapter and pin together. Do not run `fetch-wpt` against a prepared dependency checkout.
+signed FP16 distance and binary64 rounding. The adapter and `WPT_REVISION` move
+together: older helper revisions are not interchangeable with this adapter.
+Use a Node.js version with native `Float16Array` support for the fixture bridge.
+`WPT_DIR` can select a separately prepared corpus; do not run `fetch-wpt` against
+a checkout containing unpublished tests.
 
 `make test-wpt-tolerance` runs the comparator regressions without a backend.
 With the corresponding corpus prepared and Node.js available, run

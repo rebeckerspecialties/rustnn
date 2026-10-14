@@ -10,16 +10,16 @@ Documentation map:
 | Topic | Location |
 |---|---|
 | Site entry point | `docs/index.md` (built with MkDocs, `make docs-build`) |
-| API overview, backends, examples, advanced topics, troubleshooting | `docs/user-guide/` |
+| Installation, workflow examples, troubleshooting | `docs/user-guide/` |
 | Architecture | `docs/architecture/overview.md` |
 | Workflow, Make targets, adding operations and backends, CI | `docs/development/setup.md` |
 | Converter contract, per-backend lowering rules, debugging emitted models | `docs/development/converters.md` |
 | What to update together with a code change | `docs/development/documentation-policy.md` |
-| Implementation status and known gaps | `docs/development/implementation-status.md` |
+| API contracts and known limitations | Source Rustdoc; shared backend integration guides |
 | Operator support per backend (generated) | `docs/development/backend-operator-support.md` |
 | WPT conformance harness | `docs/testing/wpt-test-guide.md` |
 | Backend pages: TensorRT-RTX, CoreML, LiteRT, CANN, browser WebNN | `docs/integration/` |
-| Specification-to-API mapping; `.webnn`, JSON and weight file formats | `docs/reference/webnn-spec.md`, `docs/reference/graph-files.md` |
+| `.webnn`, JSON and weights (shared with loader Rustdoc) | `docs/reference/graph-files.md` |
 | Rust API reference | `make docs-api` (rustdoc), published under https://rustnn.github.io/rustnn/api/rustnn/ |
 
 ## Read this first
@@ -93,9 +93,10 @@ Feature checks CI runs: `cargo check`, `cargo check --features onnx-runtime`,
 `cargo check --features cann-runtime`, `cargo check --features coreml-runtime` (macOS), wasm32
 with `webnn-runtime`; `cargo test --lib` and `cargo test --lib --features cann-runtime-mock`.
 
-Environment variables: `ORT_DYLIB_PATH` (ONNX Runtime library), `RUST_LOG`, `RUSTNN_DEBUG=1|2`
-with `RUSTNN_DEBUG_ONNX_DIR`, `RUSTNN_TRTX_LOG_VERBOSITY`, `TRTX_JSON_DUMP_PATH`, `WPT_BACKEND`,
-`WPT_DIR`. The tables in `src/lib.rs` are authoritative.
+Environment variables: `ORT_DYLIB_PATH` (ONNX Runtime library), `RUST_LOG` (filters `log`
+records and spans in one stream), `RUSTNN_DEBUG=1|2` with `RUSTNN_DEBUG_ONNX_DIR`,
+`RUSTNN_TRTX_LOG_VERBOSITY`, `TRTX_JSON_DUMP_PATH`, `WPT_BACKEND`, `WPT_DIR`. The tables in
+`src/lib.rs` are authoritative.
 
 ## Before proposing a commit
 
@@ -118,7 +119,7 @@ Check the Chromium reference implementation first
 checklist in `docs/development/setup.md`: options struct, `Operation` variant and `op_type`,
 shape inference with tests, builder method, `webnn_json` mapping, each converter (or an explicit
 unsupported entry), WPT per backend with snapshot sync, `make docs-backend-ops`, and the
-operation table in `docs/user-guide/api-reference.md`.
+method and option-field Rustdoc. Do not maintain parallel API tables in guide pages.
 
 ## WebNN specification reference
 

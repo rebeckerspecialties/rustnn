@@ -42,8 +42,16 @@ theme:
   icon:
     repo: fontawesome/brands/github
 
+extra_css:
+  - stylesheets/table-headers.css
+extra_javascript:
+  - javascripts/table-headers.js
+
 plugins:
   - search
+
+hooks:
+  - scripts/build_capi_docs.py
 
 # Exclude files from the docs site. docs/archive holds superseded plans and
 # investigation notes that reference removed APIs; they are kept for history only.
@@ -73,20 +81,17 @@ nav:
   - Home: index.md
   - User Guide:
       - Getting Started: user-guide/getting-started.md
-      - API Overview: user-guide/api-reference.md
-      - Backends: user-guide/backends.md
       - Examples: user-guide/examples.md
-      - WebNN graph files: user-guide/webnn-files.md
-      - Advanced Topics: user-guide/advanced.md
       - Troubleshooting: user-guide/troubleshooting.md
-      - Rust API Reference (rustdoc, deployed from main): https://rustnn.github.io/rustnn/api/rustnn/
+      - Rust API Reference (from source, deployed from main): https://rustnn.github.io/rustnn/api/rustnn/
+      - C and C++ API Reference (Doxygen): c-api/index.html
   - Architecture:
       - Overview: architecture/overview.md
   - Development:
       - Setup and Workflow: development/setup.md
       - Converter Internals: development/converters.md
       - Documentation Policy: development/documentation-policy.md
-      - Implementation Status: development/implementation-status.md
+      - API and Support Map: development/implementation-status.md
       - Backend Operator Support: development/backend-operator-support.md
       - Flexible Input Shapes: development/flexible-input-shapes.md
       - Code Coverage: development/code-coverage.md
@@ -101,7 +106,7 @@ nav:
       - CANN (OpenHarmony): integration/cann.md
       - Browser WebNN (wasm32): integration/webnn-browser.md
   - Reference:
-      - WebNN Specification and rustnn: reference/webnn-spec.md
+      - C and C++ API: reference/c-api.md
       - Graph Files and Weights: reference/graph-files.md
       - Changelog: https://github.com/rustnn/rustnn/blob/main/CHANGELOG.md
 

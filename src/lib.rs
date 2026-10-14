@@ -67,6 +67,13 @@
 //! # }
 //! ```
 //!
+//! # Diagnostics
+//!
+//! Library users install their own [`tracing`] subscriber; the CLI installs one filtered by
+//! `RUST_LOG`. Spans identify contexts, graphs, files and calls. Targets are module paths, so
+//! filters can select a backend or subsystem. Instrumented public calls record errors on their
+//! spans before returning them. See the environment variables below for converter dumps.
+//!
 //! # Cargo features
 //!
 //! Backends are opt-in. Without a runtime feature the crate still validates graphs and
@@ -90,7 +97,7 @@
 //!
 //! | Variable | Effect |
 //! |---|---|
-//! | `RUST_LOG` | Log filter for the `log` crate (`info` prints the selected backend) |
+//! | `RUST_LOG` | Log and span filter; off unless set (`info` prints the selected backend, `rustnn=debug` adds the per-call spans) |
 //! | `RUSTNN_DEBUG` | `1` enables [`debug_print!`] output; `2` also writes the converted ONNX model |
 //! | `RUSTNN_DEBUG_ONNX_DIR` | Directory for the ONNX dump written when `RUSTNN_DEBUG=2` |
 //! | `RUSTNN_TRTX_LOG_VERBOSITY` | TensorRT logger filter: `internal_error`, `error`, `warning`, `info` or `verbose` |
@@ -115,6 +122,7 @@ pub mod executors;
 pub mod graph;
 mod graph_recorder;
 pub mod graphviz;
+mod instrumentation;
 pub mod limits;
 pub mod loader;
 pub mod mlcontext;

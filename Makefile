@@ -15,6 +15,8 @@ OHOS_SDK_NATIVE ?=
 CAPI_PREFIX ?= $(CURDIR)/target/rustnn-capi-install
 CAPI_EXAMPLE_BUILD_DIR ?= $(CURDIR)/target/examples/capi
 CAPI_RUST_LOG ?= info
+CBINDGEN ?= cbindgen
+DOXYGEN ?= doxygen
 
 ORT_VERSION ?= 1.29.0
 ORT_BASE ?= https://github.com/microsoft/onnxruntime/releases/download/v$(ORT_VERSION)
@@ -102,7 +104,7 @@ CANN_CROSS_ENV = CC_aarch64_unknown_linux_ohos=$(OHOS_SDK_NATIVE)/llvm/bin/clang
 
 .PHONY: build test fmt fmt-check lint run viz clean clean-all help \
 	coverage coverage-html coverage-lcov coverage-open coverage-clean \
-	docs-serve docs-build docs-clean ci-docs docs-api docs-backend-ops docs-backend-ops-check \
+	docs-serve docs-build docs-clean ci-docs docs-api docs-capi docs-backend-ops docs-backend-ops-check \
 	fetch-wpt require-wpt-cache test-wpt test-wpt-trtx test-wpt-litert test-wpt-coreml \
 	test-wpt-coreml-report build-coreml test-coreml benchmark-coreml-kv test-wpt-op test-wpt-report test-wpt-cann \
 	wpt-sync-onnx wpt-sync-litert wpt-sync-coreml wpt-sync-trtx wpt-sync-cann \
@@ -185,11 +187,7 @@ test-wpt-trtx: onnxruntime-download trtxruntime-download
 	$(ORT_ENV_VARS) $(TRT_ENV_VARS) $(CARGO) test --test run_wpt_conformance --features "onnx-runtime,trtx-runtime" -- trtx --test-threads 1
 
 test-wpt-litert:
-	@HOST_TRIPLE=$$(rustc -vV 2>/dev/null | grep host: | cut -d' ' -f2); \
-	LITERT_LIB_DIR="$${HOME}/.cache/litert-sys/v0.10.2/$${HOST_TRIPLE}"; \
-	LD_LIBRARY_PATH="$$LITERT_LIB_DIR:$$LD_LIBRARY_PATH" \
-	LIBRARY_PATH="$$LITERT_LIB_DIR:$$LIBRARY_PATH" \
-	WPT_REPORT_JSON="$(WPT_REPORT_LITERT_JSON)" \
+	@WPT_REPORT_JSON="$(WPT_REPORT_LITERT_JSON)" \
 	$(CARGO) test --test run_wpt_conformance --features "litert-runtime" -- litert --test-threads=1
 
 test-wpt-coreml:
@@ -255,11 +253,7 @@ WPT_BACKEND ?= onnx
 test-wpt-report: fetch-wpt onnxruntime-download
 	@mkdir -p reports
 	$(MAKE) test-wpt-tolerance-parity
-	@HOST_TRIPLE=$$(rustc -vV 2>/dev/null | grep host: | cut -d' ' -f2); \
-	LITERT_LIB_DIR="$${HOME}/.cache/litert-sys/v0.10.2/$${HOST_TRIPLE}"; \
-	LD_LIBRARY_PATH="$$LITERT_LIB_DIR:$$LD_LIBRARY_PATH" \
-	LIBRARY_PATH="$$LITERT_LIB_DIR:$$LIBRARY_PATH" \
-	RUST_BACKTRACE=1 WPT_REPORT_JSON=reports/wpt-conformance.json $(ORT_ENV_VARS) $(CARGO) test --test run_wpt_conformance --features $(WPT_BACKEND)-runtime -- --test-threads 1
+	@RUST_BACKTRACE=1 WPT_REPORT_JSON=reports/wpt-conformance.json $(ORT_ENV_VARS) $(CARGO) test --test run_wpt_conformance --features $(WPT_BACKEND)-runtime -- --test-threads 1
 
 # ONNX: onnx_expected_failures.txt.
 wpt-sync-onnx: fetch-wpt
@@ -459,6 +453,15 @@ docs-api:
 	RUSTDOCFLAGS="-D warnings" $(CARGO) doc --no-deps --lib --features $(DOCS_API_FEATURES)
 	@echo "[OK] Rust API documentation generated in target/doc/rustnn/"
 
+# Generate directly from the C ABI source; no backend build or cargo-c install needed.
+docs-capi:
+	@command -v $(CBINDGEN) >/dev/null 2>&1 || { echo "Install cbindgen: cargo install cbindgen --locked"; exit 1; }
+	@command -v $(DOXYGEN) >/dev/null 2>&1 || { echo "Install Doxygen using your system package manager"; exit 1; }
+	mkdir -p target/doxygen/include/rustnn
+	$(CBINDGEN) --config cbindgen.toml src/capi.rs --output target/doxygen/include/rustnn/rustnn.h
+	$(DOXYGEN) Doxyfile
+	@echo "[OK] C and C++ API documentation generated in target/doxygen/html/index.html"
+
 docs-backend-ops:
 	@echo "Generating backend operator support report..."
 	python3 scripts/generate_backend_operator_report.py
@@ -546,6 +549,7 @@ help:
 	@echo "  docs-build         - Build static documentation site"
 	@echo "  ci-docs            - Build documentation in strict mode (CI)"
 	@echo "  docs-api           - Build Rust API docs (rustdoc, warnings are errors)"
+	@echo "  docs-capi          - Generate rustnn.h and build C/C++ API docs with Doxygen"
 	@echo "  docs-clean         - Clean documentation artifacts"
 	@echo "  docs-backend-ops   - Generate backend operator support report"
 	@echo "  docs-backend-ops-check - Verify backend operator report is up to date"
