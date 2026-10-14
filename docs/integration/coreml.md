@@ -42,14 +42,19 @@ establishes placement, energy savings or prediction-time fallback; use separate 
 
 ## How a graph runs
 
-1. The converter lowers the graph to a MIL program. Rank-0 operands are promoted to `[1]` at the
+1. The converter lowers the graph to MIL programs. Rank-0 operands are promoted to `[1]` at the
    model boundary, comparison and logical results are produced as `uint8`, and reductions with
    empty axes, `resample2d` on arbitrary axis pairs and the stable `reduceLogSumExp` form are
    lowered explicitly because MIL has no direct equivalent.
-2. Float16 weights are written as a separate weights blob (`ConvertedGraph::weights_data`), and
-   the model is packaged as an in-memory asset together with that blob. Graphs for which the
-   in-memory compiler is known to misbehave (`gather` with a rank-0 index) are written to a
-   temporary directory and compiled from its URL instead (`supports_in_memory_asset`).
+2. Float16 weights remain a separate shared blob (`ConvertedGraph::weights_data`). Arithmetic
+   and typed boundaries compile locally from a URL: the in-memory route changes represented
+   values on multiple tested CoreML stacks. Input-free single programs consisting entirely of
+   proven constant copies prefer the in-memory asset route to avoid a BNNS URL constant-fold
+   crash. Narrowing, arithmetic and mixed computed outputs cannot take this exception.
+   Neither route forces CPU-only execution.
+   Real precision boundaries are materialized as native Pipeline children where needed.
+   The children expose live values only and reuse the original weight storage; the public
+   WebNN graph, types and shapes are unchanged.
 3. `MLGraphBuilder::build` compiles the model with `MLModel` and keeps the compiled model;
    `dispatch` binds `MLMultiArray`s over the tensor storage and runs a prediction.
 4. The legacy CLI path (`--convert coreml --run-coreml`) tries the compute-unit configurations in
@@ -158,6 +163,11 @@ These count rustnn-side work, not total memory traffic or internal CoreML alloca
 reported compute-unit policy includes load fallback but does not measure accelerator
 placement. Take counter differences around the decode loop to exclude prefill and setup.
 
+Native precision Pipelines retain input tensor storage but copy returned outputs.
+CoreML applies the outer output-backing names while evaluating earlier children,
+which reject final features absent from their own descriptions. Backings are therefore
+proposed only for a single MLProgram, even when a Pipeline's source graph is static.
+
 ## Converter-private input views
 
 Precision lowerings can request a compact native Half input through creator-defined
@@ -182,7 +192,7 @@ disabled, retaining the tensor storage and private view owners through predictio
 make test-wpt-coreml              # full WPT suite, expected failures are non-fatal
 make test-wpt-coreml-report       # same, plus the JSON report
 make wpt-sync-coreml              # regenerate tests/wpt_conformance/coreml_expected_failures.txt
-make test-coreml                  # ordinary native unit and integration tests
+make test-coreml                  # unit and integration tests
 WPT_COREML_TENSOR_MODE=persistent make test-wpt-coreml
 WPT_COREML_TENSOR_MODE=backings make test-wpt-coreml
 ```
