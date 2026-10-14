@@ -68,6 +68,8 @@ fn signed_copy_and_half_cast_graph(scalar: bool) -> GraphInfo {
         vec![Dimension::Static(256)]
     };
     let mut graph = identity_graph(DataType::Int8, shape, true);
+    // Signed reconstruction must retain the converter's private MIL name map.
+    graph.operands[0].name = Some("if".into());
     let mut half = graph.operands[1].descriptor.clone();
     half.data_type = DataType::Float16;
     graph.operands.push(Operand {
