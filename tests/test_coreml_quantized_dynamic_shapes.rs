@@ -129,12 +129,16 @@ fn broadcast_quantization_keeps_symbolic_data_dimensions() {
             vec![Dimension::Static(1), Dimension::Static(4)],
         ] {
             for name in ["quantizeLinear", "dequantizeLinear"] {
-                let original = graph(
+                let mut original = graph(
                     name,
                     float_type,
                     vec![dynamic("batch", 3), Dimension::Static(4)],
                     parameters.clone(),
                 );
+                // Source names must not bypass private MIL bindings or collide
+                // with the quantization helper names generated below.
+                original.operands[0].name = Some("if".into());
+                original.operands[1].name = Some("result_q_in_f".into());
                 let converted = CoremlMlProgramConverter.convert(&original).unwrap();
                 let model = specification::Model::decode(converted.data.as_slice()).unwrap();
                 let operations = operations(&model);
