@@ -39,6 +39,8 @@ use crate::protos::coreml::specification::Model;
 use prost::Message;
 use std::collections::HashMap;
 
+mod stride_two;
+
 /// Convert zero_point byte data from a source dtype to a target dtype.
 /// Only Int32 → Uint8 and Int32 → Int8 are supported; all other pairs are returned as-is.
 /// Values are clamped to the target range to avoid silent corruption.
@@ -10575,6 +10577,10 @@ impl super::GraphConverter for CoremlMlProgramConverter {
 
         // Set MLProgram
         model.r#type = Some(crate::protos::coreml::specification::model::Type::MlProgram(program));
+
+        // Apply layout-only normalization last, including slices introduced by
+        // arithmetic lowering. Keep native partition boundaries unchanged.
+        stride_two::rewrite_model(&mut model);
 
         // Serialize to bytes
         let mut buffer = Vec::new();

@@ -207,6 +207,11 @@ test-coreml-gather:
 test-coreml-dtypes:
 	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_dtypes -- $(TEST_FILTER) --test-threads=1
 
+.PHONY: test-coreml-stride-two
+test-coreml-stride-two:
+	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --lib stride_two -- --test-threads=1
+	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_stride_two -- --test-threads=1
+
 .PHONY: test-coreml-tensor-reuse
 test-coreml-tensor-reuse:
 	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_tensor_reuse -- $(TEST_FILTER) --test-threads=1
