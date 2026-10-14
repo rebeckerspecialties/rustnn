@@ -1127,6 +1127,12 @@ impl CoremlMlProgramConverter {
                             | Operation::Triangular { .. }
                             | Operation::IsNaN { .. }
                             | Operation::IsInfinite { .. }
+                            | Operation::CumulativeSum { .. }
+                            | Operation::ReduceMin { .. }
+                            | Operation::ReduceSumSquare { .. }
+                            | Operation::Conv2d { .. }
+                            | Operation::AveragePool2d { .. }
+                            | Operation::BatchNormalization { .. }
                     )
                 })
                 .flat_map(|operation| operation.all_input_operands())
@@ -1356,6 +1362,12 @@ impl CoremlMlProgramConverter {
                         | Operation::Prelu { .. }
                         | Operation::Gemm { .. }
                         | Operation::Triangular { .. }
+                        | Operation::CumulativeSum { .. }
+                        | Operation::ReduceMin { .. }
+                        | Operation::ReduceSumSquare { .. }
+                        | Operation::Conv2d { .. }
+                        | Operation::AveragePool2d { .. }
+                        | Operation::BatchNormalization { .. }
                 )
             })
             .flat_map(|operation| operation.outputs())

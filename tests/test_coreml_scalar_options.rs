@@ -369,7 +369,9 @@ fn normalization_epsilon_rounds_the_original_double_to_half() {
         &json!({"epsilon":epsilon}),
     )
     .unwrap();
-    expect_scalar(&graph, "batch_norm", "epsilon", 0x3c01);
+    // The complete Half BatchNorm formula adds its represented epsilon to
+    // variance in Float32 instead of using native batch_norm const parameters.
+    expect_scalar(&graph, "add", "y", 0x3c01);
 }
 
 #[test]
@@ -603,7 +605,11 @@ fn normalization_epsilon_keeps_lowest_sticky_bit_with_and_without_affine_operand
                 }
                 graph.operations[0] =
                     Operation::from_json_attributes(name, &inputs, &[1], &options).unwrap();
-                expect_scalar(&graph, kernel, "epsilon", expected);
+                if name == "batchNormalization" {
+                    expect_scalar(&graph, "add", "y", expected);
+                } else {
+                    expect_scalar(&graph, kernel, "epsilon", expected);
+                }
                 assert!(
                     graph
                         .operands
