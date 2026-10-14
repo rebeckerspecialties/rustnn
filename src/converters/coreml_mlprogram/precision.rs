@@ -151,7 +151,7 @@ fn constant_closure(operations: &[MilOperation], materialized: &HashSet<String>)
 // Only materialize stored Half constants whose represented values feed the
 // empirically affected predicate/arg kernels. Unrelated model weights remain
 // compile-time constant closures, rather than large per-prediction features.
-fn predicate_half_constant_inputs(graph: &GraphInfo) -> HashSet<String> {
+fn predicate_half_constant_inputs(graph: &LoweringGraph<'_>) -> HashSet<String> {
     let mut origins: HashMap<u32, HashSet<u32>> = graph
         .constant_operand_ids_to_handles
         .keys()
@@ -431,7 +431,7 @@ fn argument_shape(
 }
 
 fn shape_bounds(
-    graph: &GraphInfo,
+    graph: &LoweringGraph<'_>,
     types: &HashMap<String, NamedValueType>,
     operations: &[MilOperation],
 ) -> HashMap<String, Vec<GraphDimension>> {
@@ -439,7 +439,7 @@ fn shape_bounds(
 }
 
 fn shape_bounds_seeded(
-    graph: &GraphInfo,
+    graph: &LoweringGraph<'_>,
     types: &HashMap<String, NamedValueType>,
     operations: &[MilOperation],
     retained: &HashMap<String, Vec<GraphDimension>>,
@@ -599,7 +599,7 @@ struct PackedWidenings {
 // restoration is FP32-only; dynamic dimensions come from the live source, not
 // the graph's upper bounds.
 fn pack_half_widenings(
-    graph: &GraphInfo,
+    graph: &LoweringGraph<'_>,
     function_inputs: &[NamedValueType],
     block: &mut Block,
     materialized_constants: &HashSet<String>,
@@ -1052,7 +1052,7 @@ impl CoremlMlProgramConverter {
     }
 
     pub(super) fn fold_constant_half_casts(
-        graph: &GraphInfo,
+        graph: &LoweringGraph<'_>,
         model: &mut Model,
         weights: &mut super::super::WeightFileBuilder,
     ) -> Result<(), GraphError> {
@@ -1167,7 +1167,7 @@ impl CoremlMlProgramConverter {
 
     pub(super) fn materialize_precision_boundaries(
         &self,
-        graph: &GraphInfo,
+        graph: &LoweringGraph<'_>,
         mut model: Model,
         promoted: &HashSet<String>,
         materialized_boolean_results: &HashSet<String>,

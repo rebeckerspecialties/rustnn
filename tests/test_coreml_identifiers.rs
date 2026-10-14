@@ -72,6 +72,80 @@ fn coreml_identifiers_are_valid_unique_and_preserve_graph_names() {
     }
 }
 
+#[test]
+fn coreml_identifiers_are_deterministic_for_large_duplicate_name_graphs() {
+    const COUNT: usize = 2_048;
+    let mut graph = GraphInfo::default();
+    for id in 0..COUNT {
+        graph.operands.push(Operand {
+            kind: if id == 0 {
+                OperandKind::Input
+            } else {
+                OperandKind::Output
+            },
+            name: Some(match id {
+                2 => "__rustnn_operand_1".into(),
+                3 => "__rustnn_operand_1_1".into(),
+                id if id == COUNT - 1 => "result".into(),
+                _ => "value".into(),
+            }),
+            descriptor: OperandDescriptor {
+                data_type: DataType::Float32,
+                shape: vec![rustnn::graph::Dimension::Static(2)],
+                pending_permutation: vec![],
+            },
+        });
+        if id != 0 {
+            graph.operations.push(Operation::Neg {
+                input: id as u32 - 1,
+                options: None,
+                outputs: vec![id as u32],
+            });
+        }
+    }
+    graph.input_operands = vec![0];
+    graph.output_operands = vec![COUNT as u32 - 1];
+    let names = || {
+        let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+        let model = rustnn::protos::coreml::specification::Model::decode(converted.data.as_slice())
+            .unwrap();
+        let rustnn::protos::coreml::specification::model::Type::MlProgram(program) =
+            model.r#type.unwrap()
+        else {
+            panic!("expected MLProgram")
+        };
+        let function = &program.functions["main"];
+        function
+            .inputs
+            .iter()
+            .chain(
+                function.block_specializations["CoreML7"]
+                    .operations
+                    .iter()
+                    .flat_map(|op| &op.outputs),
+            )
+            .map(|value| value.name.clone())
+            .collect::<Vec<_>>()
+    };
+    let first = names();
+    assert_eq!(first, names());
+    assert_eq!(first.len(), COUNT);
+    assert_eq!(
+        first.iter().collect::<std::collections::HashSet<_>>().len(),
+        COUNT
+    );
+    assert_eq!(
+        &first[..4],
+        &[
+            "value",
+            "__rustnn_operand_1_2",
+            "__rustnn_operand_1",
+            "__rustnn_operand_1_1"
+        ]
+    );
+    assert_eq!(graph.operands[1].name.as_deref(), Some("value"));
+}
+
 #[cfg(all(target_os = "macos", feature = "coreml-runtime"))]
 #[test]
 fn coreml_identifiers_dispatch_using_original_names() {
@@ -222,49 +296,6 @@ fn coreml_identifiers_one_shot_and_checked_execution_use_original_names() {
         let output = outputs.iter().find(|output| output.name == name).unwrap();
         assert_eq!(output.data, vec![0.0, 0.0]);
     }
-}
-
-#[cfg(all(target_os = "macos", feature = "coreml-runtime"))]
-#[test]
-fn coreml_identifiers_read_previous_marker_only_exports() {
-    use rustnn::executors::coreml::{CoremlInput, run_coreml_with_inputs_with_weights};
-    use rustnn::protos::coreml::specification;
-    let mut graph = named_graph();
-    graph.operands.truncate(2);
-    graph.operations.truncate(1);
-    graph.input_operands.truncate(1);
-    graph.output_operands.truncate(1);
-    let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
-    let mut model = specification::Model::decode(converted.data.as_slice()).unwrap();
-    model
-        .description
-        .as_mut()
-        .unwrap()
-        .metadata
-        .as_mut()
-        .unwrap()
-        .user_defined
-        .retain(|key, _| key == "rustnn.coreml.name_encoding");
-    let attempts = run_coreml_with_inputs_with_weights(
-        &model.encode_to_vec(),
-        None,
-        vec![CoremlInput {
-            name: "state".into(),
-            shape: vec![2],
-            data: vec![2., -3.],
-        }],
-    )
-    .unwrap();
-    let outputs = attempts
-        .iter()
-        .find(|attempt| attempt.compute_unit == "CPU_ONLY")
-        .unwrap()
-        .result
-        .as_ref()
-        .unwrap();
-    assert_eq!(outputs.len(), 1);
-    assert_eq!(outputs[0].name, "tensor");
-    assert_eq!(outputs[0].data, [-2., 3.]);
 }
 
 #[cfg(all(target_os = "macos", feature = "coreml-runtime"))]

@@ -326,6 +326,59 @@ fn ordinary_single_copy_output_keeps_its_name_and_serializes_the_source_proof() 
 }
 
 #[test]
+fn checked_diagnostics_report_computed_scalars_without_relabeling_singletons() {
+    use rustnn::executors::coreml::{CoremlInput, run_coreml_with_inputs_checked};
+    use std::collections::HashMap;
+    for shape in [vec![], vec![Dimension::Static(1)]] {
+        let mut graph = named_graph(DataType::Float32, shape, false);
+        graph.operands[0].descriptor.shape = vec![Dimension::Static(1)];
+        graph.operands[1].name = Some("unused".into());
+        graph.output_operands = vec![2];
+        graph.operations = vec![Operation::ReduceSum {
+            input: 0,
+            options: Some(rustnn::operator_options::MLReduceOptions {
+                axes: Some(vec![0]),
+                keep_dimensions: !graph.operands[2].descriptor.shape.is_empty(),
+                ..Default::default()
+            }),
+            outputs: vec![2],
+        }];
+        let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+        let inputs = HashMap::from([("shared".into(), graph.operands[0].descriptor.clone())]);
+        let outputs = HashMap::from([("copy".into(), graph.operands[2].descriptor.clone())]);
+        let attempts = run_coreml_with_inputs_checked(
+            &converted.data,
+            vec![CoremlInput {
+                name: "shared".into(),
+                shape: vec![1],
+                data: vec![2.0],
+            }],
+            &inputs,
+            &outputs,
+        )
+        .unwrap();
+        let result = attempts
+            .iter()
+            .find(|attempt| attempt.compute_unit == "CPU_ONLY")
+            .unwrap()
+            .result
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            result[0].shape,
+            graph.operands[2]
+                .descriptor
+                .static_shape()
+                .unwrap()
+                .into_iter()
+                .map(i64::from)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(result[0].data, [2.0]);
+    }
+}
+
+#[test]
 fn input_as_output_still_requires_a_produced_operand() {
     let mut context = MLContext::create(
         &MLContextOptions::new(MLPowerPreference::Default, false)

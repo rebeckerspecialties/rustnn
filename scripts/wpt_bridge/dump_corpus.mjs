@@ -12,24 +12,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { loadWptConformanceFile } from './load-wpt-file.mjs';
+import { normalizeValue } from './normalize-fixture.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '../..');
-
-function normalizeValue(v) {
-  if (typeof v === 'number' && !Number.isFinite(v)) {
-    if (Number.isNaN(v)) return 'NaN';
-    return v > 0 ? 'Infinity' : '-Infinity';
-  }
-  if (typeof v === 'bigint') return v.toString();
-  if (Array.isArray(v)) return v.map(normalizeValue);
-  if (v && typeof v === 'object') {
-    const out = {};
-    for (const [k, val] of Object.entries(v)) out[k] = normalizeValue(val);
-    return out;
-  }
-  return v;
-}
 
 function parseArgs(argv) {
   const opts = {

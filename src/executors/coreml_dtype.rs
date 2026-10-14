@@ -116,6 +116,45 @@ pub(super) fn from_native(
     convert(bytes, source.storage(), StorageType::Webnn(target), count)
 }
 
+/// Round directly from binary64 to binary16, retaining every discarded bit.
+/// The dependency's software conversion truncates the low 32 significand bits
+/// before testing a tie. This also affects binary32 values widened to binary64
+/// on devices without the hardware half-conversion instruction.
+fn half_bits(value: f64) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 48) & 0x8000) as u16;
+    let exponent = ((bits >> 52) & 0x7ff) as i32;
+    let fraction = bits & ((1u64 << 52) - 1);
+    if exponent == 0x7ff {
+        return sign | if fraction == 0 { 0x7c00 } else { 0x7e00 };
+    }
+    // Binary64 subnormals are all below half's smallest rounding midpoint.
+    if exponent == 0 {
+        return sign;
+    }
+    let exponent = exponent - 1023;
+    if exponent > 15 {
+        return sign | 0x7c00;
+    }
+    let significand = fraction | (1u64 << 52);
+    if exponent >= -14 {
+        let rounded = round_shift_even(significand, 42);
+        // A significand carry advances the exponent, including finite overflow.
+        return sign | ((((exponent + 15) as u16) << 10) + (rounded as u16 - 1024));
+    }
+    if exponent < -25 {
+        return sign;
+    }
+    sign | round_shift_even(significand, (28 - exponent) as u32) as u16
+}
+
+fn round_shift_even(value: u64, shift: u32) -> u64 {
+    let retained = value >> shift;
+    let discarded = value & ((1u64 << shift) - 1);
+    let midpoint = 1u64 << (shift - 1);
+    retained + u64::from(discarded > midpoint || (discarded == midpoint && retained & 1 != 0))
+}
+
 /// Host buffers need not be aligned. Decode byte arrays rather than making
 /// typed references into a Vec<u8>. Preserve bits only when the types match.
 fn convert(
@@ -145,9 +184,9 @@ fn convert(
                     StorageType::Webnn(DataType::Float32) => {
                         output.extend_from_slice(&(value as f32).to_ne_bytes())
                     }
-                    StorageType::Webnn(DataType::Float16) => output.extend_from_slice(
-                        &half::f16::from_f64(value as f64).to_bits().to_ne_bytes(),
-                    ),
+                    StorageType::Webnn(DataType::Float16) => {
+                        output.extend_from_slice(&half_bits(value as f64).to_ne_bytes())
+                    }
                     StorageType::Webnn(DataType::Int32) => {
                         output.extend_from_slice(&(value as i32).to_ne_bytes())
                     }
@@ -217,6 +256,7 @@ pub(super) struct ArrayLayout {
     strides: Vec<usize>,
     pub(super) count: usize,
     pub(super) byte_length: usize,
+    pub(super) storage_byte_length: usize,
     pub(super) contiguous: bool,
     element_size: usize,
 }
@@ -255,7 +295,7 @@ impl ArrayLayout {
             .checked_mul(element_size)
             .filter(|&length| length <= isize::MAX as usize)
             .ok_or_else(|| boundary_error("MLMultiArray byte length overflow"))?;
-        if count > 0 {
+        let storage_byte_length = if count > 0 {
             let span = dimensions
                 .iter()
                 .zip(&strides)
@@ -267,10 +307,11 @@ impl ArrayLayout {
                 })
                 .and_then(|last| last.checked_add(1))
                 .and_then(|elements| elements.checked_mul(element_size));
-            if span.is_none_or(|span| span > isize::MAX as usize) {
-                return Err(boundary_error("MLMultiArray strided storage span overflow"));
-            }
-        }
+            span.filter(|&span| span <= isize::MAX as usize)
+                .ok_or_else(|| boundary_error("MLMultiArray strided storage span overflow"))?
+        } else {
+            0
+        };
         let mut contiguous = true;
         let mut expected_stride = 1usize;
         for (&dimension, &stride) in dimensions.iter().zip(&strides).rev() {
@@ -284,6 +325,7 @@ impl ArrayLayout {
             strides,
             count,
             byte_length,
+            storage_byte_length,
             contiguous,
             element_size,
         })
@@ -419,6 +461,102 @@ mod tests {
     }
 
     #[test]
+    fn coreml_dtypes_half_rounds_every_midpoint_and_neighbor_in_both_directions() {
+        // Build expectations from adjacent binary16 encodings, not from another
+        // float-to-half converter. Each midpoint is exactly representable in
+        // binary32 and binary64; its immediate neighbors must round oppositely.
+        let half_value = |bits: u16| {
+            let exponent = bits >> 10;
+            let fraction = bits & 1023;
+            if exponent == 0 {
+                f64::from(fraction) * 2f64.powi(-24)
+            } else {
+                f64::from(1024 + fraction) * 2f64.powi(i32::from(exponent) - 25)
+            }
+        };
+        let mut singles = Vec::new();
+        let mut doubles = Vec::new();
+        let mut expected = Vec::new();
+        for lower in 0u16..0x7bff {
+            let midpoint = (half_value(lower) + half_value(lower + 1)) / 2.;
+            let tie = lower + (lower & 1);
+            for (offset, want) in [(-1i64, lower), (0, tie), (1, lower + 1)] {
+                let single = f32::from_bits(((midpoint as f32).to_bits() as i64 + offset) as u32);
+                let double = f64::from_bits((midpoint.to_bits() as i64 + offset) as u64);
+                for sign in [false, true] {
+                    singles.extend_from_slice(&(if sign { -single } else { single }).to_ne_bytes());
+                    doubles.extend_from_slice(&(if sign { -double } else { double }).to_ne_bytes());
+                    expected
+                        .extend_from_slice(&(want | if sign { 0x8000 } else { 0 }).to_ne_bytes());
+                }
+            }
+        }
+        let count = expected.len() / 2;
+        assert_eq!(
+            to_native(&singles, DataType::Float32, NativeType::Float16, count).unwrap(),
+            expected,
+            "float32 input boundary"
+        );
+        assert_eq!(
+            from_native(&doubles, NativeType::Double, DataType::Float16, count).unwrap(),
+            expected,
+            "double output boundary"
+        );
+    }
+
+    #[test]
+    fn coreml_dtypes_half_keeps_sticky_bits_and_handles_special_values() {
+        let above_tie = 1. + 2f64.powi(-11) + 2f64.powi(-25);
+        for (value, want) in [
+            (above_tie, 0x3c01u16),
+            (-above_tie, 0xbc01),
+            (0., 0),
+            (-0., 0x8000),
+            (f64::MIN_POSITIVE, 0),
+            (-f64::MIN_POSITIVE, 0x8000),
+            (65520., 0x7c00),
+            (f64::from_bits(65520f64.to_bits() - 1), 0x7bff),
+            (-65520., 0xfc00),
+            (f64::INFINITY, 0x7c00),
+            (f64::NEG_INFINITY, 0xfc00),
+        ] {
+            assert_eq!(
+                from_native(
+                    &value.to_ne_bytes(),
+                    NativeType::Double,
+                    DataType::Float16,
+                    1
+                )
+                .unwrap(),
+                want.to_ne_bytes(),
+                "value={value:?}"
+            );
+        }
+        for value in [f64::NAN, -f64::NAN] {
+            let bytes = from_native(
+                &value.to_ne_bytes(),
+                NativeType::Double,
+                DataType::Float16,
+                1,
+            )
+            .unwrap();
+            assert!(half::f16::from_bits(u16::from_ne_bytes(bytes.try_into().unwrap())).is_nan());
+        }
+        let all_encodings: Vec<u8> = (0..=u16::MAX).flat_map(u16::to_ne_bytes).collect();
+        assert_eq!(
+            to_native(
+                &all_encodings,
+                DataType::Float16,
+                NativeType::Float16,
+                65536
+            )
+            .unwrap(),
+            all_encodings,
+            "matching storage must preserve every bit, including NaN payloads"
+        );
+    }
+
+    #[test]
     fn coreml_dtypes_promoted_and_packed_boundaries() {
         for (dtype, bytes, expected) in [
             (DataType::Int8, vec![128, 255, 127], vec![-128., -1., 127.]),
@@ -524,6 +662,8 @@ mod tests {
         assert!(ArrayLayout::new(&[i64::MAX, 3], &[3, 1], 0, 4).is_err());
         let layout = ArrayLayout::new(&[2, 3], &[16, 2], 6, 2).unwrap();
         assert!(!layout.contiguous);
+        assert_eq!(layout.byte_length, 12);
+        assert_eq!(layout.storage_byte_length, 42);
         assert_eq!(
             (0..6)
                 .map(|index| layout.byte_offset(index))
@@ -533,9 +673,11 @@ mod tests {
         assert_eq!(
             ArrayLayout::new(&[0, 3], &[3, 1], 0, 4)
                 .unwrap()
-                .byte_length,
+                .storage_byte_length,
             0
         );
-        assert_eq!(ArrayLayout::new(&[], &[], 1, 4).unwrap().byte_offset(0), 0);
+        let scalar = ArrayLayout::new(&[], &[], 1, 4).unwrap();
+        assert_eq!(scalar.byte_offset(0), 0);
+        assert_eq!(scalar.storage_byte_length, 4);
     }
 }
