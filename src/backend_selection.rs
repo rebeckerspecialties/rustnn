@@ -57,7 +57,7 @@ pub enum Backend {
     Onnx,
     /// NVIDIA TensorRT-RTX (`trtx-runtime`).
     Trtx,
-    /// Apple CoreML (`coreml-runtime`, macOS or iOS).
+    /// Apple CoreML on Apple targets (`coreml-runtime`; watchOS also needs `coreml-export`).
     Coreml,
     /// LiteRT (`litert-runtime`).
     Litert,
@@ -173,7 +173,13 @@ pub(crate) fn select_backend(options: &MLContextOptions) -> Result<BackendDevice
     let want_onnx = options.backend_hint.is_none() || options.backend_hint == Some(Backend::Onnx);
 
     let have_coreml = cfg!(all(
-        any(target_os = "macos", target_os = "ios"),
+        any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            target_os = "visionos",
+            all(target_os = "watchos", feature = "coreml-export")
+        ),
         feature = "coreml-runtime"
     ));
     let want_coreml =

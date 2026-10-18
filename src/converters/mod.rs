@@ -15,6 +15,8 @@ use crate::error::GraphError;
 use crate::graph::GraphInfo;
 
 mod coreml_mlprogram;
+/// Explicit native MIL scheduling utilities; independent of host arithmetic stages.
+pub mod coreml_packed;
 #[cfg(feature = "litert-runtime")]
 pub mod litert;
 pub mod onnx;
@@ -74,6 +76,61 @@ pub struct ConvertedGraph {
     pub data: Vec<u8>,
     /// Optional weight file data for formats that require external weights (e.g., CoreML Float16)
     pub weights_data: Option<Vec<u8>>,
+}
+
+impl ConvertedGraph {
+    /// Schedule admitted packed CoreML matrix operands in bounded native tiles.
+    ///
+    /// This preserves external weight bytes and the original contraction width.
+    /// The returned records identify rewritten products; an empty result does
+    /// not imply a memory bound for the graph. See [`coreml_packed`] for admission.
+    pub fn bound_coreml_packed_matmuls(
+        &mut self,
+        max_expanded_bytes: u64,
+    ) -> Result<Vec<coreml_packed::PackedMatmulExpansion>, GraphError> {
+        use prost::Message;
+        let error = |reason: String| GraphError::ConversionFailed {
+            format: self.format.into(),
+            reason,
+        };
+        if self.format != "coreml" {
+            return Err(error(
+                "packed native scheduling requires a CoreML model".into(),
+            ));
+        }
+        let mut model = crate::protos::coreml::specification::Model::decode(self.data.as_slice())
+            .map_err(|e| error(format!("cannot decode CoreML model: {e}")))?;
+        let changes = coreml_packed::bound_packed_matmuls(&mut model, max_expanded_bytes);
+        if !changes.is_empty() {
+            self.data = model.encode_to_vec();
+        }
+        Ok(changes)
+    }
+
+    /// Emit a CoreML compiled bundle locally using the Rust exporter.
+    ///
+    /// The source graph must already have been lowered by this process. This
+    /// writes external weight blobs directly without a second whole-file copy.
+    /// It invokes no Apple compiler, subprocess, network service or inference.
+    /// Loading the returned bundle remains a separate CoreML runtime operation.
+    #[cfg(feature = "coreml-export")]
+    pub fn write_coreml_bundle(
+        &self,
+        directory: impl AsRef<std::path::Path>,
+    ) -> Result<(), GraphError> {
+        if self.format != "coreml" {
+            return Err(GraphError::ConversionFailed {
+                format: self.format.into(),
+                reason: "only CoreML conversions can be written as mlmodelc bundles".into(),
+            });
+        }
+        mlmodelc_export::compile_to_dir(&self.data, self.weights_data.as_deref(), directory)
+            .map(|_| ())
+            .map_err(|error| GraphError::ConversionFailed {
+                format: "coreml".into(),
+                reason: format!("local bundle export failed: {error}"),
+            })
+    }
 }
 
 /// Lowers a [`GraphInfo`] to one backend format.

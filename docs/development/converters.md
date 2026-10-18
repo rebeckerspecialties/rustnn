@@ -168,3 +168,31 @@ inference.
 
 Then write the regression test first, fix the lowering, and run the WPT cases for the operation
 on every backend you have.
+
+### Explicit packed-weight scheduling
+
+`converters::coreml_packed::bound_packed_matmuls` is an opt-in post-lowering
+utility for a single-consumer, unit-scale Int8 affine leaf feeding a static
+rank-three Float32 matmul with contraction width 32. It retains packed weight
+bytes and the contraction, expands one output-column tile inside a native MIL
+loop, and assembles the original result before any downstream correction.
+Unsupported scale, type, transpose, shape or fanout cases are left unchanged;
+the returned records identify admitted products. The expansion budget limits
+the logical weight tile, not process or backend-cache residency.
+Changed functions declare CoreML8 for `slice_update`, requiring iOS/tvOS 18,
+watchOS 11, macOS 15, or visionOS 2 and newer. Functions with multiple block
+specializations or an unrecognized operator-set version are left unchanged.
+
+`ConvertedGraph::bound_coreml_packed_matmuls` applies the pass to a serialized
+conversion and leaves its external weight blob unchanged. Applications can set
+`RustNNOptions.coreml.packed_weight_expansion_bytes` to request the same pass
+during `rustnn_build_graph`, including after loading a local WebNN bundle. It is
+disabled by default; a zero budget admits no products. It assumes
+the surrounding arithmetic lowering has been qualified independently; it adds
+no Rust arithmetic stage or tensor readback. Do not replace a general matmul
+with a model-specific correction graph or silently alter a bundle's cache size.
+
+With `coreml-export`, `ConvertedGraph::write_coreml_bundle` writes the conversion
+through the streaming Rust exporter. The runtime uses the same exporter locally.
+The exporter must preserve nested MIL block arguments, operations, returns and
+external weight references; dropping a loop body is not a valid compilation.

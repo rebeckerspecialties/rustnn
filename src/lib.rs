@@ -85,7 +85,8 @@
 //! | `onnx-runtime` | ONNX Runtime backend through the `ort` crate (dynamic loading, `ORT_DYLIB_PATH`) |
 //! | `trtx-runtime` | NVIDIA TensorRT-RTX backend through the `trtx` crate; `trtx-runtime-mock` builds without a GPU |
 //! | `trtx-enterprise` | `trtx-runtime` linked against full TensorRT 10 (`nvinfer`) instead of TensorRT-RTX; RTX-only features are compiled out (validation only) |
-//! | `coreml-runtime` | Apple CoreML backend; executes on macOS/iOS; failing shims on other targets |
+//! | `coreml-runtime` | Apple CoreML backend on Apple targets; watchOS also requires `coreml-export` |
+//! | `coreml-export` | Emit compiled CoreML bundles locally in Rust; the runtime uses this route instead of Apple source compilation |
 //! | `litert-runtime` | LiteRT (TensorFlow Lite) backend through `litert-sys`; needs `flatc` at build time |
 //! | `cann-runtime` | Huawei CANN/HiAI backend on OpenHarmony; `cann-runtime-mock` validates without a device |
 //! | `webnn-runtime` | Browser WebNN backend for `wasm32-unknown-unknown` (`webnn-wpt-tests` embeds the WPT corpus) |

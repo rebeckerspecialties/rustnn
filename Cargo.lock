@@ -2003,6 +2003,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlmodelc-export"
+version = "0.1.0"
+
+[[package]]
 name = "monostate"
 version = "0.1.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2137,8 +2141,6 @@ dependencies = [
 [[package]]
 name = "objc"
 version = "0.2.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "915b1b472bc21c53464d6c8461c9d3af805ba1ef837e1cac254428f4a77177b1"
 dependencies = [
  "malloc_buf",
  "objc_exception",
@@ -2999,6 +3001,7 @@ dependencies = [
  "litert",
  "litert-sys",
  "log",
+ "mlmodelc-export",
  "ndarray",
  "objc",
  "ort",
