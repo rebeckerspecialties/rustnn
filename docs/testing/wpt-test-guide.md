@@ -143,6 +143,13 @@ preserves the historical default while exposing numerical conformance gaps.
 A missing or malformed source tolerance fails explicitly rather than selecting
 a local default. Strict mode accepts upstream ULP and ATOL, not the local RTOL
 extension. Keep strict and compatibility results separate when reporting passes.
+The pull-request/main conformance workflow and nightly report workflow set
+`WPT_STRICT_TOLERANCE=1` explicitly. Local commands retain the compatibility
+default unless this environment variable is set. Check the saved report's
+`options.strictTolerance` before interpreting backend results as upstream-budget
+qualification. Expected-failure entries inherited from compatibility runs are
+a known-defect inventory, not a complete strict-mode baseline; review fresh
+results with their corpus revision and comparison mode before comparing counts.
 The compatibility ATOL/RTOL and ULP comparators retain their existing behavior;
 the stronger nonfinite gate and full-width ULP budgets apply only to strict mode.
 Callbacks that require intermediate operands are reevaluated with shapes and

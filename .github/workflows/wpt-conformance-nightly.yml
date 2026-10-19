@@ -74,6 +74,7 @@ jobs:
 
       - name: Run WPT conformance and generate reports
         env:
+          WPT_STRICT_TOLERANCE: '1'
           WPT_REPORT_JSON: reports/wpt-conformance.json
           RUSTNN_GIT_SHA: ${{ github.sha }}
           RUSTNN_GIT_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
