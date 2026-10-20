@@ -47,9 +47,14 @@ Explicit compute permissions do not establish observed accelerator placement.
 
 Each split head has a CoreML runtime/export library check; the composition head
 also checks all targets. Host tests and documentation results are recorded with
-exact pushed heads in the handoff receipts. Hosted CI currently filters PR bases
-to `main`; dependent draft bases therefore do not automatically run that workflow.
-Do not infer a passing hosted matrix from the absence of checks.
+exact pushed heads in the handoff receipts. Hosted CI runs the Rust, WPT and
+RustNNPT workflows for pull requests whose base is `main` or a `feat/coreml-*`
+branch, so stacked drafts get the same matrix as the foundation PR. Do not infer
+a passing hosted matrix from the absence of checks on older runs.
+
+On a Mac where a toolchain `bin` directory precedes `~/.cargo/bin` on `PATH`,
+`rust-toolchain.toml` is bypassed and `cargo` reports that the crate requires
+rustc 1.97; run through `rustup run 1.97.0 cargo ...` or fix `PATH`.
 
 ## Accuracy and release gates
 

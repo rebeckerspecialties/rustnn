@@ -4,7 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    # Stacked native CoreML draft PRs use feat/coreml-* bases; run the same matrix for them.
+    branches: [main, 'feat/coreml-*']
 
 env:
   # Pinned on every platform: the distro package and brew both drift, and the
