@@ -427,6 +427,107 @@ impl CoremlMlProgramConverter {
         Ok((name, value_type))
     }
 
+    /// Normalize spatial dimensions in NCHW, then restore the logical layout.
+    /// Use the same path with constant and runtime affine parameters.
+    fn emit_instance_normalization(
+        &self,
+        graph: &GraphInfo,
+        op: &Operation,
+        overrides: &HashMap<u32, String>,
+        block: &mut Block,
+    ) -> Result<(), GraphError> {
+        let Operation::InstanceNormalization { input, options, .. } = op else {
+            return Err(GraphError::ConversionFailed {
+                format: "coreml_mlprogram".to_string(),
+                reason: "instance normalization lowering called on another operation".into(),
+            });
+        };
+        let output = op
+            .output_operand()
+            .ok_or_else(|| GraphError::ConversionFailed {
+                format: "coreml_mlprogram".to_string(),
+                reason: "instance normalization requires an output".into(),
+            })?;
+        let (output_name, output_type) = Self::create_output_value(graph, output, overrides)?;
+        let nhwc = options
+            .as_ref()
+            .is_some_and(|o| o.layout.eq_ignore_ascii_case("nhwc"));
+        if !nhwc {
+            block
+                .operations
+                .push(self.convert_operation_with_overrides(graph, op, overrides)?);
+            return Ok(());
+        }
+        let input_operand = graph
+            .operand(*input)
+            .ok_or_else(|| GraphError::ConversionFailed {
+                format: "coreml_mlprogram".to_string(),
+                reason: format!("instance normalization input {input} not found"),
+            })?;
+        let output_operand = graph
+            .operand(output)
+            .ok_or_else(|| GraphError::ConversionFailed {
+                format: "coreml_mlprogram".to_string(),
+                reason: format!("instance normalization output {output} not found"),
+            })?;
+        if input_operand.descriptor.shape.len() != 4 || output_operand.descriptor.shape.len() != 4 {
+            return Err(GraphError::ConversionFailed {
+                format: "coreml_mlprogram".to_string(),
+                reason: "NHWC instance normalization requires rank four".into(),
+            });
+        }
+        let dtype = Self::mil_data_type(&input_operand.descriptor.data_type)?;
+        let input_name = format!("{output_name}_in_nchw");
+        let input_shape = Self::permute_graph_shape(&input_operand.descriptor.shape, &[0, 3, 1, 2]);
+        let input_type =
+            Self::create_named_value_type(input_name.clone(), dtype, &input_shape, false);
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "x".into(),
+            Self::create_name_argument(Self::output_name_for_operand(graph, *input, overrides)),
+        );
+        inputs.insert(
+            "perm".into(),
+            Self::create_immediate_int_array(&[0, 3, 1, 2]),
+        );
+        block.operations.push(Self::create_mil_operation(
+            "transpose",
+            inputs,
+            vec![input_type],
+        ));
+
+        let normalized_name = format!("{output_name}_out_nchw");
+        let normalized_shape =
+            Self::permute_graph_shape(&output_operand.descriptor.shape, &[0, 3, 1, 2]);
+        let normalized_type =
+            Self::create_named_value_type(normalized_name.clone(), dtype, &normalized_shape, false);
+        let mut nchw_overrides = overrides.clone();
+        nchw_overrides.insert(*input, input_name);
+        let input_names = Self::input_names_for_operation(graph, op, &nchw_overrides);
+        block
+            .operations
+            .push(self.convert_operation_with_input_names_and_outputs(
+                graph,
+                op,
+                &input_names,
+                vec![normalized_type],
+                mil_ops::INSTANCE_NORM,
+            )?);
+
+        let mut inputs = HashMap::new();
+        inputs.insert("x".into(), Self::create_name_argument(normalized_name));
+        inputs.insert(
+            "perm".into(),
+            Self::create_immediate_int_array(&[0, 2, 3, 1]),
+        );
+        block.operations.push(Self::create_mil_operation(
+            "transpose",
+            inputs,
+            vec![output_type],
+        ));
+        Ok(())
+    }
+
     /// Bounds for the retained band, or its complement when the main diagonal
     /// is excluded. MIL treats every negative width as unlimited, not an offset.
     fn triangular_band_bounds(
@@ -7996,12 +8097,21 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                     let norm_name = format!("{out_name}_nogb_{out_id}");
                     let mut norm_overrides = operand_name_overrides.clone();
                     norm_overrides.insert(out_id, norm_name.clone());
-                    let mil = self.convert_operation_with_overrides(
-                        graph_info,
-                        &stripped,
-                        &norm_overrides,
-                    )?;
-                    main_block.operations.push(mil);
+                    if matches!(stripped, Operation::InstanceNormalization { .. }) {
+                        self.emit_instance_normalization(
+                            graph_info,
+                            &stripped,
+                            &norm_overrides,
+                            &mut main_block,
+                        )?;
+                    } else {
+                        let mil = self.convert_operation_with_overrides(
+                            graph_info,
+                            &stripped,
+                            &norm_overrides,
+                        )?;
+                        main_block.operations.push(mil);
+                    }
 
                     let mut cur = norm_name;
                     let steps: Vec<(&str, u32, &str)> = scale_id
@@ -8046,6 +8156,12 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         cur = step_name;
                     }
                     let _ = cur;
+                    if let Some((pending_ops, transposed_name)) =
+                        deferred_transposes.remove(&out_id)
+                    {
+                        main_block.operations.extend(pending_ops);
+                        operand_name_overrides.insert(out_id, transposed_name);
+                    }
                     continue;
                 }
             }
@@ -9748,140 +9864,22 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                 }
             }
 
-            // Special handling for instanceNormalization with NHWC layout.
-            // CoreML instance_norm requires NCHW [N,C,H,W]. For NHWC inputs:
-            //   transpose NHWC→NCHW, instance_norm(NCHW), transpose NCHW→NHWC.
+            // Constant and runtime affine paths share the same layout lowering.
             if op_type_lower == "instancenormalization" {
-                let inst_layout = match op {
-                    Operation::InstanceNormalization { options, .. } => {
-                        options.as_ref().map(|o| o.layout.as_str()).unwrap_or("")
-                    }
-                    _ => "",
-                };
-                if inst_layout.eq_ignore_ascii_case("nhwc") {
-                    let input_id = op.input_operands().first().copied().ok_or_else(|| {
-                        GraphError::ConversionFailed {
-                            format: "coreml_mlprogram".to_string(),
-                            reason: "instanceNorm op has no input operand".to_string(),
-                        }
-                    })?;
-                    let output_id =
-                        op.output_operand()
-                            .ok_or_else(|| GraphError::ConversionFailed {
-                                format: "coreml_mlprogram".to_string(),
-                                reason: "instanceNorm op has no output operand".to_string(),
-                            })?;
-                    let input_operand = graph_info.operand(input_id).ok_or_else(|| {
-                        GraphError::ConversionFailed {
-                            format: "coreml_mlprogram".to_string(),
-                            reason: format!("instanceNorm input operand {} not found", input_id),
-                        }
-                    })?;
-                    let output_operand = graph_info.operand(output_id).ok_or_else(|| {
-                        GraphError::ConversionFailed {
-                            format: "coreml_mlprogram".to_string(),
-                            reason: format!("instanceNorm output operand {} not found", output_id),
-                        }
-                    })?;
-
-                    let input_name = Self::output_name_for_operand(
-                        graph_info,
-                        input_id,
-                        &operand_name_overrides,
-                    );
-                    let (output_name, output_type) =
-                        Self::create_output_value(graph_info, output_id, &operand_name_overrides)?;
-                    let dtype = Self::mil_data_type(&input_operand.descriptor.data_type)?;
-
-                    // Pre-transpose: NHWC [N,H,W,C] -> NCHW [N,C,H,W], perm=[0,3,1,2]
-                    let nchw_in_name = format!("{}_in_nchw", output_name);
-                    let nchw_perm = [0u32, 3, 1, 2];
-                    let nchw_in_shape =
-                        Self::permute_graph_shape(&input_operand.descriptor.shape, &nchw_perm);
-                    let nchw_in_dims = Self::mil_dimensions_from_graph_shape(&nchw_in_shape, false);
-                    let nchw_in_type = NamedValueType {
-                        name: nchw_in_name.clone(),
-                        r#type: Some(ValueType {
-                            r#type: Some(
-                                crate::protos::coreml::mil_spec::value_type::Type::TensorType(
-                                    TensorType {
-                                        rank: nchw_in_dims.len() as i64,
-                                        data_type: dtype,
-                                        dimensions: nchw_in_dims,
-                                        attributes: HashMap::new(),
-                                    },
-                                ),
-                            ),
-                        }),
-                    };
-                    let mut pre_tp: HashMap<String, Argument> = HashMap::new();
-                    pre_tp.insert("x".to_string(), Self::create_name_argument(input_name));
-                    pre_tp.insert(
-                        "perm".to_string(),
-                        Self::create_immediate_int_array(&nchw_perm),
-                    );
-                    main_block.operations.push(Self::create_mil_operation(
-                        "transpose",
-                        pre_tp,
-                        vec![nchw_in_type],
-                    ));
-
-                    // instance_norm on NCHW intermediate
-                    let nchw_out_name = format!("{}_out_nchw", output_name);
-                    let nchw_out_perm = [0u32, 3, 1, 2];
-                    let nchw_out_shape =
-                        Self::permute_graph_shape(&output_operand.descriptor.shape, &nchw_out_perm);
-                    let nchw_out_dims =
-                        Self::mil_dimensions_from_graph_shape(&nchw_out_shape, false);
-                    let nchw_out_type = NamedValueType {
-                        name: nchw_out_name.clone(),
-                        r#type: Some(ValueType {
-                            r#type: Some(
-                                crate::protos::coreml::mil_spec::value_type::Type::TensorType(
-                                    TensorType {
-                                        rank: nchw_out_dims.len() as i64,
-                                        data_type: dtype,
-                                        dimensions: nchw_out_dims,
-                                        attributes: HashMap::new(),
-                                    },
-                                ),
-                            ),
-                        }),
-                    };
-                    let mut overrides_nchw = operand_name_overrides.clone();
-                    overrides_nchw.insert(input_id, nchw_in_name);
-                    let in_names = Self::input_names_for_operation(graph_info, op, &overrides_nchw);
-                    let norm_op = self.convert_operation_with_input_names_and_outputs(
-                        graph_info,
-                        op,
-                        &in_names,
-                        vec![nchw_out_type],
-                        mil_ops::INSTANCE_NORM,
-                    )?;
-                    main_block.operations.push(norm_op);
-
-                    // Post-transpose: NCHW [N,C,H,W] -> NHWC [N,H,W,C], perm=[0,2,3,1]
-                    let post_perm = [0u32, 2, 3, 1];
-                    let mut post_tp: HashMap<String, Argument> = HashMap::new();
-                    post_tp.insert("x".to_string(), Self::create_name_argument(nchw_out_name));
-                    post_tp.insert(
-                        "perm".to_string(),
-                        Self::create_immediate_int_array(&post_perm),
-                    );
-                    main_block.operations.push(Self::create_mil_operation(
-                        "transpose",
-                        post_tp,
-                        vec![output_type],
-                    ));
-
-                    if let Some((pending_ops, transposed_name)) =
+                self.emit_instance_normalization(
+                    graph_info,
+                    op,
+                    &operand_name_overrides,
+                    &mut main_block,
+                )?;
+                if let Some(output_id) = op.output_operand()
+                    && let Some((pending_ops, transposed_name)) =
                         deferred_transposes.remove(&output_id)
-                    {
-                        main_block.operations.extend(pending_ops);
-                        operand_name_overrides.insert(output_id, transposed_name);
-                    }
-                    continue;
+                {
+                    main_block.operations.extend(pending_ops);
+                    operand_name_overrides.insert(output_id, transposed_name);
                 }
+                continue;
             }
 
             // Special handling for conv2d / convTranspose2d with NHWC layout.
