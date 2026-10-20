@@ -23,6 +23,8 @@ mod coreml_mlprogram;
 pub mod coreml_numerics;
 /// Explicit native MIL packed-weight scheduling; no host inference.
 pub mod coreml_packed;
+/// Experimental block-local projections and runtime-weight attention.
+pub mod coreml_projection;
 #[cfg(feature = "litert-runtime")]
 pub mod litert;
 pub mod onnx;
