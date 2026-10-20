@@ -10,6 +10,7 @@ item_types = ["enums", "structs", "opaque", "functions"]
 exclude = [
     "rustnn_coreml_compile",
     "rustnn_coreml_load",
+    "rustnn_coreml_load_pipeline",
     "rustnn_coreml_predict",
     "rustnn_coreml_array_view",
     "rustnn_coreml_predict_backed",
