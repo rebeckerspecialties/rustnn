@@ -232,3 +232,15 @@ non-Watch CPU constant compression are explicit options, not a new default
 backend policy. This does not resize KV context or relax contraction/model
 gates. Cross-model extreme-range and accelerated physical qualification remain
 open; no GPU/ANE placement or universal goodput/memory claim is made.
+
+### Native partition and Watch producer placement
+
+`coreml_partition::split` cuts static small frontiers while retaining exact
+interfaces and constant references. Its weight budget includes constexpr
+attributes but is a scheduling heuristic rather than physical residency.
+`coreml_local_producers::clone_for_packed_children` can copy bounded pure
+producer closures into recorded packed children, preserving operations and
+constants, passthrough descriptors, retained outputs and lexical captures.
+Ambiguous or over-budget candidates are skipped transactionally. Production
+wiring is Watch-only; the failed non-Watch cloning experiments are excluded.
+Partitioning never executes host arithmetic or reads an intermediate tensor.

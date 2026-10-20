@@ -18,11 +18,15 @@ use crate::graph::GraphInfo;
 pub mod coreml_assets;
 mod coreml_weight_storage;
 pub use coreml_weight_storage::CoremlWeightStorage;
+/// Bounded pure-producer placement for explicit Watch source profiles.
+pub mod coreml_local_producers;
 mod coreml_mlprogram;
 /// Opt-in native Float32 corrections for target qualification.
 pub mod coreml_numerics;
 /// Explicit native MIL packed-weight scheduling; no host inference.
 pub mod coreml_packed;
+/// Static small-frontier child partitioning.
+pub mod coreml_partition;
 /// Experimental block-local projections and runtime-weight attention.
 pub mod coreml_projection;
 #[cfg(feature = "litert-runtime")]
