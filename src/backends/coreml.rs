@@ -85,12 +85,17 @@ impl fmt::Debug for CoremlGraph {
 
 pub(crate) struct CoremlBuilder {
     device_type: DeviceType,
+    packed_weight_expansion_bytes: Option<u64>,
 }
 
 impl fmt::Debug for CoremlBuilder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CoremlBuilder")
             .field("device_type", &self.device_type)
+            .field(
+                "packed_weight_expansion_bytes",
+                &self.packed_weight_expansion_bytes,
+            )
             .finish()
     }
 }
@@ -98,9 +103,25 @@ impl fmt::Debug for CoremlBuilder {
 impl<'context, 'builder> MLBackendBuilder<'context, 'builder> for CoremlBuilder {
     fn build(&mut self, graph_info: GraphInfo) -> crate::error::Result<MLGraph<'context>> {
         let output_backings_eligible = supports_output_backings(&graph_info);
-        let converted = CoremlMlProgramConverter
+        let mut converted = CoremlMlProgramConverter
             .convert(&graph_info)
             .map_err(|e| Error::GraphBuildError { source: e.into() })?;
+        if let Some(cap) = self.packed_weight_expansion_bytes {
+            if !cfg!(target_os = "watchos") {
+                return Err(Error::GraphBuildError {
+                    source: crate::error::GraphError::ConversionFailed {
+                        format: "coreml".into(),
+                        reason: "bounded packed-weight scheduling is supported only on watchOS"
+                            .into(),
+                    }
+                    .into(),
+                });
+            }
+            let changes = converted
+                .bound_coreml_packed_matmuls(cap)
+                .map_err(|e| Error::GraphBuildError { source: e.into() })?;
+            debug!("CoreML bounded packed-weight scheduling: {changes:?}");
+        }
         let model = compile_model(
             converted.data,
             converted.weights_data,
@@ -269,6 +290,7 @@ impl<'context> MLBackendContext<'context> for CoremlContext {
     {
         Ok(Box::new(CoremlBuilder {
             device_type: self.device_type,
+            packed_weight_expansion_bytes: self.options.packed_weight_expansion_bytes,
         }))
     }
 

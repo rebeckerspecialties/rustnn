@@ -159,7 +159,7 @@ impl Default for OrtOptions {
     }
 }
 
-/// CoreML tensor storage options; see the CoreML integration guide.
+/// CoreML lowering and tensor storage options; see the CoreML integration guide.
 #[derive(PartialEq, Eq, Clone, Debug)]
 #[non_exhaustive]
 pub struct CoremlOptions {
@@ -171,6 +171,14 @@ pub struct CoremlOptions {
     /// Defaults to true. Flexible output features are excluded. CoreML may decline
     /// compatible backings; the backend then copies into its owned storage.
     pub output_backings: bool,
+    /// Opt into bounded native expansion for admitted packed Int8 products on watchOS.
+    ///
+    /// Limits the logical Float32 weight tile, not process memory. Only static,
+    /// unit-scale rank-3 products with contraction width 32 are rewritten; other
+    /// products are unchanged. Zero admits no products. Defaults to `None`.
+    /// This does not change contraction arithmetic or relax accuracy budgets.
+    /// Setting this option on other platforms returns a graph-build error.
+    pub packed_weight_expansion_bytes: Option<u64>,
 }
 
 #[allow(clippy::derivable_impls)]
@@ -179,6 +187,7 @@ impl Default for CoremlOptions {
         Self {
             reuse_tensor_storage: false,
             output_backings: true,
+            packed_weight_expansion_bytes: None,
         }
     }
 }

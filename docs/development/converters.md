@@ -175,3 +175,15 @@ With `coreml-export`, `ConvertedGraph::write_coreml_bundle` writes through the
 immutable Git-pinned Rust exporter. Recursive MIL blocks and external weights
 remain in the compiled bundle; runtime loading is a separate native operation.
 No compiler subprocess or network service is used after deployment.
+
+### Explicit Watch packed-weight scheduling
+
+`coreml_packed::bound_packed_matmuls` preserves single-consumer, unit-scale Int8
+leaves and static rank-three K=32 contractions, expanding one output-column tile
+inside MIL. Unsupported scale/type/shape/transpose/fanout cases stay unchanged.
+`ConvertedGraph::bound_coreml_packed_matmuls` retains external weight bytes.
+The default-disabled `RustNNOptions.coreml.packed_weight_expansion_bytes` enables
+this scheduling only on watchOS; other platforms return a graph-build error.
+Changed functions require CoreML8 (`slice_update`); the logical tile cap does not
+bound physical memory or qualify arithmetic. The direct utility supports host
+qualification of generated graphs. No source numerical profile is enabled here.

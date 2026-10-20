@@ -166,3 +166,15 @@ GPU/Neural Engine placement, or establish a Watch memory bound. The source loade
 currently owns resolved weight bytes, so parsing and lowering peak memory must
 also be measured on the device. Existing operator tolerances and model accuracy
 gates remain separate validation requirements.
+
+### Explicit Watch packed-weight scheduling
+
+`coreml_packed::bound_packed_matmuls` preserves single-consumer, unit-scale Int8
+leaves and static rank-three K=32 contractions, expanding one output-column tile
+inside MIL. Unsupported scale/type/shape/transpose/fanout cases stay unchanged.
+`ConvertedGraph::bound_coreml_packed_matmuls` retains external weight bytes.
+The default-disabled `RustNNOptions.coreml.packed_weight_expansion_bytes` enables
+this scheduling only on watchOS; other platforms return a graph-build error.
+Changed functions require CoreML8 (`slice_update`); the logical tile cap does not
+bound physical memory or qualify arithmetic. The direct utility supports host
+qualification of generated graphs. No source numerical profile is enabled here.
