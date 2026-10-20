@@ -245,6 +245,18 @@ native children in the deployed process. It uses no network, Mac helper or
 compiler subprocess. Watch affine/bounded expansion and producer placement are
 compile-time watchOS choices. The source graph declares its context; the compiler
 does not shorten it. `examples/coreml_source.rs` demonstrates setup.
+
+`compile_webnn_source_cached_with_progress(path, policy, cache_dir, key)` adds a
+persistent compiled-bundle cache owned by the application. `cache_dir/<key>/`
+holds the exported bundle, the native child routing plan and a completion
+marker; a complete entry is loaded without reading the source (`cache/hit`
+notification), otherwise the source is lowered as above, exported into a staging
+directory beside the entry and published with one atomic rename (`cache/miss`).
+An entry that fails to load is removed and rebuilt once. The key is the caller's
+identity for the source bundle, the native library and the policy, all of which
+change the exported bundle; the cache never evicts other keys, so the
+application removes entries whose source bundle is gone. The Rustdoc of the
+method is the contract.
 The [qualification snapshot](../testing/native-source-qualification-v124.json)
 binds historical dirty-source A builds, not fresh split-head device validation.
 TinyStories SE2 accuracy, Mamba XS load/returned-state qualification, Watch SE2

@@ -396,6 +396,11 @@ enum CoremlModelBacking {
         #[allow(dead_code)]
         temp_model: Option<TempModelSource>,
     },
+    /// A bundle published into a caller-owned compiled-bundle cache
+    /// (`CoremlNativeSession::compile_webnn_source_cached_with_progress`). The
+    /// directory outlives the session; only the cache owner removes it.
+    #[cfg(feature = "coreml-export")]
+    Persistent { compiled_dir: PathBuf },
 }
 
 impl std::fmt::Debug for CompiledCoremlModel {
@@ -430,6 +435,13 @@ impl Drop for CompiledCoremlModel {
                 // The compiled `.mlmodelc` is produced by CoreML (not a tempfile handle),
                 // so remove it explicitly. `temp_model`, if any, cleans itself up on drop.
                 let _ = std::fs::remove_dir_all(compiled_dir);
+            }
+            #[cfg(feature = "coreml-export")]
+            CoremlModelBacking::Persistent { compiled_dir } => {
+                log::debug!(
+                    "released CoreML model backed by cached bundle {}",
+                    compiled_dir.display()
+                );
             }
         }
     }
