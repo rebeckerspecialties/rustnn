@@ -34,8 +34,11 @@ impl CompiledCoremlModel {
 }
 #[path = "coreml_load.rs"]
 mod load;
+#[cfg(feature = "coreml-export")]
+#[path = "coreml_pipeline.rs"]
+mod pipeline;
 use load::LoadTrace;
-pub use load::{CoremlLoadDiagnostics, CoremlLoadFailure, CoremlLoadRoute};
+pub use load::{CoremlComputeUnits, CoremlLoadDiagnostics, CoremlLoadFailure, CoremlLoadRoute};
 
 // Link against the system frameworks we use.
 #[cfg(any(
@@ -71,6 +74,18 @@ unsafe extern "C" {
     fn rustnn_coreml_compile(
         model_url: *mut Object,
         out_url: *mut *mut Object,
+        error: *mut c_char,
+        error_length: usize,
+    ) -> i32;
+    #[cfg(feature = "coreml-export")]
+    fn rustnn_coreml_load_pipeline(
+        compiled_url: *mut Object,
+        configuration: *mut Object,
+        plan: *const u8,
+        plan_len: usize,
+        progress: Option<extern "C" fn(*mut c_void, usize, usize, bool) -> bool>,
+        progress_context: *mut c_void,
+        out_model: *mut *mut Object,
         error: *mut c_char,
         error_length: usize,
     ) -> i32;
@@ -148,6 +163,35 @@ pub unsafe extern "C" fn rustnn_coreml_predict(
     _model: *mut Object,
     _features: *mut Object,
     _out_provider: *mut *mut Object,
+    _error: *mut c_char,
+    _error_length: usize,
+) -> i32 {
+    1
+}
+
+/// Always-failing pipeline stand-in on targets without the native CoreML shim.
+///
+/// # Safety
+/// This stand-in does not dereference pointers or initialize outputs. Its
+/// signature mirrors the native forwarding shim; no inference runs here.
+#[cfg(all(
+    feature = "coreml-export",
+    not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos"
+    ))
+))]
+pub unsafe extern "C" fn rustnn_coreml_load_pipeline(
+    _compiled_url: *mut Object,
+    _configuration: *mut Object,
+    _plan: *const u8,
+    _plan_len: usize,
+    _progress: Option<extern "C" fn(*mut c_void, usize, usize, bool) -> bool>,
+    _progress_context: *mut c_void,
+    _out_model: *mut *mut Object,
     _error: *mut c_char,
     _error_length: usize,
 ) -> i32 {
@@ -388,6 +432,126 @@ impl Drop for CompiledCoremlModel {
     }
 }
 
+/// Native CoreML session for platform applications that already own CoreML
+/// feature providers. Child routing and carried features remain native objects;
+/// this interface never reads intermediate tensor storage.
+///
+/// The WebNN tensor API remains the portable interface. This extension is for
+/// an Apple application bridging CoreML providers through its platform FFI.
+pub struct CoremlNativeSession {
+    model: CompiledCoremlModel,
+}
+impl CoremlNativeSession {
+    /// Compile and load a locally converted graph. The exporter feature is
+    /// required on watchOS; no model-download or helper-process route is used.
+    pub fn compile(
+        converted: crate::converters::ConvertedGraph,
+        device: crate::backend_selection::DeviceType,
+    ) -> Result<Self, GraphError> {
+        if converted.format != "coreml" {
+            return Err(GraphError::ConversionFailed {
+                format: converted.format.into(),
+                reason: "native session requires CoreML".into(),
+            });
+        }
+        Ok(Self {
+            model: compile_model(converted.data, converted.weights_data, device, false)?,
+        })
+    }
+    /// Compile with explicit scheduling permissions and no CPU fallback.
+    /// The selected policy does not establish observed kernel placement.
+    pub fn compile_with_policy(
+        converted: crate::converters::ConvertedGraph,
+        policy: CoremlComputeUnits,
+    ) -> Result<Self, GraphError> {
+        if converted.format != "coreml" {
+            return Err(GraphError::ConversionFailed {
+                format: converted.format.into(),
+                reason: "native session requires CoreML".into(),
+            });
+        }
+        let mut trace = LoadTrace::strict(policy);
+        Ok(Self {
+            model: compile_model_from_url(converted.data, converted.weights_data, &mut trace)?,
+        })
+    }
+    /// Emit and load locally compiled source using file-backed weight scratch.
+    /// The scratch file is released before native model preparation.
+    pub fn compile_file_backed(
+        data: Vec<u8>,
+        weights: crate::converters::CoremlWeightStorage,
+        policy: CoremlComputeUnits,
+    ) -> Result<Self, GraphError> {
+        Self::compile_file_backed_with_progress(data, weights, policy, |_| {})
+    }
+    /// Compile file-backed source with setup-only child-load notifications.
+    /// The callback runs synchronously, never during prediction. A callback
+    /// panic under an unwind-enabled build is caught before crossing the native
+    /// boundary and fails the load; panic-abort builds retain Rust's abort policy.
+    pub fn compile_file_backed_with_progress(
+        data: Vec<u8>,
+        weights: crate::converters::CoremlWeightStorage,
+        policy: CoremlComputeUnits,
+        mut progress: impl FnMut(&str),
+    ) -> Result<Self, GraphError> {
+        weights
+            .flush()
+            .map_err(|e| GraphError::CoremlRuntimeFailed {
+                reason: e.to_string(),
+            })?;
+        let mut trace = LoadTrace::strict(policy);
+        Ok(Self {
+            model: compile_model_from_url_observed(
+                data,
+                Some(weights),
+                &mut trace,
+                Some(&mut progress),
+            )?,
+        })
+    }
+    /// Inspect requested and loaded permissions; these do not prove placement.
+    pub fn load_diagnostics(&self) -> &CoremlLoadDiagnostics {
+        self.model.load_diagnostics()
+    }
+    /// Predict from a borrowed native feature provider, returning a retained
+    /// provider (+1). The caller must release the result exactly once.
+    ///
+    /// # Safety
+    /// `provider` must point to a live Objective-C object conforming to
+    /// MLFeatureProvider for the duration of this synchronous call. Tensor
+    /// storage must not be concurrently mutated. The returned pointer must
+    /// only be used as an Objective-C feature provider and released by its owner.
+    pub unsafe fn predict_feature_provider(
+        &mut self,
+        provider: *mut c_void,
+    ) -> Result<*mut c_void, GraphError> {
+        if provider.is_null() {
+            return Err(GraphError::CoremlRuntimeFailed {
+                reason: "null native feature provider".into(),
+            });
+        }
+        autoreleasepool(|| {
+            let mut output = ptr::null_mut();
+            let mut error = [0u8; 1024];
+            let status = unsafe {
+                rustnn_coreml_predict(
+                    self.model.model,
+                    provider.cast(),
+                    &mut output,
+                    error.as_mut_ptr().cast(),
+                    error.len(),
+                )
+            };
+            if status != 0 || output.is_null() {
+                return Err(GraphError::CoremlRuntimeFailed {
+                    reason: shim_error_to_string(&error),
+                });
+            }
+            Ok(output.cast())
+        })
+    }
+}
+
 /// Raw-byte input for [`run_coreml_bytes`]: a tensor's bytes plus its descriptor.
 pub(crate) struct CoremlByteInput<'a> {
     pub(crate) data: &'a [u8],
@@ -408,25 +572,23 @@ pub(crate) fn compile_model(
     device_type: crate::backend_selection::DeviceType,
     use_in_memory_asset: bool,
 ) -> Result<CompiledCoremlModel, GraphError> {
+    let mut trace = LoadTrace::new(device_type);
+    if cfg!(feature = "coreml-export") {
+        // Local export writes all live blobs before CoreML prepares its native
+        // workspace. Transfer ownership so source buffers are released first.
+        return compile_model_from_url(model_bytes, weights_data, &mut trace);
+    }
     // Owned so the in-memory path can hand the buffers to NSData without
     // copying (weight blobs reach hundreds of MB); the Arcs keep them valid
     // for the URL fallback below even after the NSData objects are released.
     let model_bytes = Arc::new(model_bytes);
     let weights_data = weights_data.map(Arc::new);
-    let mut trace = LoadTrace::new(device_type);
-    if cfg!(feature = "coreml-export") {
-        return compile_model_from_url(
-            &model_bytes,
-            weights_data.as_deref().map(Vec::as_slice),
-            &mut trace,
-        );
-    }
     trace.routes(use_in_memory_asset, |trace, route| match route {
         CoremlLoadRoute::InMemoryAsset => {
             compile_model_from_asset(&model_bytes, weights_data.as_ref(), trace)
         }
         CoremlLoadRoute::CompiledUrl | CoremlLoadRoute::RustExport => compile_model_from_url(
-            &model_bytes,
+            model_bytes.as_slice(),
             weights_data.as_deref().map(Vec::as_slice),
             trace,
         ),
@@ -472,19 +634,46 @@ fn compile_model_from_asset(
 }
 
 fn compile_model_from_url(
-    model_bytes: &[u8],
-    weights_data: Option<&[u8]>,
+    model_bytes: impl AsRef<[u8]>,
+    weights_data: Option<impl AsRef<[u8]>>,
     trace: &mut LoadTrace,
 ) -> Result<CompiledCoremlModel, GraphError> {
+    compile_model_from_url_observed(model_bytes, weights_data, trace, None)
+}
+
+fn compile_model_from_url_observed(
+    model_bytes: impl AsRef<[u8]>,
+    weights_data: Option<impl AsRef<[u8]>>,
+    trace: &mut LoadTrace,
+    #[allow(unused_variables)] progress: Option<&mut dyn FnMut(&str)>,
+) -> Result<CompiledCoremlModel, GraphError> {
+    #[cfg(feature = "coreml-export")]
+    let mut observer = pipeline::LoadObserver::new(progress);
     let route = if cfg!(feature = "coreml-export") {
         CoremlLoadRoute::RustExport
     } else {
         CoremlLoadRoute::CompiledUrl
     };
+    #[cfg(feature = "coreml-export")]
+    let plan = pipeline::from_bytes(model_bytes.as_ref())
+        .and_then(|plan| {
+            plan.map(|p| serde_json::to_vec(&p).map_err(|e| e.to_string()))
+                .transpose()
+        })
+        .map_err(|reason| GraphError::ConversionFailed {
+            format: "coreml".into(),
+            reason,
+        })?;
     autoreleasepool(|| unsafe {
         let (compiled_url, compiled_dir, temp_model) = trace.prepare(route, || {
-            prepare_compiled_model_with_weights(model_bytes, weights_data, None)
+            prepare_compiled_model_with_weights(
+                model_bytes.as_ref(),
+                weights_data.as_ref().map(AsRef::as_ref),
+                None,
+            )
         })?;
+        drop(model_bytes);
+        drop(weights_data);
         // Owned (+1) by us; released when this function returns on any path.
         let _compiled_url_guard = ReleaseOnDrop(compiled_url);
         let loaded = trace.policies(route, |code| {
@@ -493,6 +682,29 @@ fn compile_model_from_url(
             let () = msg_send![config, setComputeUnits: code];
             let mut model: *mut Object = ptr::null_mut();
             let mut error = [0u8; 1024];
+            #[cfg(feature = "coreml-export")]
+            let status = if let Some(plan) = &plan {
+                rustnn_coreml_load_pipeline(
+                    compiled_url,
+                    config,
+                    plan.as_ptr(),
+                    plan.len(),
+                    observer.callback(),
+                    observer.context(),
+                    &mut model,
+                    error.as_mut_ptr().cast(),
+                    error.len(),
+                )
+            } else {
+                rustnn_coreml_load(
+                    compiled_url,
+                    config,
+                    &mut model,
+                    error.as_mut_ptr().cast(),
+                    error.len(),
+                )
+            };
+            #[cfg(not(feature = "coreml-export"))]
             let status = rustnn_coreml_load(
                 compiled_url,
                 config,

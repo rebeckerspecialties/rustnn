@@ -88,6 +88,7 @@ fn build_coreml_shim() {
 
     let shim = "src/executors/coreml_shim.mm";
     println!("cargo:rerun-if-changed={shim}");
+    println!("cargo:rerun-if-changed=src/executors/coreml_pipeline.h");
     cc::Build::new()
         .file(shim)
         .flag("-fobjc-arc")
