@@ -27,7 +27,7 @@
 /// This replaces the legacy NeuralNetwork format.
 use crate::converters::operand_name;
 use crate::error::GraphError;
-use crate::graph::{DataType, Dimension as GraphDimension, GraphInfo, OperandKind};
+use crate::graph::{DataType, Dimension as GraphDimension, GraphInfo};
 use crate::operator_enums::MLOperandDataType;
 use crate::operator_options::MLDimension;
 use crate::operators::Operation;
@@ -1286,6 +1286,155 @@ impl CoremlMlProgramConverter {
         }
 
         Ok(Self::create_mil_operation(mil_op_type, inputs, outputs))
+    }
+
+    fn fresh_convolution_name(graph: &GraphInfo, block: &Block, base: String) -> String {
+        let reserved: std::collections::HashSet<String> = (0..graph.operands.len())
+            .map(|id| operand_name(graph, id as u32))
+            .chain(
+                block
+                    .operations
+                    .iter()
+                    .flat_map(|op| op.outputs.iter().map(|value| value.name.clone())),
+            )
+            .collect();
+        let mut name = base.clone();
+        let mut suffix = 0usize;
+        while reserved.contains(&name) {
+            suffix += 1;
+            name = format!("{base}_{suffix}");
+        }
+        name
+    }
+
+    /// Materialize only the views required by this convolution consumer.
+    /// Keep the original source binding for other consumers and graph outputs;
+    /// one weight can legally be interpreted under different filter layouts.
+    fn convolution_input_names(
+        graph: &GraphInfo,
+        operation: &Operation,
+        source_overrides: &HashMap<u32, String>,
+        block: &mut Block,
+        views: &mut HashMap<(String, Vec<u32>), String>,
+    ) -> Result<Vec<String>, GraphError> {
+        use crate::operator_enums::{
+            MLConv2dFilterOperandLayout as ConvLayout,
+            MLConvTranspose2dFilterOperandLayout as TransposeLayout,
+        };
+        let (input, filter, nhwc, filter_permutation) = match operation {
+            Operation::Conv2d {
+                input,
+                filter,
+                options,
+                ..
+            } => (
+                *input,
+                *filter,
+                options.as_ref().is_some_and(|options| {
+                    options.input_layout.as_str().eq_ignore_ascii_case("nhwc")
+                }),
+                match options
+                    .as_ref()
+                    .map(|options| options.filter_layout)
+                    .unwrap_or_default()
+                {
+                    ConvLayout::Oihw => None,
+                    ConvLayout::Hwio => Some(vec![3, 2, 0, 1]),
+                    ConvLayout::Ohwi => Some(vec![0, 3, 1, 2]),
+                    ConvLayout::Ihwo => Some(vec![3, 0, 1, 2]),
+                },
+            ),
+            Operation::ConvTranspose2d {
+                input,
+                filter,
+                options,
+                ..
+            } => (
+                *input,
+                *filter,
+                options.as_ref().is_some_and(|options| {
+                    options.input_layout.as_str().eq_ignore_ascii_case("nhwc")
+                }),
+                match options
+                    .as_ref()
+                    .map(|options| options.filter_layout)
+                    .unwrap_or_default()
+                {
+                    TransposeLayout::Iohw => None,
+                    TransposeLayout::Hwoi => Some(vec![3, 2, 0, 1]),
+                    TransposeLayout::Ohwi => Some(vec![3, 0, 1, 2]),
+                },
+            ),
+            _ => {
+                return Ok(Self::input_names_for_operation(
+                    graph,
+                    operation,
+                    source_overrides,
+                ));
+            }
+        };
+        let mut result = Self::input_names_for_operation(graph, operation, source_overrides);
+        // Bind views by argument position, not operand ID: one operand may be
+        // both the activation and the filter with different required layouts.
+        let needed = filter_permutation
+            .map(|permutation| (1, filter, permutation))
+            .into_iter()
+            .chain(nhwc.then_some((0, input, vec![0, 3, 1, 2])));
+        for (argument, id, permutation) in needed {
+            let source = Self::output_name_for_operand(graph, id, source_overrides);
+            let key = (source.clone(), permutation.clone());
+            let name = if let Some(name) = views.get(&key) {
+                name.clone()
+            } else {
+                let operand = graph
+                    .operand(id)
+                    .ok_or_else(|| GraphError::ConversionFailed {
+                        format: "coreml_mlprogram".into(),
+                        reason: format!("convolution view operand {id} not found"),
+                    })?;
+                if operand.descriptor.shape.len() != 4 {
+                    return Err(GraphError::ConversionFailed {
+                        format: "coreml_mlprogram".into(),
+                        reason: format!("convolution layout requires rank-4 operand {id}"),
+                    });
+                }
+                let shape = Self::permute_graph_shape(&operand.descriptor.shape, &permutation);
+                let name =
+                    Self::fresh_convolution_name(graph, block, format!("{source}_conv_layout"));
+                let output = NamedValueType {
+                    name: name.clone(),
+                    r#type: Some(ValueType {
+                        r#type: Some(
+                            crate::protos::coreml::mil_spec::value_type::Type::TensorType(
+                                TensorType {
+                                    rank: shape.len() as i64,
+                                    data_type: Self::mil_data_type(&operand.descriptor.data_type)?,
+                                    dimensions: Self::mil_dimensions_from_graph_shape(
+                                        &shape, false,
+                                    ),
+                                    attributes: HashMap::new(),
+                                },
+                            ),
+                        ),
+                    }),
+                };
+                block.operations.push(Self::create_mil_operation(
+                    "transpose",
+                    HashMap::from([
+                        ("x".into(), Self::create_name_argument(source)),
+                        (
+                            "perm".into(),
+                            Self::create_immediate_int_array(&permutation),
+                        ),
+                    ]),
+                    vec![output],
+                ));
+                views.insert(key, name.clone());
+                name
+            };
+            result[argument] = name;
+        }
+        Ok(result)
     }
 
     fn create_cast_operation(
@@ -5872,211 +6021,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
             }
         }
 
-        // Operations that must be inserted right after the op that produces their input operand.
-        // Keyed by the source operand_id.  Value = (transpose ops, transposed_name).
-        // We intentionally do NOT set operand_name_overrides[id] until the deferred ops are
-        // emitted, so that the operation that *produces* the id still writes the original name.
-        let mut deferred_transposes: HashMap<u32, (Vec<MilOperation>, String)> = HashMap::new();
-
-        // First pass: Handle filter layout transformations for conv operations
-
-        for op in &graph_info.operations {
-            let op_type_lower = op.op_type().to_lowercase();
-
-            if (op_type_lower == "conv2d" || op_type_lower == "convtranspose2d")
-                && op.input_operands().len() >= 2
-            {
-                use crate::operator_enums::{
-                    MLConv2dFilterOperandLayout as ConvLayout,
-                    MLConvTranspose2dFilterOperandLayout as TransposeLayout,
-                };
-                let filter_perm = match &op {
-                    Operation::Conv2d { options, .. } => match options
-                        .as_ref()
-                        .map(|o| o.filter_layout)
-                        .unwrap_or_default()
-                    {
-                        ConvLayout::Oihw => None,
-                        ConvLayout::Hwio => Some(vec![3, 2, 0, 1]),
-                        ConvLayout::Ohwi => Some(vec![0, 3, 1, 2]),
-                        ConvLayout::Ihwo => Some(vec![3, 0, 1, 2]),
-                    },
-                    Operation::ConvTranspose2d { options, .. } => match options
-                        .as_ref()
-                        .map(|o| o.filter_layout)
-                        .unwrap_or_default()
-                    {
-                        TransposeLayout::Iohw => None,
-                        TransposeLayout::Hwoi => Some(vec![3, 2, 0, 1]),
-                        TransposeLayout::Ohwi => Some(vec![3, 0, 1, 2]),
-                    },
-                    _ => None,
-                };
-                if let Some(perm) = filter_perm {
-                    let filter_operand_id = op.input_operands()[1];
-
-                    // Dedup: two convs sharing one filter (tied weights) must
-                    // not both define {filter}_transposed. This reuses the FIRST
-                    // consumer's permutation; sharing a filter under different
-                    // layouts would need per-consumer names.
-                    if !operand_name_overrides.contains_key(&filter_operand_id)
-                        && !deferred_transposes.contains_key(&filter_operand_id)
-                        && let Some(filter_operand) = graph_info.operand(filter_operand_id)
-                    {
-                        // Create transpose operation for filter
-                        let filter_name = operand_name(graph_info, filter_operand_id);
-                        let transposed_filter_name = format!("{}_transposed", filter_name);
-
-                        let mut transpose_inputs: HashMap<String, Argument> = HashMap::new();
-                        transpose_inputs
-                            .insert("x".to_string(), Self::create_name_argument(filter_name));
-                        transpose_inputs
-                            .insert("perm".to_string(), Self::create_immediate_int_array(&perm));
-
-                        // Create tensor type for transposed filter
-                        let dtype = Self::mil_data_type(&filter_operand.descriptor.data_type)?;
-                        let transposed_shape =
-                            Self::permute_graph_shape(&filter_operand.descriptor.shape, &perm);
-                        let dimensions =
-                            Self::mil_dimensions_from_graph_shape(&transposed_shape, false);
-
-                        let value_type = ValueType {
-                            r#type: Some(
-                                crate::protos::coreml::mil_spec::value_type::Type::TensorType(
-                                    TensorType {
-                                        rank: dimensions.len() as i64,
-                                        data_type: dtype,
-                                        dimensions,
-                                        attributes: HashMap::new(),
-                                    },
-                                ),
-                            ),
-                        };
-
-                        let transpose_output_type = NamedValueType {
-                            name: transposed_filter_name.clone(),
-                            r#type: Some(value_type),
-                        };
-
-                        let transpose_op = Self::create_mil_operation(
-                            "transpose",
-                            transpose_inputs,
-                            vec![transpose_output_type],
-                        );
-
-                        // If the filter operand is a constant or graph input it has already
-                        // been emitted, so the transpose and the name override can go here.
-                        // If it is an intermediate (e.g. output of dequantizeLinear in a QDQ
-                        // graph) the producing operation hasn't been emitted yet — defer the
-                        // transpose until right after that operation, and defer the override
-                        // too (so the producing op writes the *original* name, not the
-                        // transposed name).
-                        if matches!(
-                            filter_operand.kind,
-                            OperandKind::Constant | OperandKind::Input
-                        ) {
-                            // Override can be set now; the filter has already been emitted.
-                            operand_name_overrides
-                                .insert(filter_operand_id, transposed_filter_name.clone());
-                            main_block.operations.push(transpose_op);
-                        } else {
-                            // Do NOT set the override yet; set it after the deferred op fires.
-                            deferred_transposes
-                                .entry(filter_operand_id)
-                                .or_insert_with(|| (Vec::new(), transposed_filter_name.clone()))
-                                .0
-                                .push(transpose_op);
-                        }
-                    }
-                }
-
-                let input_layout = match &op {
-                    Operation::Conv2d { options, .. } => options
-                        .as_ref()
-                        .map(|o| o.input_layout.as_str())
-                        .unwrap_or(""),
-                    Operation::ConvTranspose2d { options, .. } => options
-                        .as_ref()
-                        .map(|o| o.input_layout.as_str())
-                        .unwrap_or(""),
-                    _ => "",
-                };
-                if input_layout == "nhwc" && !op.input_operands().is_empty() {
-                    let input_operand_id = op.input_operands()[0];
-
-                    // Only transpose if not already transposed (deferred entries
-                    // only insert their override at flush time, so check both).
-                    if !operand_name_overrides.contains_key(&input_operand_id)
-                        && !deferred_transposes.contains_key(&input_operand_id)
-                        && let Some(input_operand) = graph_info.operand(input_operand_id)
-                    {
-                        // NHWC -> NCHW transposition: [0, 3, 1, 2]
-                        let perm = [0, 3, 1, 2];
-
-                        // Create transpose operation for input
-                        let input_name = operand_name(graph_info, input_operand_id);
-                        let transposed_input_name = format!("{}_nchw", input_name);
-
-                        let mut transpose_inputs: HashMap<String, Argument> = HashMap::new();
-                        transpose_inputs
-                            .insert("x".to_string(), Self::create_name_argument(input_name));
-                        transpose_inputs.insert(
-                            "perm".to_string(),
-                            Self::create_immediate_int_array(perm.as_ref()),
-                        );
-
-                        // Create tensor type for transposed input
-                        let dtype = Self::mil_data_type(&input_operand.descriptor.data_type)?;
-                        let transposed_shape =
-                            Self::permute_graph_shape(&input_operand.descriptor.shape, &perm);
-                        let dimensions =
-                            Self::mil_dimensions_from_graph_shape(&transposed_shape, false);
-
-                        let value_type = ValueType {
-                            r#type: Some(
-                                crate::protos::coreml::mil_spec::value_type::Type::TensorType(
-                                    TensorType {
-                                        rank: dimensions.len() as i64,
-                                        data_type: dtype,
-                                        dimensions,
-                                        attributes: HashMap::new(),
-                                    },
-                                ),
-                            ),
-                        };
-
-                        let transpose_output_type = NamedValueType {
-                            name: transposed_input_name.clone(),
-                            r#type: Some(value_type),
-                        };
-
-                        let transpose_op = Self::create_mil_operation(
-                            "transpose",
-                            transpose_inputs,
-                            vec![transpose_output_type],
-                        );
-
-                        // Same defer logic as for the filter: for constants/inputs the
-                        // source has already been emitted so the override and transpose go now.
-                        // For intermediates, defer both until the producing op is emitted.
-                        if matches!(
-                            input_operand.kind,
-                            OperandKind::Constant | OperandKind::Input
-                        ) {
-                            operand_name_overrides
-                                .insert(input_operand_id, transposed_input_name.clone());
-                            main_block.operations.push(transpose_op);
-                        } else {
-                            deferred_transposes
-                                .entry(input_operand_id)
-                                .or_insert_with(|| (Vec::new(), transposed_input_name.clone()))
-                                .0
-                                .push(transpose_op);
-                        }
-                    }
-                }
-            }
-        }
+        let mut convolution_views: HashMap<(String, Vec<u32>), String> = HashMap::new();
 
         // CoreML's model compiler fuses a `pad` op that directly feeds a pool into
         // the pool's own padding. The fused pool drops the pad's constant value
@@ -6096,6 +6041,23 @@ impl super::GraphConverter for CoremlMlProgramConverter {
         // Convert all operations to MIL operations
         for op in &graph_info.operations {
             let op_type_lower = op.op_type().to_lowercase();
+            // A layout view belongs to this convolution, not to its logical
+            // producer. Every producer has finished before its consumer is
+            // reached, including specialized lowerings with early continues.
+            let convolution_input_names = if matches!(
+                op,
+                Operation::Conv2d { .. } | Operation::ConvTranspose2d { .. }
+            ) {
+                Some(Self::convolution_input_names(
+                    graph_info,
+                    op,
+                    &operand_name_overrides,
+                    &mut main_block,
+                    &mut convolution_views,
+                )?)
+            } else {
+                None
+            };
 
             if matches!(
                 op,
@@ -8306,12 +8268,17 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         _ => {}
                     }
                     let nobias_name = format!("{out_name}_nobias_{out_id}");
-                    let mut nobias_overrides = operand_name_overrides.clone();
-                    nobias_overrides.insert(out_id, nobias_name.clone());
-                    let mil = self.convert_operation_with_overrides(
+                    let mut nobias_type = out_type.clone();
+                    nobias_type.name = nobias_name.clone();
+                    let input_names = convolution_input_names
+                        .as_ref()
+                        .expect("convolution inputs");
+                    let mil = self.convert_operation_with_input_names_and_outputs(
                         graph_info,
                         &stripped,
-                        &nobias_overrides,
+                        &input_names[..stripped.input_operands().len()],
+                        vec![nobias_type],
+                        self.get_mil_op_type(stripped.op_type())?,
                     )?;
                     main_block.operations.push(mil);
 
@@ -8610,13 +8577,6 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         vec![output_type],
                     ));
                 }
-
-                // Flush deferred transposes for this output
-                if let Some((pending_ops, transposed_name)) = deferred_transposes.remove(&output_id)
-                {
-                    main_block.operations.extend(pending_ops);
-                    operand_name_overrides.insert(output_id, transposed_name);
-                }
                 continue;
             }
 
@@ -8633,15 +8593,6 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                     &weight_builder,
                     &mut main_block,
                 )?;
-                // A dequantized conv filter carries a deferred layout transpose
-                // keyed on this output; flush it like every other emission path.
-                if let Some(output_id) = op.output_operand()
-                    && let Some((pending_ops, transposed_name)) =
-                        deferred_transposes.remove(&output_id)
-                {
-                    main_block.operations.extend(pending_ops);
-                    operand_name_overrides.insert(output_id, transposed_name);
-                }
                 continue;
             }
             // quantize/dequantize that CoreML's native op can't express (int32 tensors,
@@ -8655,13 +8606,6 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                     &operand_name_overrides,
                     &mut main_block,
                 )?;
-                if let Some(output_id) = op.output_operand()
-                    && let Some((pending_ops, transposed_name)) =
-                        deferred_transposes.remove(&output_id)
-                {
-                    main_block.operations.extend(pending_ops);
-                    operand_name_overrides.insert(output_id, transposed_name);
-                }
                 continue;
             }
             if op_type_lower == "quantizelinear" && Self::qdq_should_decompose(graph_info, op) {
@@ -9874,19 +9818,13 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         vec![output_type],
                     ));
 
-                    if let Some((pending_ops, transposed_name)) =
-                        deferred_transposes.remove(&output_id)
-                    {
-                        main_block.operations.extend(pending_ops);
-                        operand_name_overrides.insert(output_id, transposed_name);
-                    }
                     continue;
                 }
             }
 
             // Special handling for conv2d / convTranspose2d with NHWC layout.
-            // CoreML conv requires NCHW. The pre-scan (above) has already transposed input and
-            // filter operands to NCHW and recorded the overrides. Here we run the conv op with
+            // CoreML conv requires NCHW. Consumer-local views have transposed input and
+            // filter operands without changing their other uses. Run the conv op with
             // an intermediate NCHW output name, then post-transpose to restore NHWC.
             if op_type_lower == "conv2d" || op_type_lower == "convtranspose2d" {
                 let conv_layout = match op {
@@ -9941,14 +9879,15 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         }),
                     };
 
-                    // Run conv with NCHW-transposed inputs (set up by pre-scan) and NCHW output
-                    let input_names =
-                        Self::input_names_for_operation(graph_info, op, &operand_name_overrides);
+                    // Run conv with its consumer-local input views and NCHW output
+                    let input_names = convolution_input_names
+                        .as_ref()
+                        .expect("convolution inputs");
                     let mil_op_type = self.get_mil_op_type(op.op_type())?;
                     let conv_op = self.convert_operation_with_input_names_and_outputs(
                         graph_info,
                         op,
-                        &input_names,
+                        input_names,
                         vec![nchw_out_type],
                         mil_op_type,
                     )?;
@@ -9968,14 +9907,6 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         post_tp_inputs,
                         vec![output_type],
                     ));
-
-                    // Flush deferred transposes for this output
-                    if let Some((pending_ops, transposed_name)) =
-                        deferred_transposes.remove(&output_id)
-                    {
-                        main_block.operations.extend(pending_ops);
-                        operand_name_overrides.insert(output_id, transposed_name);
-                    }
                     continue;
                 }
             }
@@ -10122,14 +10053,6 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         post_tp_inputs,
                         vec![output_type],
                     ));
-
-                    // Flush deferred transposes for this output
-                    if let Some((pending_ops, transposed_name)) =
-                        deferred_transposes.remove(&output_id)
-                    {
-                        main_block.operations.extend(pending_ops);
-                        operand_name_overrides.insert(output_id, transposed_name);
-                    }
                     continue;
                 }
             }
@@ -10249,14 +10172,6 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         reduce_inputs,
                         vec![output_type],
                     ));
-
-                    // Flush deferred transposes for this output.
-                    if let Some((pending_ops, transposed_name)) =
-                        deferred_transposes.remove(&output_id)
-                    {
-                        main_block.operations.extend(pending_ops);
-                        operand_name_overrides.insert(output_id, transposed_name);
-                    }
                     continue;
                 }
             }
@@ -10415,19 +10330,21 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                 }
             }
 
-            let mil_op =
-                self.convert_operation_with_overrides(graph_info, op, &operand_name_overrides)?;
+            let mil_op = if let Some(input_names) = convolution_input_names {
+                let output_id = op.output_operand().expect("convolution output");
+                let (_, output_type) =
+                    Self::create_output_value(graph_info, output_id, &operand_name_overrides)?;
+                self.convert_operation_with_input_names_and_outputs(
+                    graph_info,
+                    op,
+                    &input_names,
+                    vec![output_type],
+                    self.get_mil_op_type(op.op_type())?,
+                )?
+            } else {
+                self.convert_operation_with_overrides(graph_info, op, &operand_name_overrides)?
+            };
             main_block.operations.push(mil_op);
-
-            // Flush any transpose ops that were waiting for this operation's output, and
-            // activate the corresponding operand-name override so that later operations
-            // that consume this operand use the transposed name.
-            if let Some(output_id) = op.output_operand()
-                && let Some((pending_ops, transposed_name)) = deferred_transposes.remove(&output_id)
-            {
-                main_block.operations.extend(pending_ops);
-                operand_name_overrides.insert(output_id, transposed_name);
-            }
         }
 
         // Add block outputs (output operand names)
