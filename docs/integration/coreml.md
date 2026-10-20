@@ -251,3 +251,6 @@ TinyStories SE2 accuracy, Mamba XS load/returned-state qualification, Watch SE2
 and accelerated execution remain open. Smol response quality/context and token
 cap issues remain release blockers. Physical final-head qualification must
 precede performance claims; budgets and frozen references stay unchanged.
+
+See the [native source-port handoff](../testing/native-coreml-source-handoff.md)
+for the draft branch sequence, immutable prerequisites and outstanding gates.
