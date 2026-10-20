@@ -73,10 +73,10 @@ fn build_coreml_protos() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(feature = "coreml-runtime")]
 fn build_coreml_shim() {
     // Build scripts run on the host: select by the Cargo target, not the host's
-    // cfg. In particular, watchOS cannot compile source models with this API.
+    // cfg. watchOS uses the Rust exporter; the shim only loads and predicts.
     if !matches!(
         env::var("CARGO_CFG_TARGET_OS").as_deref(),
-        Ok("macos" | "ios")
+        Ok("macos" | "ios" | "tvos" | "watchos" | "visionos")
     ) {
         return;
     }

@@ -76,6 +76,33 @@ pub struct ConvertedGraph {
     pub weights_data: Option<Vec<u8>>,
 }
 
+impl ConvertedGraph {
+    /// Emit a CoreML compiled bundle locally using the Rust exporter.
+    ///
+    /// The source graph must already have been lowered by this process. This
+    /// writes external weight blobs directly without a second whole-file copy.
+    /// It invokes no Apple compiler, subprocess, network service or inference.
+    /// Loading the returned bundle remains a separate CoreML runtime operation.
+    #[cfg(feature = "coreml-export")]
+    pub fn write_coreml_bundle(
+        &self,
+        directory: impl AsRef<std::path::Path>,
+    ) -> Result<(), GraphError> {
+        if self.format != "coreml" {
+            return Err(GraphError::ConversionFailed {
+                format: self.format.into(),
+                reason: "only CoreML conversions can be written as mlmodelc bundles".into(),
+            });
+        }
+        mlmodelc_export::compile_to_dir(&self.data, self.weights_data.as_deref(), directory)
+            .map(|_| ())
+            .map_err(|error| GraphError::ConversionFailed {
+                format: "coreml".into(),
+                reason: format!("local bundle export failed: {error}"),
+            })
+    }
+}
+
 /// Lowers a [`GraphInfo`] to one backend format.
 pub trait GraphConverter {
     /// Format name used as the registry key (lower case).

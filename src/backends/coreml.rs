@@ -964,7 +964,14 @@ mod test {
             outputs.insert("out", out);
             builder.build(&outputs).unwrap()
         };
-        assert_eq!(load_route(&graph), CoremlLoadRoute::InMemoryAsset);
+        assert_eq!(
+            load_route(&graph),
+            if cfg!(feature = "coreml-export") {
+                CoremlLoadRoute::RustExport
+            } else {
+                CoremlLoadRoute::InMemoryAsset
+            }
+        );
 
         let mut io_desc = MLTensorDescriptor::from_operand_descriptor(&desc);
         io_desc.set_writable(true);
@@ -1012,7 +1019,14 @@ mod test {
             outputs.insert("out", out);
             builder.build(&outputs).unwrap()
         };
-        assert_eq!(load_route(&graph), CoremlLoadRoute::CompiledUrl);
+        assert_eq!(
+            load_route(&graph),
+            if cfg!(feature = "coreml-export") {
+                CoremlLoadRoute::RustExport
+            } else {
+                CoremlLoadRoute::CompiledUrl
+            }
+        );
 
         let mut io_desc = MLTensorDescriptor::from_operand_descriptor(&desc);
         io_desc.set_writable(true);

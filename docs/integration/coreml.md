@@ -1,6 +1,6 @@
 # CoreML Backend
 
-The `coreml` backend runs WebNN graphs through Apple CoreML on macOS and iOS. The converter
+The `coreml` backend runs WebNN graphs through Apple CoreML on Apple targets. The converter
 (`src/converters/coreml_mlprogram.rs`) emits an MLProgram, the MIL-based model format, and the
 backend (`src/backends/coreml.rs`) compiles it once and keeps the compiled model for repeated
 dispatch. The Objective-C bridge lives in `src/executors/coreml.rs` and `src/executors/coreml_shim.mm`.
@@ -9,8 +9,9 @@ dispatch. The Objective-C bridge lives in `src/executors/coreml.rs` and `src/exe
 
 - A CoreML version that accepts MLProgram models (macOS 13 or newer). The native Rust
   backend also supports iOS; mobile validation uses iOS 18 as its deployment target.
-- tvOS is not enabled: the published `objc` dependency selects the wrong message ABI
-  there. watchOS execution is not enabled by these target gates either.
+- The vendored `objc` message-dispatch patch selects the Apple ABI on tvOS,
+  watchOS and visionOS. Keep this prerequisite when updating the dependency.
+  watchOS additionally requires `coreml-export` for local bundle compilation.
 - The `coreml-runtime` Cargo feature. On Linux and Windows the feature compiles to shims whose
   calls always fail, so `cargo check --features coreml-runtime` works everywhere but the backend
   is never selected on those platforms.
@@ -138,3 +139,30 @@ The remaining expected failures come from the platform rather than from missing 
 
 See the [WPT conformance dashboard](https://rustnn.github.io/rustnn/wpt-conformance/) for the
 current per-operation status.
+
+## Local compilation on Apple devices
+
+Build with `coreml-runtime,coreml-export` to parse a local WebNN source bundle,
+lower it in RustNN and emit its compiled CoreML bundle in the application process.
+This route uses the immutable Git-pinned `mlmodelc-export` prerequisite and loads
+the result through CoreML. The dependency can be replaced by a released crate once nested-block support is available. It needs no
+Mac helper, Python, compiler subprocess or network connection after deployment;
+Cargo dependencies and the application binary can be prepared on a development
+machine. watchOS requires this route because its public CoreML API does not
+compile source models. The same route is available on iOS, tvOS, visionOS and
+macOS. Cross-compilation alone does not qualify a physical device.
+
+Load `.webnn` or `.json` and its local weights with `load_graph_from_path`, then
+pass the result to `MLContext::rustnn_build_graph`. Load diagnostics report
+`CoremlLoadRoute::RustExport`. Export or load errors are returned to the caller;
+this route does not fall back to a remote compiler or host inference stage.
+Enable `RustNNOptions.coreml.reuse_tensor_storage` to carry compatible tensors
+between dispatches without Rust materializing their bytes. Read only the outputs
+your application actually needs. CoreML may still copy storage internally.
+
+The Rust compiler route changes bundle emission, not the numerical lowering.
+It does not by itself qualify the experimental SmolLM2 corrections, guarantee
+GPU/Neural Engine placement, or establish a Watch memory bound. The source loader
+currently owns resolved weight bytes, so parsing and lowering peak memory must
+also be measured on the device. Existing operator tolerances and model accuracy
+gates remain separate validation requirements.
