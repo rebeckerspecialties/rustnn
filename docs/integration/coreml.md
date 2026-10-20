@@ -212,3 +212,14 @@ Operator accuracy and carried-model accuracy are distinct gates. The preserved
 A profile still fails one TinyStories SE2 logit at step 163; later B/C softmax
 and XS boundary experiments are excluded. Extreme-range/policy and three-model
 physical qualification remain required before deployment recommendation.
+
+### Experimental block-local contractions
+
+`coreml_projection::apply_file_backed` uses width-32 block-local aligned pieces
+for admitted constant projections and runtime-weight attention, retaining
+ordinary native paths outside admission. Static weight transformation happens
+during compilation; inference remains native. Watch profile affine leaves and
+non-Watch CPU constant compression are explicit options, not a new default
+backend policy. This does not resize KV context or relax contraction/model
+gates. Cross-model extreme-range and accelerated physical qualification remain
+open; no GPU/ANE placement or universal goodput/memory claim is made.
