@@ -58,3 +58,10 @@ Persist both the model and any weights returned in
 [ConvertedGraph](https://rustnn.github.io/rustnn/api/rustnn/converters/struct.ConvertedGraph.html);
 these backend artifacts are separate from the source `.webnn`/SafeTensors pair. See the
 [conversion recipe](https://rustnn.github.io/rustnn/user-guide/examples/#convert-to-onnx-without-a-backend).
+
+For offline Apple deployment, ship the original source graph and local weight
+sidecars, enable `coreml-runtime,coreml-export`, and call the same loader and
+`rustnn_build_graph` on the device. Parsing, shape validation, backend lowering
+and bundle compilation then run in the application process. A pre-lowered CoreML
+protobuf demonstrates only the compilation/inference portion of this workflow.
+See the [CoreML integration guide](https://rustnn.github.io/rustnn/integration/coreml/).

@@ -168,3 +168,10 @@ inference.
 
 Then write the regression test first, fix the lowering, and run the WPT cases for the operation
 on every backend you have.
+
+### Local Apple bundle emission
+
+With `coreml-export`, `ConvertedGraph::write_coreml_bundle` writes through the
+immutable Git-pinned Rust exporter. Recursive MIL blocks and external weights
+remain in the compiled bundle; runtime loading is a separate native operation.
+No compiler subprocess or network service is used after deployment.

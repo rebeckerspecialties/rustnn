@@ -43,6 +43,8 @@ default = []
 capi = ["dep:pretty_env_logger"]
 dynamic-inputs = []
 coreml-runtime = ["objc", "block"]
+# Emit the compiled bundle locally in Rust, including on watchOS.
+coreml-export = ["dep:mlmodelc-export"]
 onnx-runtime = ["ort", "ndarray"]
 trtx-runtime = ["trtx", "cudarc", "zstd-cache-compression"]
 trtx-runtime-mock = ["trtx/mock", "cudarc"]
@@ -218,6 +220,7 @@ regex = "1.11"
 hiai-rs = { version = "0.1.0", optional = true }
 webnn-graph = "0.4"
 webnn-onnx-utils = "0.1.1"
+mlmodelc-export = { git = "https://github.com/rebeckerspecialties/mlmodelc-export", rev = "9ba3c3cbc57e2cbe16624fcfd0ea75062cf9dd89", default-features = false, optional = true }
 
 cudarc = { version = "0.19", features = ["cuda-13020"], optional = true }
 log = "0.4.29"
@@ -240,14 +243,14 @@ js-sys = { version = "0.3.104", optional = true }
 wasm-bindgen-futures = { version = "0.4.77", optional = true }
 
 # The exception feature is needed to avoid undefined behavior when objc throws exceptions
-objc = { version = "0.2", optional = true, features = [
+objc = { version = "0.2", path = "vendor/objc", optional = true, features = [
 ] } # without "exception" it builds on Linux using https://github.com/gnustep/libobjc2
 block = { version = "0.1", optional = true }
 pollster = { version = "1.0.1", optional = true }
 
-[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+[target.'cfg(target_vendor = "apple")'.dependencies]
 # Native CoreML targets require Objective-C exception handling.
-objc = { version = "0.2", optional = true, features = ["exception"] }
+objc = { version = "0.2", path = "vendor/objc", optional = true, features = ["exception"] }
 
 [build-dependencies]
 # cleanup-markdown rewrites the .proto comments as Markdown and fences their code blocks as

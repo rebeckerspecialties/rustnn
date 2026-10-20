@@ -10,6 +10,8 @@ pub enum CoremlLoadRoute {
     InMemoryAsset,
     /// Compile a source URL and load the resulting `.mlmodelc`.
     CompiledUrl,
+    /// Emit the compiled bundle in this process with `mlmodelc-export`.
+    RustExport,
 }
 
 /// An unsuccessful attempt preceding a successful model load.

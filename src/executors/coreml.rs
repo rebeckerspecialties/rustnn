@@ -1,4 +1,4 @@
-//! Minimal CoreML execution bridge for macOS and iOS.
+//! CoreML execution bridge for supported Apple targets.
 //! Loads a `.mlmodel`, compiles it if needed, and runs a zeroed inference
 //! using CoreML's Objective-C API.
 
@@ -38,17 +38,36 @@ use load::LoadTrace;
 pub use load::{CoremlLoadDiagnostics, CoremlLoadFailure, CoremlLoadRoute};
 
 // Link against the system frameworks we use.
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos"
+))]
 #[link(name = "Foundation", kind = "framework")]
 unsafe extern "C" {}
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos"
+))]
 #[link(name = "CoreML", kind = "framework")]
 unsafe extern "C" {}
 
 // Objective-C++ exception firewall (src/executors/coreml_shim.mm).
 // Return codes: 0 = success, 1 = NSError, 2 = NSException, 3 = C++ exception.
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos"
+))]
 unsafe extern "C" {
+    #[cfg(not(feature = "coreml-export"))]
     fn rustnn_coreml_compile(
         model_url: *mut Object,
         out_url: *mut *mut Object,
@@ -77,7 +96,13 @@ unsafe extern "C" {
 /// # Safety
 /// This stand-in does not dereference its pointer arguments. Its unsafe signature
 /// mirrors the native shim; no output pointers are initialized on failure.
-#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos"
+)))]
 pub unsafe extern "C" fn rustnn_coreml_compile(
     _model_url: *mut Object,
     _out_url: *mut *mut Object,
@@ -91,7 +116,13 @@ pub unsafe extern "C" fn rustnn_coreml_compile(
 /// # Safety
 /// This stand-in does not dereference its pointer arguments. Its unsafe signature
 /// mirrors the native shim; no output pointers are initialized on failure.
-#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos"
+)))]
 pub unsafe extern "C" fn rustnn_coreml_load(
     _compiled_url: *mut Object,
     _configuration: *mut Object,
@@ -106,7 +137,13 @@ pub unsafe extern "C" fn rustnn_coreml_load(
 /// # Safety
 /// This stand-in does not dereference its pointer arguments. Its unsafe signature
 /// mirrors the native shim; no output pointers are initialized on failure.
-#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos"
+)))]
 pub unsafe extern "C" fn rustnn_coreml_predict(
     _model: *mut Object,
     _features: *mut Object,
@@ -126,6 +163,7 @@ struct ReleaseOnDrop(*mut Object);
 impl ReleaseOnDrop {
     /// Take the pointer back out without releasing, handing ownership (+1)
     /// to the caller.
+    #[cfg(not(feature = "coreml-export"))]
     fn into_inner(self) -> *mut Object {
         let ptr = self.0;
         std::mem::forget(self);
@@ -376,11 +414,18 @@ pub(crate) fn compile_model(
     let model_bytes = Arc::new(model_bytes);
     let weights_data = weights_data.map(Arc::new);
     let mut trace = LoadTrace::new(device_type);
+    if cfg!(feature = "coreml-export") {
+        return compile_model_from_url(
+            &model_bytes,
+            weights_data.as_deref().map(Vec::as_slice),
+            &mut trace,
+        );
+    }
     trace.routes(use_in_memory_asset, |trace, route| match route {
         CoremlLoadRoute::InMemoryAsset => {
             compile_model_from_asset(&model_bytes, weights_data.as_ref(), trace)
         }
-        CoremlLoadRoute::CompiledUrl => compile_model_from_url(
+        CoremlLoadRoute::CompiledUrl | CoremlLoadRoute::RustExport => compile_model_from_url(
             &model_bytes,
             weights_data.as_deref().map(Vec::as_slice),
             trace,
@@ -431,7 +476,11 @@ fn compile_model_from_url(
     weights_data: Option<&[u8]>,
     trace: &mut LoadTrace,
 ) -> Result<CompiledCoremlModel, GraphError> {
-    let route = CoremlLoadRoute::CompiledUrl;
+    let route = if cfg!(feature = "coreml-export") {
+        CoremlLoadRoute::RustExport
+    } else {
+        CoremlLoadRoute::CompiledUrl
+    };
     autoreleasepool(|| unsafe {
         let (compiled_url, compiled_dir, temp_model) = trace.prepare(route, || {
             prepare_compiled_model_with_weights(model_bytes, weights_data, None)
@@ -1307,6 +1356,40 @@ unsafe fn prepare_compiled_model(
 ///
 /// On success the returned NSURL is owned (+1); the caller must release it
 /// (e.g. via [`ReleaseOnDrop`]) once the model has been loaded.
+#[cfg(feature = "coreml-export")]
+pub(crate) unsafe fn prepare_compiled_model_with_weights(
+    model_bytes: &[u8],
+    weights_data: Option<&[u8]>,
+    cached_compiled: Option<&Path>,
+) -> Result<(*mut Object, PathBuf, Option<TempModelSource>), GraphError> {
+    let map_error = |error: String| GraphError::CoremlRuntimeFailed { reason: error };
+    // Keep the temporary directory owned on errors. Only transfer ownership
+    // after export and URL creation succeed, matching the native URL route.
+    let temporary = if cached_compiled.is_none() {
+        Some(
+            tempfile::Builder::new()
+                .prefix("rustnn_local_")
+                .suffix(".mlmodelc")
+                .tempdir()
+                .map_err(|e| map_error(e.to_string()))?,
+        )
+    } else {
+        None
+    };
+    let path = cached_compiled.unwrap_or_else(|| temporary.as_ref().unwrap().path());
+    mlmodelc_export::compile_to_dir(model_bytes, weights_data, path)
+        .map_err(|e| map_error(format!("local CoreML bundle export failed: {e}")))?;
+    let url = unsafe { nsurl_from_path(path)? };
+    let _: *mut Object = unsafe { msg_send![url, retain] };
+    let directory = if let Some(temporary) = temporary {
+        temporary.keep()
+    } else {
+        path.to_path_buf()
+    };
+    Ok((url, directory, None))
+}
+
+#[cfg(not(feature = "coreml-export"))]
 pub(crate) unsafe fn prepare_compiled_model_with_weights(
     model_bytes: &[u8],
     weights_data: Option<&[u8]>,
@@ -1372,6 +1455,7 @@ fn write_temp_model(model_bytes: &[u8]) -> Result<TempModelSource, GraphError> {
 /// compiles from. The underlying temp path is created with a random, `O_EXCL`-guarded
 /// name via `tempfile` and is deleted when this handle drops (RAII), so there is no
 /// cross-process collision or symlink/TOCTOU exposure and cleanup survives panics.
+#[cfg_attr(feature = "coreml-export", allow(dead_code))]
 pub(crate) enum TempModelSource {
     /// A `.mlpackage` directory (used when the model has external weights).
     Package(tempfile::TempDir),
@@ -1379,6 +1463,7 @@ pub(crate) enum TempModelSource {
     Model(tempfile::TempPath),
 }
 
+#[cfg_attr(feature = "coreml-export", allow(dead_code))]
 impl TempModelSource {
     fn path(&self) -> &Path {
         match self {
@@ -1629,6 +1714,7 @@ unsafe fn ns_error_to_string(error: *mut Object, default: &str) -> String {
     unsafe { nsstring_to_string(desc) }
 }
 
+#[cfg(not(feature = "coreml-export"))]
 fn copy_dir_recursively(src: &Path, dst: &Path) -> std::io::Result<()> {
     if dst.exists() {
         std::fs::remove_dir_all(dst)?;
