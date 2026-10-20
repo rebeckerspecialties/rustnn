@@ -1,3 +1,5 @@
 Source: crates.io objc 0.2.7, MIT licensed; see LICENSE.txt.
-Local delta: src/message/mod.rs selects the Apple message ABI for every target_vendor=apple, including tvOS, watchOS and visionOS. Other implementation files are unchanged.
+Local delta: src/message/mod.rs selects the Apple message ABI for every target_vendor=apple, including tvOS, watchOS and visionOS. Other implementation files have only mechanical rustfmt changes, required by the workspace-wide formatting check.
 This patch must remain explicit when updating the dependency; GNUstep objc_msg_lookup is not the Apple runtime ABI.
+
+Formatting: Rust 1.97 cargo fmt --all; kept as a separate style-only commit from the functional ABI change.
