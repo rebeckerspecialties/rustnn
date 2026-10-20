@@ -67,7 +67,7 @@ pub fn sanitize_webnn_identifiers(text: &str) -> String {
     result
 }
 
-fn map_weight_resolve_error(err: WeightResolveError) -> GraphError {
+pub(crate) fn map_weight_resolve_error(err: WeightResolveError) -> GraphError {
     match err {
         WeightResolveError::ReadFile { path, source } => GraphError::io(path, source),
         WeightResolveError::ManifestJson { path, source } => GraphError::ConversionFailed {
@@ -112,10 +112,27 @@ fn map_weight_resolve_error(err: WeightResolveError) -> GraphError {
 )]
 pub fn load_graph_from_path(path: impl AsRef<Path>) -> Result<GraphInfo, GraphError> {
     let path_ref = path.as_ref();
+    let mut graph_json = parse_graph_source(path_ref)?;
+
+    webnn_graph::external_weights::resolve_external_weights(&mut graph_json, path_ref, None, None)
+        .map_err(map_weight_resolve_error)?;
+
+    let graph = webnn_json::from_graph_json_owned(graph_json)?;
+    tracing::info!(
+        operands = graph.operands.len(),
+        operations = graph.operations.len()
+    );
+    Ok(graph)
+}
+
+/// Parse and shape-check source separately from consuming its external payloads.
+pub(crate) fn parse_graph_source(
+    path_ref: &Path,
+) -> Result<webnn_graph::ast::GraphJson, GraphError> {
     let contents = fs::read_to_string(path_ref).map_err(|err| GraphError::io(path_ref, err))?;
 
     // Determine format based on file extension
-    let mut graph_json = if let Some(ext) = path_ref.extension() {
+    let graph_json = if let Some(ext) = path_ref.extension() {
         match ext.to_str() {
             Some("webnn") => {
                 // Sanitize identifiers (replace dots with underscores)
@@ -146,15 +163,7 @@ pub fn load_graph_from_path(path: impl AsRef<Path>) -> Result<GraphInfo, GraphEr
         });
     };
 
-    webnn_graph::external_weights::resolve_external_weights(&mut graph_json, path_ref, None, None)
-        .map_err(map_weight_resolve_error)?;
-
-    let graph = webnn_json::from_graph_json_owned(graph_json)?;
-    tracing::info!(
-        operands = graph.operands.len(),
-        operations = graph.operations.len()
-    );
-    Ok(graph)
+    Ok(graph_json)
 }
 
 /// The format `load_graph_from_path` parses a path as, from its extension.
