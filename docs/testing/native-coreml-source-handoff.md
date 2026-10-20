@@ -38,7 +38,7 @@ cargo run --features coreml-runtime,coreml-export --example coreml_source -- /pa
 ```
 
 Development dependency fetching is permitted. Deployed applications use local
-WebNN text/JSON and weight sidecars and perform parsing, shape validation,
+WebNN text/JSON and weight sidecars and perform parsing, structural checks,
 lowering, bundle emission and native prediction on the edge device. The example
 checks setup only. A load is not a prediction or accuracy qualification.
 Native providers route intermediate `MLFeatureValue` objects without Rust
