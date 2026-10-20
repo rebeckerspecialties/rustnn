@@ -235,3 +235,19 @@ constants, passthrough descriptors, retained outputs and lexical captures.
 Ambiguous or over-budget candidates are skipped transactionally. Production
 wiring is Watch-only; the failed non-Watch cloning experiments are excluded.
 Partitioning never executes host arithmetic or reads an intermediate tensor.
+
+### Experimental offline source composition
+
+`CoremlNativeSession::compile_webnn_source_with_progress(path, policy)` parses
+local WebNN text/JSON and weight sidecars, lowers, applies the opt-in numerical
+and projection profiles, compacts live blobs, partitions, exports and loads
+native children in the deployed process. It uses no network, Mac helper or
+compiler subprocess. Watch affine/bounded expansion and producer placement are
+compile-time watchOS choices. The source graph declares its context; the compiler
+does not shorten it. `examples/coreml_source.rs` demonstrates setup.
+The [qualification snapshot](../testing/native-source-qualification-v124.json)
+binds historical dirty-source A builds, not fresh split-head device validation.
+TinyStories SE2 accuracy, Mamba XS load/returned-state qualification, Watch SE2
+and accelerated execution remain open. Smol response quality/context and token
+cap issues remain release blockers. Physical final-head qualification must
+precede performance claims; budgets and frozen references stay unchanged.

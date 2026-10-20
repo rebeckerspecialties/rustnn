@@ -1,0 +1,369 @@
+{
+  "buildIdentities": {
+    "M4-v124": {
+      "bridgeSourcesSHA256": "bd9ec60ff2e1cbe993269e600ed8743cd2f7b00a97053281e4b8b9adec3fcb07",
+      "buildNumber": "124",
+      "bundleIdentifier": "co.rbckr.modelchat.mac",
+      "exporterSourcesSHA256": "a53405590255dd357c7f1d9825721adb424cfbd4daa5a4c137f8d664b26df5d7",
+      "nativeArchiveSHA256": "9963f9b1e302609cacc64aa9db443a416210d6362ab012c61f36cbbb157729eb",
+      "nativeCargoLockSHA256": "f48a002af2117e42de55dea319b32e8313d4b3e69269ab91fb1f71213666ec73",
+      "packagedModelAssetsSHA256": "71c1242e95be587b9c2416910a30967e3e8f3d5bb11405b0408b28db1e8384e7",
+      "rustSourcesSHA256": "d0892edc9ed0f56379fcf0e951bf0243a33abce335359ef35947ac42b72fdeaa",
+      "swiftSourcesSHA256": "faab735101a6b0ee051e9de51be33a260e93b83368780723bd40f2cbe28d01bf"
+    },
+    "Watch10-v123": {
+      "bridgeSourcesSHA256": "bd9ec60ff2e1cbe993269e600ed8743cd2f7b00a97053281e4b8b9adec3fcb07",
+      "buildNumber": "123",
+      "bundleIdentifier": "co.rbckr.modelchat.watch",
+      "exporterSourcesSHA256": "a53405590255dd357c7f1d9825721adb424cfbd4daa5a4c137f8d664b26df5d7",
+      "nativeArchiveSHA256": "8e8abe0a7b52124a1f85f5148791d44eb5a3d1d13746f133c022e8e840ecfadf",
+      "nativeCargoLockSHA256": "f48a002af2117e42de55dea319b32e8313d4b3e69269ab91fb1f71213666ec73",
+      "packagedModelAssetsSHA256": "71c1242e95be587b9c2416910a30967e3e8f3d5bb11405b0408b28db1e8384e7",
+      "rustSourcesSHA256": "d0892edc9ed0f56379fcf0e951bf0243a33abce335359ef35947ac42b72fdeaa",
+      "swiftSourcesSHA256": "a1fbf4955f2417e6a3454dfb70c708d2cd8582ff7bd849b07aae26d5cdeba863"
+    },
+    "phones-v124": {
+      "bridgeSourcesSHA256": "bd9ec60ff2e1cbe993269e600ed8743cd2f7b00a97053281e4b8b9adec3fcb07",
+      "buildNumber": "124",
+      "bundleIdentifier": "co.rbckr.modelchat.phone",
+      "exporterSourcesSHA256": "a53405590255dd357c7f1d9825721adb424cfbd4daa5a4c137f8d664b26df5d7",
+      "nativeArchiveSHA256": "6edfeed56f9460c21712329a5a02889a82ed71e95a833775e3b4a98e8f0be9e4",
+      "nativeCargoLockSHA256": "f48a002af2117e42de55dea319b32e8313d4b3e69269ab91fb1f71213666ec73",
+      "packagedModelAssetsSHA256": "71c1242e95be587b9c2416910a30967e3e8f3d5bb11405b0408b28db1e8384e7",
+      "rustSourcesSHA256": "d0892edc9ed0f56379fcf0e951bf0243a33abce335359ef35947ac42b72fdeaa",
+      "swiftSourcesSHA256": "faab735101a6b0ee051e9de51be33a260e93b83368780723bd40f2cbe28d01bf"
+    }
+  },
+  "crossModelBlockers": {
+    "Mamba-XS-v124": {
+      "classification": "Process exited during load before first prediction; memory growth recorded; precise OS termination cause unproven",
+      "completed": false,
+      "lastProgress": {
+        "counters": {
+          "compressedLifetime": 1630191616,
+          "cowFaults": 273,
+          "cpuMicroseconds": 17311791,
+          "decompressions": 38,
+          "faults": 657571,
+          "inputBlocks": 0,
+          "majorFaults": 114443,
+          "minorFaults": 543128,
+          "pageins": 114443,
+          "taskInfoStatus": 0
+        },
+        "freeDiskBytes": 408425549824,
+        "memory": {
+          "compressed": 1629569024,
+          "peakPhysicalFootprint": 2163479736,
+          "physicalFootprint": 2163332280,
+          "resident": 571244544
+        },
+        "phase": "child/52/74/start",
+        "pid": 1436,
+        "uptime": 83021.68235054167
+      },
+      "newMatchingOSCrashReportFound": false,
+      "pid": 1436,
+      "predictionQualified": false
+    },
+    "TinyStories-SE2-v124": {
+      "device": {
+        "os": "Version 26.7.1 (Build 23H30)",
+        "pid": 19513,
+        "policy": "cpuOnly",
+        "sessionSHA256": "e5dd121569146bf2470a709f9f0e189302680526f66b2c03bf75096142946fdf",
+        "sourceSHA256": "0e593d243a60d07089da848866b9a00dbf5c16770d1ae435824b021314fea4dc",
+        "timingValid": true
+      },
+      "gate": {
+        "argmaxFailures": 0,
+        "arithmetic": "FP32 promoted to binary64, finite actual/reference, abs(a-b)/(atol+rtol*abs(b)) <=1; first maximum index exact",
+        "atol": 2e-05,
+        "deviceRatiosExact": true,
+        "elements": 8242148,
+        "failedCells": 1,
+        "failures": [
+          {
+            "absoluteError": 2.1753832697868347e-05,
+            "actual": 0.015425620600581169,
+            "actualBits": "0x3c7cbbbe",
+            "allowance": 2.1540386676788334e-05,
+            "cell": 8099,
+            "gateRatio": 1.009909108145678,
+            "reference": 0.0154038667678833,
+            "referenceBits": "0x3c7c6080",
+            "step": 163
+          }
+        ],
+        "maximumGateRatio": 1.009909108145678,
+        "nonfinite": 0,
+        "plannedSteps": 261,
+        "rtol": 0.0001,
+        "stepsRead": 164
+      },
+      "priorFailureComparison": {
+        "all164RecordedNumericalChecksEqual": true,
+        "sameOSGraphSessionGate": true,
+        "step163RawByteIdentical": true
+      },
+      "rawCarryLimitation": "Frozen reference bytes verified, recorded device failures/hashes checked; actual carry bytes were not saved, so this is receipt verification, not an independent raw carry comparison.",
+      "status": "confirmed original-gate failure; not qualified"
+    }
+  },
+  "evidenceArtifacts": {
+    "Fork37StrictResults-v123.txt": "9d0636a37b09d2e424592af4d03d75a3ce402efbf3108665e58e3f3171066c4a",
+    "SmolLM2-quiet-session-results-v124.json": "1b9141e276884a0ea66f37e193614350a24fdeb949328785c5286b18dffa2d67",
+    "SmolSourceAssetDelta-v128.json": "00c5c935c6cc839fc55afb6c0efb37d9b16169155b16bbe7221ba48bace8cc04",
+    "UpstreamPortReadiness-v124.txt": "9b45d17ae771716cb2403ba9e47ca865171ee1f03d466264015ec565ab867b26",
+    "Watch10-v123-independent-audit.json": "6527f85db51de2b0038b14256f3766be099ce4621a282822599cc1acbfe54399",
+    "Watch10-v123-independent-raw-parity.json": "33f009e2381d2d2ad00532dfe9942b8a9115ba3b75e8b575fb7718c327e9f8ac",
+    "XS-head32-v125-experiment/XS-load-artifact-audit.json": "2f38cced332c0214bedf785c78a2a7c9b66cc43443b82eca653baa775ee774eb",
+    "XS-head32-v125-experiment/XS-load-receipt-audit.json": "4d97be77bf2ed2024f7c18ffa0d7ec9a6b0bf4020a194fc056525897830aca17",
+    "production-accuracy-v124/SE2-smol-independent-audit.json": "f5a4fb2c11eb99b7f68339327c196bf00a36b5106621584a474797607bb4377c",
+    "production-accuracy-v124/SE2-tiny-independent-audit.json": "89f0b4b22a7944b1c28172ed3a36f4d6b3d2511cc478ca7a43b38f4539aafb75",
+    "production-accuracy-v124/XS-mamba-load-exit-audit.json": "29ba93f306d1249c4ab00e8210a3ead962b35e08d36843f0093dc523c769e80d",
+    "production-accuracy-v124/XS-smol-independent-audit.json": "cc1c4e909b2b8dc269801f27190520d42ad8017e319f3d3cb3f2c8aa2d30387e",
+    "quiet-v123/watch10-independent-audit/audit.json": "7f89f9187f0a9f1590904122749f3967855802c5dece2db8a75bdfb02cc6e615",
+    "quiet-v123/watch10-independent-audit/receipt-manifest.json": "91b7c9119ff28936068635fa6ae47a07d75cdc8539c99075202e3423840cdfdc"
+  },
+  "generatedUTC": "2026-10-19T22:18:12.936076+00:00",
+  "generatorSHA256": "af97d2697d9b077a9390569041f44ca1248856d8fe058ca15bad36c673c3202b",
+  "isolatedHeadLoadControl": {
+    "allThermalsNominal": true,
+    "completed": true,
+    "identitySHA256": "d7e2d7e54169915639f168baacce63bf6af2b1b1562fe83ce2cc9d9c56566c96",
+    "os": "Version 18.7.10 (Build 22H374)",
+    "pid": 1444,
+    "preparationLifetimePeakPhysicalBytes": 120620312,
+    "rows": [
+      {
+        "beforePhysicalBytes": 11437096,
+        "cpuSecondsDuringLoad": 0.500842,
+        "decompressionsDuringLoad": 0,
+        "loadNetMiB": 31.046951293945312,
+        "loadNetPhysicalBytes": 32555088,
+        "loadSeconds": 0.5206640833348501,
+        "loadedPhysicalBytes": 43992184,
+        "pageinsDuringLoad": 2,
+        "postReleaseDriftBytes": 376832,
+        "releasedPhysicalBytes": 11813928,
+        "sampledLoadPhasePeakPhysicalBytes": 49988888,
+        "variant": "A1"
+      },
+      {
+        "beforePhysicalBytes": 11813928,
+        "cpuSecondsDuringLoad": 0.082781,
+        "decompressionsDuringLoad": 0,
+        "loadNetMiB": 0.0625,
+        "loadNetPhysicalBytes": 65536,
+        "loadSeconds": 0.12740904167003464,
+        "loadedPhysicalBytes": 11879464,
+        "pageinsDuringLoad": 710,
+        "postReleaseDriftBytes": 49152,
+        "releasedPhysicalBytes": 11863080,
+        "sampledLoadPhasePeakPhysicalBytes": 12092576,
+        "variant": "B"
+      },
+      {
+        "beforePhysicalBytes": 11863080,
+        "cpuSecondsDuringLoad": 0.490424,
+        "decompressionsDuringLoad": 0,
+        "loadNetMiB": 30.703201293945312,
+        "loadNetPhysicalBytes": 32194640,
+        "loadSeconds": 0.5045514999947045,
+        "loadedPhysicalBytes": 44057720,
+        "pageinsDuringLoad": 0,
+        "postReleaseDriftBytes": 16384,
+        "releasedPhysicalBytes": 11879464,
+        "sampledLoadPhasePeakPhysicalBytes": 49808664,
+        "variant": "A2"
+      }
+    ],
+    "scope": [
+      "Only retained standalone child load allocation is measured.",
+      "No prediction, intermediate readback or host inference stage.",
+      "Process lifetime peak includes source preparation and earlier variants.",
+      "No full-pipeline peak, goodput, deferred-allocation or execution-placement claim."
+    ],
+    "sourcePreparationSeconds": 7.52102775000094,
+    "timingValid": true
+  },
+  "publicationStatus": "Generated from locally preserved evidence identified by artifact ID and SHA256. No public evidence repository, clean reproducible source release, SDK/UI final readiness, or App Store approval is claimed.",
+  "quietQualifiers": [
+    "Watch peak is lifetime peak in PID1680 across earlier interrupted attempts and successful run; completed run timing is foreground-valid.",
+    "M4 direct app process network-denial control passed; OS-service-wide network isolation is not established. Phone/Watch source parse/lower/compile/inference is local; Wi-Fi/USB was used for development installation and evidence retrieval.",
+    "No GPU/ANE placement claim.",
+    "XS head-child allocation regression remains unresolved.",
+    "All 32-token reply texts/counts match matched M4 control; this does not establish long-form conversational quality.",
+    "Strict WebNN operation/WPT budgets remain distinct from the 459-step frozen full-model accuracy gate.",
+    "Watch inclusive goodput remains below 1 token/sec; decode-only rate does not satisfy that target.",
+    "Watch v123 predates the v124 practical pause/resume UI and final-publication timing changes. Its completed strict receipt has no lifecycle interruption; two earlier interrupted attempts are preserved and excluded.",
+    "Only the declared final logits are read for application token selection. Native per-child forwarding does not prove zero copies within CoreML."
+  ],
+  "quietSessionScope": "Six UI replies capped at 32 generated tokens each, requested cpuOnly, unchanged frozen SmolLM2 source assets; prompt processing included in reply goodput. Model accuracy is independently qualified, not inferred from text match.",
+  "quietSessions": [
+    {
+      "appVersion": "v124",
+      "device": "M4 Max",
+      "generatedTokens": 192,
+      "lifetimePeakPhysicalMiB": 211.50128173828125,
+      "nominalThermals": true,
+      "replyInclusiveTokensPerSecond": 11.042068178431244,
+      "sessionTokensPerSecondIncludingLoad": 7.9554117403107485,
+      "sourceToLoadedSeconds": 6.705734874999999,
+      "summaryArtifactID": "quiet-v124/M4-offline-completed/summary.json",
+      "summarySHA256": "79c02c38df0577be6c3388e70f1008a3fb5d7f2722ef4159f3b6519871b12782",
+      "ttftSecondsMaximum": 2.168862291000001,
+      "ttftSecondsMedian": 1.0853035625
+    },
+    {
+      "appVersion": "v124",
+      "device": "iPhone XS Max / A12",
+      "generatedTokens": 192,
+      "lifetimePeakPhysicalMiB": 555.8309707641602,
+      "nominalThermals": true,
+      "replyInclusiveTokensPerSecond": 1.9021455268570289,
+      "sessionTokensPerSecondIncludingLoad": 1.5573510966529807,
+      "sourceToLoadedSeconds": 22.323133042,
+      "summaryArtifactID": "quiet-v124/XS-summary.json",
+      "summarySHA256": "0e76fec64f7de8782f8c6821800d66287272209a90edcde661e7a610b75bf86b",
+      "ttftSecondsMaximum": 13.411986708,
+      "ttftSecondsMedian": 6.267404124999999
+    },
+    {
+      "appVersion": "v124",
+      "device": "iPhone SE2 / A13",
+      "generatedTokens": 192,
+      "lifetimePeakPhysicalMiB": 134.12677764892578,
+      "nominalThermals": true,
+      "replyInclusiveTokensPerSecond": 4.305097261378205,
+      "sessionTokensPerSecondIncludingLoad": 3.1129892482297774,
+      "sourceToLoadedSeconds": 17.002007458999998,
+      "summaryArtifactID": "quiet-v124/SE2-summary.json",
+      "summarySHA256": "7f2c5c6ccbd52fa4bfbff3ccc722beab362d4192405becde088ced12fb34341a",
+      "ttftSecondsMaximum": 5.56991275,
+      "ttftSecondsMedian": 2.791948582999998
+    },
+    {
+      "appVersion": "v123",
+      "device": "Watch 10",
+      "generatedTokens": 192,
+      "lifetimePeakPhysicalMiB": 242.51753997802734,
+      "nominalThermals": true,
+      "replyInclusiveTokensPerSecond": 0.9914535428676403,
+      "sessionTokensPerSecondIncludingLoad": 0.8247768807100067,
+      "sourceToLoadedSeconds": 39.05704820899996,
+      "summaryArtifactID": "quiet-v123/Watch10-completed-summary.json",
+      "summarySHA256": "c564ae0e53f00bc12672561b9137d3e0383ff3c537257fbf6b2eadbebdd4ae98",
+      "ttftSecondsMaximum": 26.16117208300011,
+      "ttftSecondsMedian": 11.643794812500005
+    }
+  ],
+  "remainingGates": [
+    "Clean, pinned RustNN/exporter/bridge commits and source-only rebuild recipe; current qualified RustNN tree contains uncommitted work.",
+    "Current final source builds of SmolLM2, TinyStories and Mamba on requested devices, including arm64_32 Watch SE2; preserve each original model and operator accuracy gate.",
+    "Resolve TinyStories numerical failure and Mamba XS load exit before claiming cross-model qualification; precise Mamba termination cause is unproven.",
+    "XS full-model memory remains unresolved. Isolated head A/B/A load controls and reciprocal-correction source drafts are not integrated qualified fixes.",
+    "GPU/ANE exact-PID placement, performance and precision; selected compute permission is insufficient.",
+    "Cold clean installation with connectivity disabled, no compiled cache, sustained sessions, reload/release and final memory limits on every supported device.",
+    "Practical pause/resume, cancellation, thermals, accessibility, model switching and final SDK/UI checks on physical devices.",
+    "Native contribution line/branch tests and strict touched-operation WPT; new WPT packets need real browser positive and defective controls.",
+    "Portable dependency pins, model-conversion provenance, final notices/privacy/entitlements/signing, app icons, TV/visionOS targets and store archive/submission."
+  ],
+  "schemaVersion": 1,
+  "scope": "Opt-in native WebNN source sessions and manually packaged development apps; frozen SmolLM2 CPU campaign and capped six-turn quiet controls only.",
+  "smolAccuracy": {
+    "SE2-v124": {
+      "device": {
+        "lifecyclePolicy": "accuracy-pause-resume",
+        "lifecycleSource": "swiftui-scene-phase",
+        "os": "Version 26.7.1 (Build 23H30)",
+        "pid": 19501,
+        "policy": "cpuOnly",
+        "timingValid": true
+      },
+      "gate": {
+        "argmaxFailures": 0,
+        "elements": 22560768,
+        "failures": 0,
+        "maximumGateRatio": 0.9580932360027625,
+        "nonfiniteActual": 0,
+        "nonfiniteReference": 0,
+        "steps": 459
+      }
+    },
+    "Watch10-v123": {
+      "allFrozenSessionChecksPass": true,
+      "byteDifferentFilesVsM4WatchProfileV122": [],
+      "lifecycle": {
+        "policy": "accuracy-pause-resume",
+        "sceneInterruptions": 0,
+        "timingValid": true
+      },
+      "logitComparisons": 22560768,
+      "maximumGateRatio": 0.9580932360027625,
+      "memoryBytes": {
+        "heldPhysical": 161302656,
+        "heldResident": 643678208,
+        "loadedPhysical": 131663736,
+        "peakPhysical": 244221840,
+        "releasedPhysical": 19154640
+      },
+      "stateScope": "Final logits checked independently; carried state exercised through later predictions, without direct raw KV reference comparison.",
+      "steps": 459
+    },
+    "XS-v124": {
+      "device": {
+        "lifecyclePolicy": "accuracy-pause-resume",
+        "os": "Version 18.7.10 (Build 22H374)",
+        "pid": 1425,
+        "policy": "cpuOnly",
+        "timingValid": true
+      },
+      "gate": {
+        "allFinite": true,
+        "argmaxFailures": 0,
+        "elements": 22560768,
+        "failures": 0,
+        "maximumGateRatio": 0.8549120960890259,
+        "steps": 459
+      }
+    },
+    "gate": {
+      "argmax": "exact",
+      "atol": 2e-05,
+      "finite": true,
+      "rtol": 0.0001
+    }
+  },
+  "sourceModel": {
+    "authoringDelta": {
+      "constantDeclarationsUnchanged": true,
+      "finalOutputDeclarationsUnchanged": true,
+      "shapeOrOptionEdits": 181
+    },
+    "cacheTokens": 128,
+    "graphSHA256": "f899fd701a9fd209173a5d08c514508adc906dbb5a02aa89d6a9c53e4fefc0a5",
+    "inputVariant": "Pre-authored context128 WebNN source; not an automatic compiler resize of the original512 graph.",
+    "onDeviceTransforms": [
+      "WebNN parsing",
+      "native numerical lowering",
+      "wide-head tiling",
+      "native partitioning and feature forwarding",
+      "CoreML bundle emission and load"
+    ],
+    "originalGraphSHA256": "6e337ae7f4b7b908d340a6b9e52cd3a942397ab5aa7f901b95fb33bbc4d05fcb",
+    "provenanceArtifactID": "SmolSourceAssetDelta-v128.json",
+    "sessionSHA256": "60a576a90f0bf50faa1d52b8c92d38860d122489f05ee42ef0e1f298e9640390",
+    "weightsSHA256": "c25e41a3c0459cad1b1a7a2e78baaa67c50241cf39b69f2192d9dc00453c1983"
+  },
+  "strictWpt": {
+    "allBackendJobs": "failed",
+    "corpusPin": "8b876b9f39a0e7ee65762918cae96b081d14ceb5",
+    "forkPR": 37,
+    "head": "aebdf9786f95a721efa0e1dfb40feecb4058552c",
+    "runID": 39316168121,
+    "scope": "Comparator/corpus baseline only; not validation of the experimental native source numerical profile.",
+    "toleranceMode": "strict"
+  }
+}

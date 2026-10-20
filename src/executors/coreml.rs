@@ -37,6 +37,9 @@ mod load;
 #[cfg(feature = "coreml-export")]
 #[path = "coreml_pipeline.rs"]
 mod pipeline;
+#[cfg(feature = "coreml-export")]
+#[path = "coreml_source.rs"]
+mod source;
 use load::LoadTrace;
 pub use load::{CoremlComputeUnits, CoremlLoadDiagnostics, CoremlLoadFailure, CoremlLoadRoute};
 
