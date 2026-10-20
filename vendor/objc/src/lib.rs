@@ -62,7 +62,10 @@ The bindings can be used on Linux or *BSD utilizing the
 
 #![crate_name = "objc"]
 #![crate_type = "lib"]
-#![warn(missing_docs)]
+// Preserve the upstream 0.2.7 dependency's legacy diagnostics when vendored.
+// Registry dependencies are lint-capped by Cargo; path packages are not.
+// Keep RustNN's own strict lint policy unchanged.
+#![allow(missing_docs, missing_abi, deprecated, unexpected_cfgs)]
 
 extern crate malloc_buf;
 #[cfg(feature = "exception")]

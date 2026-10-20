@@ -3,3 +3,5 @@ Local delta: src/message/mod.rs selects the Apple message ABI for every target_v
 This patch must remain explicit when updating the dependency; GNUstep objc_msg_lookup is not the Apple runtime ABI.
 
 Formatting: Rust 1.97 cargo fmt --all; kept as a separate style-only commit from the functional ABI change.
+
+Lint compatibility: allow only the frozen upstream missing_docs, missing_abi, deprecated and cargo-clippy cfg diagnostics within this vendored crate. RustNN keeps its strict warning policy; no ABI or inference behavior changes.
