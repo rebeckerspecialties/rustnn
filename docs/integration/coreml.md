@@ -201,3 +201,14 @@ internally. Explicit `CoremlComputeUnits` permissions fail without retrying a
 CPU-only policy and do not prove actual placement. Setup-only load callbacks
 never inspect runtime tensors. Read terminal outputs only as the application
 requires. File-backed compiler storage is dropped before native preparation.
+
+### Experimental native numerical profile
+
+`coreml_numerics::apply` emits native MIL guarded softmax, sigmoid tails, scalar
+sqrt/mean residuals, division and softplus corrections with native fallbacks and
+ReLU rounding barriers. It is never enabled by the portable converter by default.
+No WPT budget, expected-failure list, or full-model reference is changed.
+Operator accuracy and carried-model accuracy are distinct gates. The preserved
+A profile still fails one TinyStories SE2 logit at step 163; later B/C softmax
+and XS boundary experiments are excluded. Extreme-range/policy and three-model
+physical qualification remain required before deployment recommendation.
