@@ -19,6 +19,8 @@ pub mod coreml_assets;
 mod coreml_weight_storage;
 pub use coreml_weight_storage::CoremlWeightStorage;
 mod coreml_mlprogram;
+/// Opt-in native Float32 corrections for target qualification.
+pub mod coreml_numerics;
 /// Explicit native MIL packed-weight scheduling; no host inference.
 pub mod coreml_packed;
 #[cfg(feature = "litert-runtime")]
