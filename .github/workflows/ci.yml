@@ -4,7 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    # Stacked native CoreML draft PRs use feat/coreml-* bases; run the same matrix for them.
+    branches: [main, 'feat/coreml-*']
 
 env:
   # Pinned on every platform: the distro package and brew both drift, and the
@@ -130,6 +131,12 @@ jobs:
       - name: Run CoreML unit and integration tests (without dynamic-inputs)
         if: runner.os == 'macOS'
         run: make test-coreml COREML_FEATURES=coreml-runtime
+
+      # The device-local export route and its MIL passes are gated on coreml-export;
+      # no other job compiles them, so run their tests here as well.
+      - name: Run CoreML unit and integration tests (coreml-runtime,coreml-export)
+        if: runner.os == 'macOS'
+        run: make test-coreml COREML_FEATURES=coreml-runtime,coreml-export
 
       - name: Run CoreML unit and integration tests (with dynamic-inputs)
         if: runner.os == 'macOS'
