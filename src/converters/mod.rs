@@ -15,6 +15,8 @@ use crate::error::GraphError;
 use crate::graph::GraphInfo;
 
 mod coreml_mlprogram;
+/// Explicit native MIL packed-weight scheduling; no host inference.
+pub mod coreml_packed;
 #[cfg(feature = "litert-runtime")]
 pub mod litert;
 pub mod onnx;
@@ -77,6 +79,34 @@ pub struct ConvertedGraph {
 }
 
 impl ConvertedGraph {
+    /// Schedule admitted packed CoreML matrix operands in bounded native tiles.
+    ///
+    /// This preserves external weight bytes and the original contraction width.
+    /// The returned records identify rewritten products; an empty result does
+    /// not imply a memory bound for the graph. See [`coreml_packed`] for admission.
+    pub fn bound_coreml_packed_matmuls(
+        &mut self,
+        max_expanded_bytes: u64,
+    ) -> Result<Vec<coreml_packed::PackedMatmulExpansion>, GraphError> {
+        use prost::Message;
+        let error = |reason: String| GraphError::ConversionFailed {
+            format: self.format.into(),
+            reason,
+        };
+        if self.format != "coreml" {
+            return Err(error(
+                "packed native scheduling requires a CoreML model".into(),
+            ));
+        }
+        let mut model = crate::protos::coreml::specification::Model::decode(self.data.as_slice())
+            .map_err(|e| error(format!("cannot decode CoreML model: {e}")))?;
+        let changes = coreml_packed::bound_packed_matmuls(&mut model, max_expanded_bytes);
+        if !changes.is_empty() {
+            self.data = model.encode_to_vec();
+        }
+        Ok(changes)
+    }
+
     /// Emit a CoreML compiled bundle locally using the Rust exporter.
     ///
     /// The source graph must already have been lowered by this process. This
