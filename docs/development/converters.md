@@ -94,8 +94,8 @@ Rules that hold for every converter:
   `constant_only_feeds_casts`). Refit failures raise `TrtxError::ConstantRefitFailed` with the
   operand and its consumers.
 - The engine cache key hashes the converter sources (`build.rs`, `SOURCE_HASH`), so converter
-  edits invalidate cached engines; changes to builder flags do not. Delete the cache directories
-  when in doubt.
+  edits invalidate cached engines. This source hash does not invalidate the separate TensorRT
+  JIT runtime cache. See the [cache guide](https://rustnn.github.io/rustnn/integration/tensorrt/#caches).
 - The nearest-neighbour rounding of `resample2d` is `round_prefer_floor` (`kHALF_DOWN`).
 - `triangular` builds a Boolean keep mask and selects the input or a typed zero. Multiplying by
   a zero mask would propagate NaN and infinity into positions that WebNN requires to be zero.
@@ -148,9 +148,10 @@ Rules that hold for every converter:
 
 - Spatial operations are NHWC. `is_spatial_op` marks operands whose layout changes; filters are
   transposed to OHWI and boundary tensors are transposed by the backend at run time.
-- Operations without a kernel are rejected in `backends::litert::unsupported_ops`, data types
-  without a kernel in `dtype_unsupported_for_op`. The WPT harness uses the same functions to
-  skip trials.
+- The converter rejects unsupported operation/data-type combinations; the runtime can impose
+  further kernel restrictions. See the shared
+  [LiteRT guide](https://rustnn.github.io/rustnn/integration/litert/) and generated support report
+  rather than assuming the WPT skip list is a complete runtime capability query.
 
 ### CANN
 
@@ -178,6 +179,9 @@ the snapshot diff.
 
 ## Debugging a wrong model
 
+Set `RUST_LOG=rustnn=debug` to include conversion diagnostics in the application's
+configured logger. Conversion failures use error logs and recoverable fallbacks use warnings.
+
 The signature of a converter bug: rustnn's shape inference is right, the emitted model is not,
 and the error surfaces downstream, as a type error at load time or an out-of-bounds axis on the
 next operation. Compare the emitted node with the backend's semantics before touching shape
@@ -185,7 +189,7 @@ inference.
 
 | Backend | Dump | Inspect |
 |---|---|---|
-| ONNX Runtime | `RUSTNN_DEBUG=2 RUSTNN_DEBUG_ONNX_DIR=<dir>` writes every model the backend builds | `python -c "import onnx; print(onnx.load('<file>'))"` or Netron |
+| ONNX Runtime | `RUSTNN_ONNX_DUMP_DIR=<dir>` writes each converted model to `debug_webnn_onnx.onnx` (overwriting the previous dump) | `python -c "import onnx; print(onnx.load('<file>'))"` or Netron |
 | TensorRT-RTX | `TRTX_JSON_DUMP_PATH=<dir>` writes the layer graph of each engine; `RUSTNN_TRTX_LOG_VERBOSITY=verbose` for the builder log | look for the layer that consumes the operand; Myelin-fused layers print as `__myl_...` |
 | CoreML | `--coreml-compiled-output <dir>` in the CLI keeps the `.mlmodelc` | `coremltools` or Xcode |
 | LiteRT | `--convert litert --convert-output model.tflite` | `flatc --json` with `protos/tflite/schema.fbs`, or the TFLite visualizer |

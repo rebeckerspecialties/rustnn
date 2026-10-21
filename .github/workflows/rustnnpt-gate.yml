@@ -40,12 +40,22 @@ jobs:
         working-directory: rustnnpt
         run: npm run test:wpt:fetch
 
+      # wpt-runner must resolve the same webnn-graph as this PR's rustnn, or GraphJson types
+      # no longer match. The runner's dependency line is copied from rustnn. The rustnnpt root
+      # manifest also carries a `[patch.crates-io]` entry that redirected the crates.io
+      # webnn-graph to git main while rustnn used the git branch; with rustnn on a crates.io
+      # version that entry must go, because cargo rejects a patch pointing at its own source.
       - name: Align rustnnpt webnn-graph with this PR
         working-directory: rustnnpt
         run: |
           WEBNN_GRAPH_DEP="$(sed -n '/^webnn-graph = /p' ../rustnn/Cargo.toml)"
           test -n "$WEBNN_GRAPH_DEP"
-          sed -i "s|^webnn-graph = .*|$WEBNN_GRAPH_DEP|" Cargo.toml crates/wpt-runner/Cargo.toml
+          sed -i "s|^webnn-graph = .*|$WEBNN_GRAPH_DEP|" crates/wpt-runner/Cargo.toml
+          case "$WEBNN_GRAPH_DEP" in
+            *git*) sed -i "s|^webnn-graph = .*|$WEBNN_GRAPH_DEP|" Cargo.toml ;;
+            *)     sed -i '/^\[patch\.crates-io\]/,/^webnn-graph = /d' Cargo.toml ;;
+          esac
+          grep -n 'webnn-graph' Cargo.toml crates/wpt-runner/Cargo.toml || true
 
       - name: Pin rustnnpt to this PR rustnn SHA
         working-directory: rustnnpt

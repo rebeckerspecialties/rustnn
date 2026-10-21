@@ -12,7 +12,7 @@
 
 ## [WARNING] EXPERIMENTAL - DO NOT USE IN PRODUCTION
 
-rustnn is a development release (`0.5.x`). APIs change without notice.
+rustnn is a development release (`0.6.0`). APIs change without notice.
 
 ---
 
@@ -40,13 +40,16 @@ ONNX models for parity checks.
 
 ## Quick start
 
-The WebNN API below lives on `main` and is not yet published; the `rustnn` crate on crates.io
-(0.5.x) is the earlier converter and loader crate without `MLContext`. Use the git dependency:
+Version 0.6.0 is the first crates.io release of the WebNN `MLContext` API (the 0.5.x releases
+were the earlier converter and loader crate). Add it with a backend feature:
 
 ```toml
 [dependencies]
-rustnn = { git = "https://github.com/rustnn/rustnn", features = ["onnx-runtime"] }
+rustnn = { version = "0.6", features = ["onnx-runtime"] }
 ```
+
+To follow unreleased changes, depend on the repository instead:
+`rustnn = { git = "https://github.com/rustnn/rustnn", features = ["onnx-runtime"] }`.
 
 ```rust
 use rustnn::mlcontext::{
@@ -155,7 +158,7 @@ ownership rules, package layout, and exact build and run commands.
 | `native-examples` | Compiles the large example programs |
 
 Full list and environment variables: crate docs (`make docs-api`) or
-[Backends](docs/user-guide/backends.md).
+[Backends](https://rustnn.github.io/rustnn/api/rustnn/backend_selection/).
 
 ## Command line
 
@@ -169,7 +172,7 @@ cargo run --features onnx-runtime -- examples/sample_graph.webnn --convert onnx 
 ## Documentation
 
 - [Documentation site](https://rustnn.github.io/rustnn/) with the user guide, architecture and development pages
-- Rust API reference: `make docs-api` writes it to `target/doc/rustnn/index.html`; the site publishes it under [`/api/`](https://rustnn.github.io/rustnn/api/rustnn/) (docs.rs still shows the 0.5.x crate)
+- Rust API reference: `make docs-api` writes it to `target/doc/rustnn/index.html`; the site publishes it under [`/api/`](https://rustnn.github.io/rustnn/api/rustnn/) and docs.rs builds it for each release
 - [Backend Operator Support](docs/development/backend-operator-support.md), generated from the converters
 - [WPT conformance dashboard](https://rustnn.github.io/rustnn/wpt-conformance/)
 - [Changelog](CHANGELOG.md)

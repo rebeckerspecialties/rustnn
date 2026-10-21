@@ -6,27 +6,52 @@ This changelog consolidates the previous `RELEASE_NOTES_*.md` files into a singl
 
 ## [Unreleased]
 
-Changes on `main` since the `v0.5.12` publish branch (2026-05-02).
+### Added
+
+### Changed
+
+### Fixed
+
+## [0.6.0] - 2026-10-14
+
+First release of the WebNN `MLContext` API from `main`. The 0.5.x releases were cut from the
+`v0.5` branch and are the earlier converter and loader crate; everything below is new relative to
+`v0.5.12` (2026-05-04). Downstream bindings (pywebnn, webnnjs) need updates for the breaking
+changes listed under Changed.
 
 ### Added
+- Experimental C and C++ API: a cargo-c library with a generated `rustnn.h` and the header-only `rustnn.hpp` wrapper, documented in `docs/reference/c-api.md` and a Doxygen reference published under `/c-api/` (#233, #264, #271).
+- `MLGraphBuilder::constant_from_value` for scalar constants (#232).
+- `dynamically_load_tensorrt` for custom TensorRT-RTX library paths (#280).
+- CoreML: opt-in tensor storage reuse for KV-cache chaining with `BackendStatistics` counters, retained load diagnostics after a compute-unit fallback, SmolLM shape tensors, exact boundary data type conversions and strided storage; the compiled model is `Send` (#223, #255, #256, #258, #285).
+- LiteRT and CANN operator coverage extended (#210, #237, #242, #250).
+- WPT harness: strict upstream tolerances behind `WPT_STRICT_TOLERANCE`, CoreML device and tensor-mode policies, numeric fidelity of the fixture bridge (signed zeros, exact float literals) and audit mode (#268, #274).
 - WebNN API in Rust: `MLContext`, `MLGraphBuilder`, `MLGraph`, `MLTensor`, `dispatch`, tensor read and write; backend and device hints on `MLContextOptions`; `RustNNOptions` with `TrtxOptions` (#111, #155, #181).
 - Backends behind the unified API: TensorRT-RTX with native network lowering, refittable weights, zstd-compressed engine and runtime caches and CUDA graphs (#128, #162, #182, #189, #192, #193); CoreML (#140); LiteRT (#149, #179, #187, #196); Huawei CANN on OpenHarmony (#198, #203); browser WebNN bindings for wasm32 (#206).
-- In-repo WPT conformance harness with per-backend PASS snapshots, expected-failure lists, JSON and HTML reports, audit mode and a weekly snapshot-sync workflow (#151, #166, #176, #197, #226).
+- In-repo WPT conformance harness with per-backend expected-failure lists, JSON and HTML reports, audit mode and a weekly `wpt-sync` workflow that bumps the pinned WPT revision (#151, #166, #176, #197, #226, #241).
 - `MLGraphBuilder::rustnn_save_webnn`: save a graph as `.webnn` text plus `.safetensors` weights (#184).
 - `int4` and `uint4` data types (#148); shape inference for the normalization operations (#125).
 - Examples: builder-API fast style transfer, ResNet-50, SmolLM on `MLContext` (#124, #162).
 - `TRTX_JSON_DUMP_PATH` engine dumps (#177).
 - `MLOperand::rustnn_index()` and `From<MLOperand> for OperandIndex` to fill operand fields of `ML*Options` such as `MLConv2dOptions::bias`.
 - Rust API docs (rustdoc) built with warnings denied in CI and published under `/api/`; every public item is documented and `#![warn(missing_docs)]` keeps it that way; `docs/development/documentation-policy.md`.
-- Documentation pages: CoreML, LiteRT, CANN and browser WebNN backend pages under `docs/integration/`, `docs/development/converters.md` (converter contract and per-backend lowering rules), `docs/user-guide/troubleshooting.md`, `docs/reference/graph-files.md` (`.webnn`, JSON and weight formats) and a specification-to-API mapping in `docs/reference/webnn-spec.md`; the Make target table in `docs/development/setup.md` is complete.
+- Documentation pages: CoreML, LiteRT, CANN and browser WebNN backend pages under `docs/integration/`, `docs/development/converters.md` (converter contract and per-backend lowering rules), `docs/user-guide/troubleshooting.md`, `docs/reference/graph-files.md` (`.webnn`, JSON and weight formats, shared with the loader rustdoc); the Make target table in `docs/development/setup.md` is complete. Guides that duplicated rustdoc were consolidated into the API reference (#243, #287).
 - Span instrumentation for a [`tracing`](https://docs.rs/tracing) subscriber, covering the crate's
   common paths; the CLI prints spans and `log` records for `RUST_LOG`.
 
 ### Changed
+- **Breaking:** `MLConv2dOptions::input_layout`, `filter_layout` and the other layout fields use the `MLInputOperandLayout`, `MLConv2dFilterOperandLayout` and `MLConvTranspose2dFilterOperandLayout` enums instead of strings (#260).
+- **Breaking:** the legacy constant operations are removed from the public graph API; constants are operands with data (#266).
+- **Breaking:** the old TensorRT executor and `test_trtx_execution` are removed; TensorRT-RTX runs through `MLContext` (#185, #245).
+- **Breaking:** the crate no longer declares `cdylib` and `staticlib` crate types; the C ABI is built with cargo-c (#246).
+- Shape inference is unified so graphs reloaded from `.webnn` files are executable without re-inference (#238).
+- WPT results are tracked through expected-failure lists only; the PASS snapshots and the LiteRT dtype and unsupported-operation gates are gone (#239, #241).
+- TensorRT-RTX: the runtime cache is no longer invalidated by rustnn source changes; `triangular` uses `select` so NaN and infinity do not leak into masked positions (#248, #254).
 - The selected backend is reported as a span event instead of a `log` line, and messages the spans
   already carry as fields moved from `debug` to `trace`.
 - **Breaking:** `MLContext::dispatch`, `MLGraphBuilder::build` and `rustnn_save_webnn` take `MLNamedTensors` and `MLNamedOperands` (`BTreeMap`) instead of `HashMap` (#202).
-- `MLGraphBuilder::conv2_with_options` renamed to `conv2d_with_options`; the old name stays as a deprecated alias. `MLTensor::destoy` renamed to `destroy`.
+- `webnn-graph` 0.4 and `webnn-onnx-utils` 0.1.1 are taken from crates.io instead of git branches, which is what allows this crate to be published.
+- **Breaking:** `MLGraphBuilder::conv2_with_options` renamed to `conv2d_with_options` (the deprecated alias was removed in #264); `MLTensor::destoy` renamed to `destroy`.
 - Errors are `Send + Sync` (#170); backend traits require `Send + Sync` (#145, #147).
 - Dispatch validates tensor bindings: shapes and data types (#126, #132) and duplicate tensors (#220).
 - Toolchain 1.97 (#211); `ort` 2.0.0-rc.13 (#208); `trtx` 0.8 for TensorRT-RTX 1.6 (#200); `thiserror` 2 (#190).
@@ -34,6 +59,10 @@ Changes on `main` since the `v0.5.12` publish branch (2026-05-02).
 - Documentation rewritten for the Rust API; superseded plans moved to `docs/archive/`; Python-era files removed (`MANIFEST.in`, `pytest.ini`, the old `TODO.txt`); the built MkDocs site is no longer tracked.
 
 ### Fixed
+- CoreML: gather bounds for active dimensions, triangular masking and diagonal handling (#228, #235).
+- LiteRT: dispatch buffer order, prebuilt library path resolution from `litert-sys`, converter checked on macOS (#244, #282, #283).
+- ONNX: exact output sizes for `resample2d` (#259).
+- Documentation site: the WPT conformance dashboard no longer goes stale between nightly runs, the pass-rate badge is back in the README, and the Pages deploy is skipped on forks without Pages (#263, #265, #286).
 - TensorRT: CUDA graph replay, write synchronization, negative scatter indices, cache write races and many operator lowerings (#167, #168, #169, #182, #194, #231).
 - ONNX Runtime: bool and uint8 handling (#180); bidirectional LSTM and GRU, an fp16 cast that broke optimized ONNX Runtime builds, `Squeeze` axes (#219).
 - `cargo test` passes again: prost-build's `cleanup-markdown` feature turns the code blocks in the CoreML `.proto` comments into text fences instead of failing doctests, and the WPT harness exits successfully instead of failing when no backend feature is compiled in.

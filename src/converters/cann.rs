@@ -491,7 +491,7 @@ mod adapter {
         Ok(const_op)
     }
 
-    // `RUSTNN_DEBUG=2`: log every op's input/output shapes (model structure).
+    // Log every op's input/output shapes (model structure) at debug level.
     fn dump_op_shapes(graph: &GraphInfo) {
         for (i, op) in graph.operations.iter().enumerate() {
             let fmt = |ids: &[u32]| -> String {
@@ -1165,10 +1165,7 @@ mod adapter {
 
         super::check_encodable(graph)?;
 
-        if std::env::var("RUSTNN_DEBUG")
-            .map(|v| v == "2")
-            .unwrap_or(false)
-        {
+        if log::log_enabled!(log::Level::Debug) {
             dump_op_shapes(graph);
         }
 
@@ -3273,7 +3270,7 @@ mod adapter {
             } = op
             {
                 if let Some(o) = options.as_ref() {
-                    let mode_ok = o.mode.is_empty() || o.mode.eq_ignore_ascii_case("constant");
+                    let mode_ok = o.mode == crate::operator_enums::MLPaddingMode::Constant;
                     let value_ok = match o.value.as_ref() {
                         None | Some(serde_json::Value::Null) => true,
                         Some(v) => {

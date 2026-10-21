@@ -650,15 +650,6 @@ dependencies = [
 
 [[package]]
 name = "cudarc"
-version = "0.11.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a5bd4d1eee570c3b2ac64ed114125517dd1e541d88dd28fc259f1de4dba8d60"
-dependencies = [
- "libloading 0.8.9",
-]
-
-[[package]]
-name = "cudarc"
 version = "0.19.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "804764d10e844da09765a7b2ca9641a0851523d1702efb0d7299d73e31b86e80"
@@ -2977,7 +2968,7 @@ dependencies = [
 
 [[package]]
 name = "rustnn"
-version = "0.5.11"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -2986,7 +2977,7 @@ dependencies = [
  "bytes",
  "cc",
  "clap",
- "cudarc 0.19.9",
+ "cudarc",
  "dirs 7.0.0",
  "flatbuffers",
  "futures-util",
@@ -3014,6 +3005,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_with",
+ "strum",
  "tempfile",
  "thiserror 2.0.21",
  "tokenizers",
@@ -3348,6 +3340,27 @@ name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
+
+[[package]]
+name = "strum"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9628de9b8791db39ceda2b119bbe13134770b56c138ec1d3af810d045c04f9bd"
+dependencies = [
+ "strum_macros",
+]
+
+[[package]]
+name = "strum_macros"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab85eea0270ee17587ed4156089e10b9e6880ee688791d45a905f5b1ca36f664"
+dependencies = [
+ "heck",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "subtle"
@@ -3702,14 +3715,12 @@ dependencies = [
 
 [[package]]
 name = "trtx"
-version = "0.8.1+rtx1.6"
+version = "0.9.1+rtx1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75ecf9d27c8ba1246dbbec0b06922f7d06e7bc7617e11283d87c69a5805352ef"
+checksum = "345f47d356314a6de8d5b9f7c4b37ac2d1a72a460a93344c56778a73c9b52eaf"
 dependencies = [
  "autocxx",
- "cudarc 0.11.9",
  "cxx",
- "libc",
  "libloading 0.9.0",
  "log",
  "thiserror 2.0.21",
@@ -3718,9 +3729,9 @@ dependencies = [
 
 [[package]]
 name = "trtx-sys"
-version = "0.8.1+rtx1.6"
+version = "0.9.1+rtx1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce855124c15c6b89050129b779ced096ed451fb99b00adab81a1d7dfab765aa3"
+checksum = "5480ee056292951daa1bc74532162d6cb75190f091e45d7d97c0c356916ae171"
 dependencies = [
  "autocxx",
  "autocxx-build",
@@ -4043,8 +4054,9 @@ dependencies = [
 
 [[package]]
 name = "webnn-graph"
-version = "0.3.0"
-source = "git+https://github.com/rustnn/webnn-graph?branch=main#0bcd517d30cf740f55bf19386be254e37010ab2b"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b3045dd969f9cdc251c7ff43a0b465008a657eeeadac3ff4cf0bf8932370e53c"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4063,7 +4075,8 @@ dependencies = [
 [[package]]
 name = "webnn-onnx-utils"
 version = "0.1.1"
-source = "git+https://github.com/rustnn/webnn-onnx-utils?branch=main#cead2ef3a35dded186617d0256614e2d5df463f7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e27dc3ae7bb6b6db1002fe4c50f5fd105f248aa3e35e0c2cff1db6e7cd6b8b6"
 dependencies = [
  "half",
  "once_cell",
