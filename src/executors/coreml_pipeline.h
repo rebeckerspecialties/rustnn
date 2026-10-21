@@ -107,6 +107,8 @@ static RustNNPipeline *rustnn_load_pipeline(NSURL *url, MLModelConfiguration *co
                 if (!desc) { failure=rustnn_pipeline_error(@"Child input description differs"); break; }
                 if (!slotDescriptions[binding[@"slot"]]) slotDescriptions[binding[@"slot"]]=desc;
             }
+            // Report the first mismatch; the output check must not replace it.
+            if (failure) break;
             for (NSDictionary *binding in child[@"outputs"]) {
                 MLFeatureDescription *desc=model.modelDescription.outputDescriptionsByName[binding[@"name"]];
                 if (!desc) { failure=rustnn_pipeline_error(@"Child output description differs"); break; }
@@ -120,15 +122,22 @@ static RustNNPipeline *rustnn_load_pipeline(NSURL *url, MLModelConfiguration *co
         ++childIndex;
     }
     if (failure) { if (error) *error=failure; return nil; }
+    // Descriptions come from the children. A pipeline input that no child
+    // consumes has none, yet may be returned unchanged as a pipeline output;
+    // callers then bind that feature with its WebNN operand type.
+    NSMutableSet *inputSlots = [NSMutableSet set];
     for (NSDictionary *binding in plan[@"inputs"]) {
+        [inputSlots addObject:binding[@"slot"]];
         id desc=slotDescriptions[binding[@"slot"]];
         if (desc) inputDescriptions[binding[@"name"]]=desc;
     }
     NSMutableDictionary *outputDescriptions = [NSMutableDictionary dictionary];
     for (NSDictionary *binding in plan[@"outputs"]) {
         id desc=slotDescriptions[binding[@"slot"]];
-        if (!desc) { if (error) *error=rustnn_pipeline_error(@"No native description for pipeline output"); return nil; }
-        outputDescriptions[binding[@"name"]]=desc;
+        if (desc) outputDescriptions[binding[@"name"]]=desc;
+        else if (![inputSlots containsObject:binding[@"slot"]]) {
+            if (error) *error=rustnn_pipeline_error(@"No native description for pipeline output"); return nil;
+        }
     }
     pipeline.modelDescription=[[RustNNPipelineDescription alloc] init];
     pipeline.modelDescription.inputDescriptionsByName=inputDescriptions;

@@ -399,4 +399,118 @@ mod native_tests {
             }
         }
     }
+    /// Load `plan` against an exported bundle directory through the native
+    /// shim, returning the shim's error message when loading fails.
+    fn load_plan(directory: &std::path::Path, plan: &[u8]) -> Result<(), String> {
+        objc::rc::autoreleasepool(|| unsafe {
+            use objc::runtime::Object;
+            use objc::{class, msg_send, sel, sel_impl};
+            let url = super::super::nsurl_from_path(directory).unwrap();
+            let config: *mut Object = msg_send![class!(MLModelConfiguration), new];
+            let _config = super::super::ReleaseOnDrop(config);
+            let mut output = std::ptr::null_mut();
+            let mut error = [0u8; 1024];
+            let status = super::super::rustnn_coreml_load_pipeline(
+                url,
+                config,
+                plan.as_ptr(),
+                plan.len(),
+                None,
+                std::ptr::null_mut(),
+                &mut output,
+                error.as_mut_ptr().cast(),
+                error.len(),
+            );
+            if status == 0 && !output.is_null() {
+                drop(super::super::ReleaseOnDrop(output));
+                return Ok(());
+            }
+            assert!(output.is_null());
+            Err(super::super::shim_error_to_string(&error))
+        })
+    }
+    #[test]
+    fn child_description_mismatch_reports_the_first_error() {
+        // Neither binding of the child exists in its native description. The
+        // input mismatch is found first; describing the same child's outputs
+        // afterwards must not replace that error with the output mismatch.
+        let directory = tempfile::tempdir().unwrap();
+        mlmodelc_export::compile_to_dir(
+            &child("x", "y").encode_to_vec(),
+            None,
+            directory.path().join("model0"),
+        )
+        .unwrap();
+        let plan = br#"{"slots":2,"inputs":[{"name":"x","slot":0}],"outputs":[{"name":"y","slot":1}],"children":[{"path":"model0","inputs":[{"name":"absent_input","slot":0}],"outputs":[{"name":"absent_output","slot":1}],"release":[0]}]}"#;
+        let message = load_plan(directory.path(), plan).unwrap_err();
+        assert!(
+            message.contains("Child input description differs"),
+            "{message}"
+        );
+    }
+    #[test]
+    fn unconsumed_pipeline_input_passes_through_to_an_output() {
+        // No child consumes `carried`, so no child description covers it.
+        // Returning it unchanged as a pipeline output must still load and run.
+        let only = child("x", "y");
+        let mut description = only.description.clone().unwrap();
+        let mut carried = description.input[0].clone();
+        carried.name = "carried".into();
+        description.input.push(carried.clone());
+        description.output.push(carried);
+        let model = Model {
+            specification_version: 9,
+            description: Some(description),
+            r#type: Some(model::Type::Pipeline(Pipeline {
+                models: vec![only],
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let plan = from_model(&model).unwrap().unwrap();
+        assert_eq!(plan.outputs[1].slot, plan.inputs[1].slot);
+        let mut trace = super::super::load::LoadTrace::strict(CoremlComputeUnits::CpuOnly);
+        let native = super::super::compile_model_from_url_observed(
+            model.encode_to_vec(),
+            None::<Vec<u8>>,
+            &mut trace,
+            None,
+        )
+        .unwrap();
+        let desc = crate::graph::OperandDescriptor {
+            data_type: crate::graph::DataType::Float32,
+            shape: vec![crate::graph::Dimension::Static(4)],
+            pending_permutation: vec![],
+        };
+        let bytes = |values: [f32; 4]| {
+            values
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>()
+        };
+        let (x, carried) = (bytes([1.0, 2.0, 3.0, 4.0]), bytes([5.0, 6.0, 7.0, 8.0]));
+        let actual = run_coreml_bytes(
+            &native,
+            &HashMap::from([
+                (
+                    "x".into(),
+                    CoremlByteInput {
+                        data: &x,
+                        descriptor: &desc,
+                    },
+                ),
+                (
+                    "carried".into(),
+                    CoremlByteInput {
+                        data: &carried,
+                        descriptor: &desc,
+                    },
+                ),
+            ]),
+            &HashMap::from([("y".into(), desc.clone()), ("carried".into(), desc.clone())]),
+        )
+        .unwrap();
+        assert_eq!(actual["y"], bytes([2.0, 4.0, 6.0, 8.0]));
+        assert_eq!(actual["carried"], carried);
+    }
 }
