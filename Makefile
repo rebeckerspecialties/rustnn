@@ -28,6 +28,8 @@ TRT_DIR ?= target/tensorrt-rtx
 TRT_SDK_DIR ?= $(TRT_DIR)/TensorRT-RTX-$(TRT_VERSION)
 CHROMEDRIVER_CACHE ?= $(CURDIR)/.cache/chromedriver
 CHROMEDRIVER ?= $(CHROMEDRIVER_CACHE)/chromedriver
+# Seconds wasm-bindgen-test waits for the browser WPT run; the suite builds every case in one test.
+WEBNN_WPT_TIMEOUT ?= 600
 
 # Platform detection
 UNAME_S := $(shell uname)
@@ -173,10 +175,10 @@ webnn-chromedriver:
 
 # Requires wasm-pack, Node.js, curl, and unzip. webdriver.json enables Chrome's WebNN feature.
 test-webnn-wpt-chrome: require-wpt-cache webnn-chromedriver
-	@env -u CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER WASM_BINDGEN_TEST_ADDRESS=127.0.0.1:0 RUSTFLAGS='-C target-feature=+reference-types --cfg=web_sys_unstable_apis' wasm-pack test --chrome --chromedriver "$(CHROMEDRIVER)" -- --test webnn_wpt -F webnn-runtime,webnn-wpt-tests -- --nocapture
+	@env -u CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER WASM_BINDGEN_TEST_ADDRESS=127.0.0.1:0 WASM_BINDGEN_TEST_TIMEOUT=$(WEBNN_WPT_TIMEOUT) RUSTFLAGS='-C target-feature=+reference-types --cfg=web_sys_unstable_apis' wasm-pack test --chrome --chromedriver "$(CHROMEDRIVER)" -- --test webnn_wpt -F webnn-runtime,webnn-wpt-tests -- --nocapture
 
 test-webnn-wpt-chrome-headless: require-wpt-cache webnn-chromedriver
-	@env -u CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER RUSTFLAGS='-C target-feature=+reference-types --cfg=web_sys_unstable_apis' wasm-pack test --headless --chrome --chromedriver "$(CHROMEDRIVER)" -- --test webnn_wpt -F webnn-runtime,webnn-wpt-tests -- --nocapture
+	@env -u CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER WASM_BINDGEN_TEST_TIMEOUT=$(WEBNN_WPT_TIMEOUT) RUSTFLAGS='-C target-feature=+reference-types --cfg=web_sys_unstable_apis' wasm-pack test --headless --chrome --chromedriver "$(CHROMEDRIVER)" -- --test webnn_wpt -F webnn-runtime,webnn-wpt-tests -- --nocapture
 
 # WPT conformance (requires Node.js, WPT cache; set WPT_BACKEND=onnx|trtx to pick backend)
 test-wpt: onnxruntime-download
@@ -196,7 +198,7 @@ test-wpt-coreml:
 
 .PHONY: test-wpt-tolerance test-wpt-tolerance-parity
 test-wpt-tolerance:
-	$(CARGO) test --test test_wpt_tolerance
+	$(CARGO) test --test test_wpt_tolerance --test test_wpt_report
 
 test-wpt-tolerance-parity: require-wpt-cache
 	$(CARGO) test --test test_wpt_tolerance strict_comparator_matches_upstream_javascript -- --ignored
@@ -286,6 +288,10 @@ fmt-check:
 
 lint:
 	$(CARGO) clippy --all-targets -- -D warnings
+
+.PHONY: test-quantization-validation
+test-quantization-validation:
+	$(CARGO) test --test test_quantization_validation
 
 # ==============================================================================
 # Code Coverage Targets
