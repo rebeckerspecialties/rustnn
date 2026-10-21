@@ -998,11 +998,51 @@ fn apply_storage(
                 .map(|v| v.name.clone())
                 .chain(producers.keys().map(|&n| n.into()))
                 .collect::<BTreeSet<_>>();
+            // Float16 closures rewritten under their own name, so a gather and every matmul
+            // that read the same table share one blockwise constant.
+            let mut rewritten = BTreeMap::<String, V>::new();
             for op in &old {
                 for v in &op.outputs {
                     if let Some(v) = variable(v) {
                         vars.insert(v.name.clone(), v);
                     }
+                }
+                let closure = (|| {
+                    if op.r#type != "reshape" || op.outputs.len() != 1 {
+                        return None;
+                    }
+                    let packed = recognize_in(
+                        &op.outputs[0].name,
+                        &producers,
+                        weights,
+                        m::DataType::Float16,
+                    )?;
+                    let data_dtype = variable(
+                        producers
+                            .get(packed.source_name.as_str())?
+                            .outputs
+                            .first()?,
+                    )?
+                    .dtype;
+                    Some((packed, data_dtype))
+                })();
+                if let Some((packed, data_dtype)) = closure {
+                    let mut e = Emit {
+                        next: names.len(),
+                        ops: vec![],
+                        names: &mut names,
+                    };
+                    let w = e.blockwise_constexpr(&packed, data_dtype, weights);
+                    e.ops.push(m::Operation {
+                        r#type: "identity".into(),
+                        inputs: [("x".into(), reference(&w.name))].into(),
+                        outputs: op.outputs.clone(),
+                        ..Default::default()
+                    });
+                    block.operations.extend(e.ops);
+                    rewritten.insert(op.outputs[0].name.clone(), w);
+                    count += 1;
+                    continue;
                 }
                 let candidate = (|| {
                     if op.r#type != "matmul"
@@ -1071,31 +1111,44 @@ fn apply_storage(
                     {
                         return None;
                     }
-                    let packed = recognize_in(
-                        named_arg(y, "x")?,
-                        &producers,
-                        weights,
-                        m::DataType::Float16,
-                    )?;
-                    if x.shape.last() != Some(&packed.k) || shape(y)? != [packed.k, packed.n] {
+                    let chain = named_arg(y, "x")?;
+                    let shared = rewritten.get(chain).cloned();
+                    let packed = match &shared {
+                        Some(_) => None,
+                        None => Some(recognize_in(
+                            chain,
+                            &producers,
+                            weights,
+                            m::DataType::Float16,
+                        )?),
+                    };
+                    let (n, k) = match (&shared, &packed) {
+                        (Some(w), _) => (w.shape[0], w.shape[1]),
+                        (None, Some(p)) => (p.n, p.k),
+                        _ => return None,
+                    };
+                    if x.shape.last() != Some(&k) || shape(y)? != [k, n] {
                         return None;
                     }
-                    let data_dtype = variable(
-                        producers
-                            .get(packed.source_name.as_str())?
-                            .outputs
-                            .first()?,
-                    )?
-                    .dtype;
-                    Some((x.clone(), packed, data_dtype))
+                    let data_dtype = match &packed {
+                        Some(p) => {
+                            variable(producers.get(p.source_name.as_str())?.outputs.first()?)?.dtype
+                        }
+                        None => m::DataType::Float16,
+                    };
+                    Some((x.clone(), shared, packed, data_dtype))
                 })();
-                if let Some((x, packed, data_dtype)) = half_candidate {
+                if let Some((x, shared, packed, data_dtype)) = half_candidate {
                     let mut e = Emit {
                         next: names.len(),
                         ops: vec![],
                         names: &mut names,
                     };
-                    let w = e.blockwise_constexpr(&packed, data_dtype, weights);
+                    let w = match (shared, packed) {
+                        (Some(w), _) => w,
+                        (None, Some(p)) => e.blockwise_constexpr(&p, data_dtype, weights),
+                        _ => unreachable!(),
+                    };
                     let out = variable(&op.outputs[0]).unwrap();
                     let no = e.bool(false);
                     let yes = e.bool(true);
@@ -1589,13 +1642,22 @@ mod tests {
             )
             .unwrap();
         let y = b.matmul(x, transposed).unwrap();
+        // A second reader of the same table (a language model's embedding gather reads the
+        // head's matrix) and a second matmul: one blockwise constant must serve all of them.
+        let twice = b.add(x, x).unwrap();
+        let y2 = b.matmul(twice, transposed).unwrap();
+        let table = b.identity(weight).unwrap();
         let g = b
-            .finish_graph_info(&MLNamedOperands::from([("y", y)]))
+            .finish_graph_info(&MLNamedOperands::from([
+                ("y", y),
+                ("y2", y2),
+                ("table", table),
+            ]))
             .unwrap();
         let converted = CoremlMlProgramConverter.convert(&g).unwrap();
         let mut weights = converted.weights_data.unwrap();
         let mut model = Model::decode(converted.data.as_slice()).unwrap();
-        assert_eq!(apply(&mut model, &mut weights, false), 1);
+        assert_eq!(apply(&mut model, &mut weights, false), 3);
         let Some(model::Type::MlProgram(p)) = &model.r#type else {
             panic!()
         };
@@ -1607,11 +1669,13 @@ mod tests {
             .iter()
             .flat_map(|o| o.outputs.iter().map(move |v| (v.name.as_str(), o)))
             .collect::<BTreeMap<_, _>>();
-        let leaf = block
+        let leaves = block
             .operations
             .iter()
-            .find(|o| o.r#type == "constexpr_blockwise_shift_scale")
-            .expect("one blockwise constant");
+            .filter(|o| o.r#type == "constexpr_blockwise_shift_scale")
+            .collect::<Vec<_>>();
+        assert_eq!(leaves.len(), 1, "one constant shared by every reader");
+        let leaf = leaves[0];
         let out = variable(&leaf.outputs[0]).unwrap();
         assert_eq!(
             (out.dtype, out.shape.clone()),
@@ -1645,18 +1709,27 @@ mod tests {
             raw(&offset_leaf.attributes["val"], &weights).unwrap(),
             vec![128u8; (n * 2) as usize]
         );
-        let product = block
+        let products = block
             .operations
             .iter()
-            .find(|o| o.r#type == "matmul")
-            .expect("one float16 matmul");
-        assert_eq!(named_arg(product, "y"), Some(leaf.outputs[0].name.as_str()));
-        assert!(
-            matches!(parameter(product, "transpose_y", &producers), Some(m::tensor_value::Value::Bools(v)) if v.values == [true])
-        );
+            .filter(|o| o.r#type == "matmul")
+            .collect::<Vec<_>>();
+        assert_eq!(products.len(), 2);
+        for product in &products {
+            assert_eq!(named_arg(product, "y"), Some(leaf.outputs[0].name.as_str()));
+            assert!(
+                matches!(parameter(product, "transpose_y", &producers), Some(m::tensor_value::Value::Bools(v)) if v.values == [true])
+            );
+            assert_eq!(
+                variable(&product.outputs[0]).unwrap().dtype,
+                m::DataType::Float16
+            );
+        }
+        let table_identity = producers["table"];
+        assert_eq!(table_identity.r#type, "identity");
         assert_eq!(
-            variable(&product.outputs[0]).unwrap().dtype,
-            m::DataType::Float16
+            named_arg(table_identity, "x"),
+            Some(leaf.outputs[0].name.as_str())
         );
         assert!(
             !block.operations.iter().any(|o| o.r#type == "cast"
