@@ -5465,7 +5465,7 @@ impl CoremlMlProgramConverter {
     }
 
     /// Create a FeatureType for model description from an OperandDescriptor
-    fn create_feature_type(
+    pub(super) fn create_feature_type(
         descriptor: &crate::graph::OperandDescriptor,
     ) -> Result<crate::protos::coreml::specification::FeatureType, GraphError> {
         use crate::protos::coreml::specification::{ArrayFeatureType, FeatureType, feature_type};
@@ -5559,6 +5559,98 @@ impl super::GraphConverter for CoremlMlProgramConverter {
     }
 }
 impl CoremlMlProgramConverter {
+    /// Parse a local source bundle and consume large external constants directly
+    /// into private compiler storage, retaining at most one source payload at a
+    /// time. Small parameters remain available to ordinary converter validation.
+    pub fn convert_source_file_backed(
+        &self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<(Vec<u8>, super::CoremlWeightStorage), GraphError> {
+        use webnn_graph::external_weights::{
+            WeightResolveError, resolve_external_weights_with_consumer,
+        };
+        let path = path.as_ref();
+        let mut source = crate::loader::parse_graph_source(path)?;
+        let mut graph = crate::webnn_json::from_graph_json_owned(source.clone())?;
+        let names = graph
+            .operands
+            .iter()
+            .enumerate()
+            .filter_map(|(id, o)| {
+                if o.kind != crate::graph::OperandKind::Constant {
+                    return None;
+                }
+                Some((o.name.clone()?, id as u32))
+            })
+            .collect::<HashMap<_, _>>();
+        // Quantization parameters can need consumer-specific dtype coercion.
+        // Retain those payloads even if a source supplied an unusually large one.
+        let parameters = graph
+            .operations
+            .iter()
+            .filter(|op| {
+                op.op_type().eq_ignore_ascii_case("quantizeLinear")
+                    || op.op_type().eq_ignore_ascii_case("dequantizeLinear")
+            })
+            .flat_map(|op| op.input_operands().into_iter().skip(1))
+            .collect::<std::collections::HashSet<_>>();
+        let mut builder = super::WeightFileBuilder::file_backed()?;
+        resolve_external_weights_with_consumer(
+            &mut source,
+            path,
+            None,
+            None,
+            &mut |name, _, bytes| {
+                let fail = |message: String| WeightResolveError::Manifest(message);
+                let &id = names
+                    .get(name)
+                    .ok_or_else(|| fail(format!("missing source constant {name}")))?;
+                let descriptor = &graph.operands[id as usize].descriptor;
+                let dtype = match descriptor.data_type {
+                    DataType::Float16 => Some(super::weight_file_builder::blob_data_type::FLOAT16),
+                    DataType::Float32 => Some(super::weight_file_builder::blob_data_type::FLOAT32),
+                    DataType::Int8 => Some(super::weight_file_builder::blob_data_type::INT8),
+                    DataType::Uint8 => Some(super::weight_file_builder::blob_data_type::UINT8),
+                    _ => None,
+                };
+                if bytes.len() > 4096
+                    && !descriptor.shape.is_empty()
+                    && !parameters.contains(&id)
+                    && let Some(dtype) = dtype
+                {
+                    let width = match descriptor.data_type {
+                        DataType::Float32 => 4,
+                        DataType::Float16 => 2,
+                        _ => 1,
+                    };
+                    let expected = descriptor.static_shape().and_then(|s| {
+                        s.iter()
+                            .try_fold(width, |n: usize, &d| n.checked_mul(d as usize))
+                    });
+                    if expected != Some(bytes.len()) {
+                        return Err(fail(format!(
+                            "constant {name} byte extent does not match its descriptor"
+                        )));
+                    }
+                    builder
+                        .add_weight(id, dtype, &bytes)
+                        .map_err(|e| fail(e.to_string()))?;
+                } else {
+                    graph
+                        .constant_operand_ids_to_handles
+                        .get_mut(&id)
+                        .ok_or_else(|| fail(format!("missing constant storage {name}")))?
+                        .data = bytes;
+                }
+                Ok(Vec::new())
+            },
+        )
+        .map_err(crate::loader::map_weight_resolve_error)?;
+        drop(source);
+        let (data, weights) =
+            self.convert_graph_storage(std::borrow::Cow::Owned(graph), builder)?;
+        Ok((data, weights.finalize_storage()))
+    }
     /// Consume a graph while exporting constants, releasing each source buffer
     /// once its external blob has been written. The borrowed converter remains
     /// available when the caller needs to retain the source graph.
@@ -13001,5 +13093,70 @@ mod tests {
             builder.finalize_storage().as_ref(),
             expected.weights_data.unwrap().as_slice()
         );
+    }
+
+    #[test]
+    fn streamed_source_preserves_archive_and_manifest_payloads() {
+        // Streaming each external constant into file-backed storage must give
+        // the same model and blob as resolving the whole source first, for
+        // both a safetensors archive and a manifest with a raw weights file.
+        let words =
+            (0..1025).map(|i| [0u32, 0x80000000, 1, 0x007fffff, 0x7fc01234, 0x3f800001][i % 6]);
+        let bytes = words.flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+        let graph = serde_json::json!({"format":"webnn-graph-json","version":2,"inputs":{"x":{"dataType":"float32","shape":[1025]}},"consts":{"w":{"dataType":"float32","shape":[1025],"init":{"kind":"weights","ref":"w"}}},"nodes":[{"id":"sum","op":"add","inputs":["x","w"],"outputs":["y"],"options":{}}],"outputs":{"y":"y"}});
+        for archive in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("graph.json");
+            std::fs::write(&path, serde_json::to_vec(&graph).unwrap()).unwrap();
+            let payload = if archive {
+                let view = safetensors::tensor::TensorView::new(
+                    safetensors::Dtype::F32,
+                    vec![1025],
+                    &bytes,
+                )
+                .unwrap();
+                let encoded = safetensors::serialize([("w", view)], None).unwrap();
+                let path = root.path().join("graph.safetensors");
+                std::fs::write(&path, &encoded).unwrap();
+                (path, encoded)
+            } else {
+                let manifest =
+                    serde_json::json!({"tensors":{"w":{"byteOffset":64,"byteLength":bytes.len()}}});
+                std::fs::write(
+                    root.path().join("graph.manifest.json"),
+                    serde_json::to_vec(&manifest).unwrap(),
+                )
+                .unwrap();
+                let mut encoded = vec![0; 64];
+                encoded.extend_from_slice(&bytes);
+                let path = root.path().join("graph.weights");
+                std::fs::write(&path, &encoded).unwrap();
+                (path, encoded)
+            };
+            let original = CoremlMlProgramConverter
+                .convert(&crate::load_graph_from_path(&path).unwrap())
+                .unwrap();
+            let (model, weights) = CoremlMlProgramConverter
+                .convert_source_file_backed(&path)
+                .unwrap();
+            assert_eq!(
+                Model::decode(model.as_slice()).unwrap(),
+                Model::decode(original.data.as_slice()).unwrap()
+            );
+            assert_eq!(weights.as_ref(), original.weights_data.unwrap());
+            // The source files themselves are never modified.
+            assert_eq!(std::fs::read(&payload.0).unwrap(), payload.1);
+            // A truncated payload fails conversion before any model is loaded.
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&payload.0)
+                .unwrap();
+            file.set_len(64).unwrap();
+            assert!(
+                CoremlMlProgramConverter
+                    .convert_source_file_backed(&path)
+                    .is_err()
+            );
+        }
     }
 }

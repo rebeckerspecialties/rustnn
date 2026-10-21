@@ -178,3 +178,15 @@ this scheduling only on watchOS; other platforms return a graph-build error.
 Changed functions require CoreML8 (`slice_update`); the logical tile cap does not
 bound physical memory or qualify arithmetic. The direct utility supports host
 qualification of generated graphs. No source numerical profile is enabled here.
+
+### File-backed source weights
+
+`CoremlMlProgramConverter::convert_source_file_backed` parses a local WebNN source
+bundle and consumes its large external constants one payload at a time into
+`CoremlWeightStorage` scratch, instead of first resolving every weight into the
+graph as `load_graph_from_path` does. Small and scalar constants, quantization
+parameters and types the blob format cannot hold stay in the graph for ordinary
+converter validation; the source files are not modified. The consuming resolver
+comes from a Git-pinned `webnn-graph` revision, and `load_graph_from_path` keeps
+its contract. Peak setup memory still includes one source tensor and the native
+compiler workspace.
