@@ -11353,7 +11353,6 @@ mod tests {
                 OperatorOptions::default(),
             )],
             constant_operand_ids_to_handles: HashMap::new(),
-            id_to_constant_tensor_operand_map: HashMap::new(),
             quantized: false,
         }
     }
@@ -11524,7 +11523,6 @@ mod tests {
                 .expect("resample2d options"),
             )],
             constant_operand_ids_to_handles: HashMap::new(),
-            id_to_constant_tensor_operand_map: HashMap::new(),
             quantized: false,
         };
 
@@ -11591,7 +11589,6 @@ mod tests {
                     .expect("reduceLogSumExp options"),
             )],
             constant_operand_ids_to_handles: HashMap::new(),
-            id_to_constant_tensor_operand_map: HashMap::new(),
             quantized: false,
         }
     }
@@ -11664,7 +11661,6 @@ mod tests {
                 .expect("conv2d options"),
             )],
             constant_operand_ids_to_handles: HashMap::new(),
-            id_to_constant_tensor_operand_map: HashMap::new(),
             quantized: false,
         };
 
@@ -11724,7 +11720,6 @@ mod tests {
             operands: vec![],
             operations: vec![],
             constant_operand_ids_to_handles: HashMap::new(),
-            id_to_constant_tensor_operand_map: HashMap::new(),
             quantized: false,
         };
 
@@ -11908,7 +11903,6 @@ mod tests {
             operands: vec![],
             operations: vec![],
             constant_operand_ids_to_handles: HashMap::new(),
-            id_to_constant_tensor_operand_map: HashMap::new(),
             quantized: false,
         };
 
@@ -12021,7 +12015,6 @@ mod tests {
             operands: vec![],
             operations: vec![],
             constant_operand_ids_to_handles: HashMap::new(),
-            id_to_constant_tensor_operand_map: HashMap::new(),
             quantized: false,
         };
 
@@ -12085,7 +12078,6 @@ mod tests {
             operands: vec![],
             operations: vec![],
             constant_operand_ids_to_handles: HashMap::new(),
-            id_to_constant_tensor_operand_map: HashMap::new(),
             quantized: true,
         };
 
@@ -12134,7 +12126,6 @@ mod tests {
             operands: vec![],
             operations: vec![],
             constant_operand_ids_to_handles: HashMap::new(),
-            id_to_constant_tensor_operand_map: HashMap::new(),
             quantized: true,
         };
 
@@ -12187,7 +12178,6 @@ mod tests {
             operands: vec![],
             operations: vec![],
             constant_operand_ids_to_handles: HashMap::new(),
-            id_to_constant_tensor_operand_map: HashMap::new(),
             quantized: true,
         };
 
@@ -12240,7 +12230,6 @@ mod tests {
             operands: vec![],
             operations: vec![],
             constant_operand_ids_to_handles: HashMap::new(),
-            id_to_constant_tensor_operand_map: HashMap::new(),
             quantized: true,
         };
 
@@ -12322,7 +12311,6 @@ mod tests {
                 .expect("linear options"),
             )],
             constant_operand_ids_to_handles: HashMap::new(),
-            id_to_constant_tensor_operand_map: HashMap::new(),
             quantized: false,
         };
 
@@ -12421,7 +12409,6 @@ mod tests {
                     label: None,
                 },
             )]),
-            id_to_constant_tensor_operand_map: HashMap::new(),
             quantized: false,
         };
 
@@ -12548,7 +12535,6 @@ mod tests {
                 OperatorOptions::default(),
             )],
             constant_operand_ids_to_handles: HashMap::new(),
-            id_to_constant_tensor_operand_map: HashMap::new(),
             quantized: false,
         }
     }
@@ -12603,7 +12589,6 @@ mod tests {
                         OperatorOptions::default(),
                     )],
                     constant_operand_ids_to_handles: HashMap::new(),
-                    id_to_constant_tensor_operand_map: HashMap::new(),
                     quantized: false,
                 };
 
@@ -12871,7 +12856,6 @@ mod tests {
                     outputs: vec![1],
                 }],
                 constant_operand_ids_to_handles: HashMap::new(),
-                id_to_constant_tensor_operand_map: HashMap::new(),
                 quantized: false,
             };
             let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
@@ -12917,7 +12901,6 @@ mod tests {
             operands: vec![],
             operations: vec![],
             constant_operand_ids_to_handles: HashMap::new(),
-            id_to_constant_tensor_operand_map: HashMap::new(),
             quantized: true,
         };
         graph.operands.push(Operand {
@@ -13104,7 +13087,6 @@ mod tests {
                 OperatorOptions::default(),
             )],
             constant_operand_ids_to_handles: HashMap::new(),
-            id_to_constant_tensor_operand_map: HashMap::new(),
             quantized: false,
         };
 
@@ -13121,7 +13103,6 @@ mod tests {
             operands: vec![],
             operations: vec![],
             constant_operand_ids_to_handles: HashMap::new(),
-            id_to_constant_tensor_operand_map: HashMap::new(),
             quantized: false,
         };
 
@@ -13228,7 +13209,6 @@ mod tests {
                 OperatorOptions::default(),
             )],
             constant_operand_ids_to_handles: HashMap::new(),
-            id_to_constant_tensor_operand_map: HashMap::new(),
             quantized: false,
         };
 
@@ -13282,7 +13262,6 @@ mod tests {
                 .expect("cumulativeSum options"),
             )],
             constant_operand_ids_to_handles: HashMap::new(),
-            id_to_constant_tensor_operand_map: HashMap::new(),
             quantized: false,
         };
 
@@ -13341,7 +13320,6 @@ mod tests {
                     .expect("gelu options"),
             )],
             constant_operand_ids_to_handles: HashMap::new(),
-            id_to_constant_tensor_operand_map: HashMap::new(),
             quantized: false,
         };
 
