@@ -153,16 +153,18 @@ equality behavior as zero ULP: equal integers pass before the budget is consulte
 and unequal integers fail. This does not apply to floating-point, BigInt, scalar,
 or malformed expectations, or to infinite budgets; unresolved budgets in those
 cases remain a test failure.
-The strict finite-value comparator follows the revised upstream helpers: numerical
-half-bit ordering across signs and zero, direct binary64-to-FP16 nearest-even rounding, and unrounded
+The strict finite-value comparator follows the upstream helpers: signed-magnitude
+bit distance for FP32 and FP16 (signed zeros are equal), expected values rounded
+directly to FP16 with ties-to-even as `Float16Array` does, and unrounded
 JavaScript-number expected values for ATOL. Its audit uses the same comparator
 and applied budget. Nonfinite values use classification rules instead of the
 upstream bit-distance helper: NaN matches NaN regardless of payload, and
 infinities must match in sign. A large budget cannot hide a class mismatch.
 ULP classification uses the expected value after conversion to the output
 dtype; ATOL retains the original source number, including at overflow boundaries.
-Strict FP16 runtime inputs and constants also use
-the revised upstream conversion without narrowing first to FP32; compatibility packing is unchanged.
+Strict FP16 runtime inputs and constants are also rounded directly from the
+source number, as upstream `toHalf` does; compatibility packing rounds through FP32
+and is unchanged.
 The JavaScript fixture bridge preserves negative zero in tensor data and floating-point
 options rather than losing its sign during JSON serialization. This source fidelity is
 separate from the ULP comparator, which continues to treat signed zeros as equal.

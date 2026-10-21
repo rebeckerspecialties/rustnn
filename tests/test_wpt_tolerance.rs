@@ -87,11 +87,12 @@ fn strict_wpt_budget_rejects_missing_or_malformed_source_tolerance() {
 }
 
 #[test]
-fn strict_half_metric_matches_upstream_ordering_and_even_rounding() {
+fn strict_half_metric_matches_upstream_signed_bits_and_halfway_rounding() {
+    // Signed-magnitude ordering, as for float32: 2 * 0x3c00.
     assert_eq!(tolerance::upstream_ulp_distance(-1.0, 1.0, true), 30720);
     assert_eq!(tolerance::upstream_ulp_distance(-0.0, 0.0, true), 0);
     assert_eq!(tolerance::upstream_ulp_distance(0.0, -0.0, true), 0);
-    // The revised upstream helper rounds this midpoint to the even encoding.
+    // Float16Array rounds this tie to even (1.0).
     assert_eq!(
         tolerance::upstream_ulp_distance(1.0, 1.00048828125, true),
         0
@@ -100,6 +101,10 @@ fn strict_half_metric_matches_upstream_ordering_and_even_rounding() {
         tolerance::upstream_ulp_distance(-1.0, -1.00048828125, true),
         0
     );
+    // Just above the tie: direct f64 rounding goes up, while rounding through
+    // f32 first would land on the tie and round down.
+    let above_tie = 1.0 + 2.0f64.powi(-11) + 2.0f64.powi(-40);
+    assert_eq!(tolerance::upstream_ulp_distance(1.0, above_tie, true), 1);
     let subnormal = half::f16::from_bits(1).to_f32();
     assert_eq!(tolerance::upstream_ulp_distance(subnormal, 0.0, true), 1);
     assert_eq!(tolerance::upstream_ulp_distance(-subnormal, 0.0, true), 1);
@@ -573,7 +578,12 @@ fn javascript_fixture_bridge_preserves_signed_zero_in_tensors_and_options() {
 fn strict_half_inputs_and_constants_use_source_rounding_without_changing_default() {
     for constant in [false, true] {
         let spec = wpt_types::WptTensorSpec {
-            data: serde_json::json!([1.00048828125, -1.00048828125]),
+            // Just above a float16 tie: rounding through f32 lands on the tie
+            // (ties-to-even gives 1.0), while upstream rounds the source directly.
+            data: serde_json::json!([
+                1.0 + 2.0f64.powi(-11) + 2.0f64.powi(-40),
+                -1.0 - 2.0f64.powi(-11) - 2.0f64.powi(-40)
+            ]),
             shape: vec![2],
             data_type: "float16".into(),
             constant,
@@ -582,7 +592,7 @@ fn strict_half_inputs_and_constants_use_source_rounding_without_changing_default
         let compatibility = wpt_tensor::tensor_f16_bits_with_mode(&spec, false);
         let strict = wpt_tensor::tensor_f16_bits_with_mode(&spec, true);
         assert_eq!(compatibility, [0x3c00, 0xbc00]);
-        assert_eq!(strict, [0x3c00, 0xbc00]);
+        assert_eq!(strict, [0x3c01, 0xbc01]);
         assert_eq!(
             wpt_tensor::tensor_spec_to_bytes_with_mode(&spec, true).unwrap(),
             strict
@@ -819,7 +829,7 @@ fn strict_comparator_matches_upstream_javascript() {
     ];
     // Every finite FP16 encoding, including both signs and the entire
     // subnormal range. Adjacent midpoints exercise the source toHalf helper's
-    // rounding; opposite signs exercise numerical ordering across zero.
+    // rounding; opposite signs exercise its signed-magnitude distance.
     for bits in 0..=u16::MAX {
         let value = half::f16::from_bits(bits);
         if !value.is_finite() {
