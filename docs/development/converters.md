@@ -187,3 +187,17 @@ this scheduling only on watchOS; other platforms return a graph-build error.
 Changed functions require CoreML8 (`slice_update`); the logical tile cap does not
 bound physical memory or qualify arithmetic. The direct utility supports host
 qualification of generated graphs. No source numerical profile is enabled here.
+
+### File-backed weight storage
+
+`WeightFileBuilder::file_backed` writes CoreML weight blobs into
+`CoremlWeightStorage`, a private memory-mapped scratch file, instead of a
+model-sized heap buffer, and flushes each blob once it is written.
+`CoremlMlProgramConverter::convert_owned` and `convert_owned_file_backed` consume
+an owned `GraphInfo` and release each constant once its blob is written; borrowed
+conversion remains available. A constant whose blob the builder already holds is
+referenced at that offset instead of being read or written again.
+`coreml_assets::compact_file_backed` validates all recursive blob references before
+relocating live spans and externalizing large immediate values; it does not
+quantize weights or change arithmetic. A scratch file and a smaller weight blob do
+not imply a process-memory bound.
