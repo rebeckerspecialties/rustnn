@@ -98,6 +98,7 @@ nav:
   - Testing:
       - WPT Conformance Guide: testing/wpt-test-guide.md
       - WPT Conformance Dashboard: https://rustnn.github.io/rustnn/wpt-conformance/
+      - CoreML Stride-Two Lowering: testing/coreml-stride-two.md
   - Integration:
       - TensorRT-RTX: integration/tensorrt.md
       - Windows TensorRT-RTX Setup: integration/windows-tensorrt-setup.md
