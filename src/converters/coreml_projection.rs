@@ -102,6 +102,8 @@ struct Packed {
     source_name: String,
     source_offset: Option<u64>,
     lookup_original: bool,
+    /// Zero point subtracted from the stored bytes before scaling.
+    zero: f32,
 }
 fn shape(op: &m::Operation) -> Option<Vec<u32>> {
     Some(variable(op.outputs.first()?)?.shape)
@@ -138,7 +140,10 @@ fn constant<'a>(name: &str, p: &BTreeMap<&str, &'a m::Operation>) -> Option<&'a 
 fn floats(name: &str, p: &BTreeMap<&str, &m::Operation>, weights: &[u8]) -> Option<Vec<f32>> {
     let op = p.get(name)?;
     if op.r#type == "cast" {
-        if variable(op.outputs.first()?)?.dtype != m::DataType::Float32 {
+        if !matches!(
+            variable(op.outputs.first()?)?.dtype,
+            m::DataType::Float32 | m::DataType::Float16
+        ) {
             return None;
         }
         return floats(named_arg(op, "x")?, p, weights);
@@ -181,6 +186,15 @@ fn untransposed(op: &m::Operation, producers: &BTreeMap<&str, &m::Operation>) ->
     })
 }
 fn recognize(name: &str, p: &BTreeMap<&str, &m::Operation>, weights: &[u8]) -> Option<Packed> {
+    recognize_in(name, p, weights, m::DataType::Float32)
+}
+/// Recognize the constant dequantization closure whose cast lands in `lane`.
+fn recognize_in(
+    name: &str,
+    p: &BTreeMap<&str, &m::Operation>,
+    weights: &[u8],
+    lane: m::DataType,
+) -> Option<Packed> {
     let r = p.get(name)?;
     if r.r#type != "reshape" {
         return None;
@@ -219,7 +233,7 @@ fn recognize(name: &str, p: &BTreeMap<&str, &m::Operation>, weights: &[u8]) -> O
                 zero = z[0];
                 q = p.get(named_arg(q, "x")?)?;
             }
-            if q.r#type != "cast" || variable(q.outputs.first()?)?.dtype != m::DataType::Float32 {
+            if q.r#type != "cast" || variable(q.outputs.first()?)?.dtype != lane {
                 return None;
             }
             let qname = named_arg(q, "x")?;
@@ -278,6 +292,7 @@ fn recognize(name: &str, p: &BTreeMap<&str, &m::Operation>, weights: &[u8]) -> O
                     _ => None,
                 },
                 lookup_original: dtype == m::DataType::Int8 && zero == 0.,
+                zero,
             })
         })() else {
             continue;
@@ -459,6 +474,61 @@ impl Emit<'_> {
         let p = self.reshape(&p, &[groups * 16, 1, columns]);
         let result = self.aligned_sum(&p, &[0], groups * 16);
         Some(self.reshape(&result, &out.shape))
+    }
+    /// Replace a float16 dequantization closure by one `constexpr_blockwise_shift_scale`
+    /// over the stored Int8/Uint8 matrix, so the exported bundle keeps the weights
+    /// quantized and CoreML decompresses them itself. The group scales become a float16
+    /// `[n, k/width]` blob and the zero point a constant offset in the data's dtype.
+    fn blockwise_constexpr(
+        &mut self,
+        packed: &Packed,
+        data_dtype: m::DataType,
+        weights: &mut super::CoremlWeightStorage,
+    ) -> V {
+        let groups = packed.k / packed.width;
+        let bytes = packed
+            .scales
+            .iter()
+            .flat_map(|&s| half::f16::from_f32(s).to_bits().to_le_bytes())
+            .collect::<Vec<_>>();
+        let offset = append_blob(weights, 1, &bytes);
+        let scale = self.op("const", vec![], m::DataType::Float16, &[packed.n, groups]);
+        self.ops.last_mut().unwrap().attributes.insert(
+            "val".into(),
+            m::Value {
+                r#type: named_type("", m::DataType::Float16, &[packed.n, groups]).r#type,
+                value: Some(m::value::Value::BlobFileValue(m::value::BlobFileValue {
+                    file_name: "@model_path/weights/weights.bin".into(),
+                    offset,
+                })),
+                ..Default::default()
+            },
+        );
+        let mut inputs = vec![
+            ("data", reference(&packed.source_name)),
+            ("scale", reference(&scale.name)),
+        ];
+        if packed.zero != 0. {
+            let byte = if data_dtype == m::DataType::Int8 {
+                packed.zero as i32 as i8 as u8
+            } else {
+                packed.zero as u8
+            };
+            let zero = self.constant(
+                data_dtype,
+                &[packed.n, groups],
+                m::tensor_value::Value::Bytes(m::tensor_value::RepeatedBytes {
+                    values: vec![byte; (packed.n * groups) as usize].into(),
+                }),
+            );
+            inputs.push(("offset", reference(&zero.name)));
+        }
+        self.op(
+            "constexpr_blockwise_shift_scale",
+            inputs,
+            m::DataType::Float16,
+            &[packed.n, packed.k],
+        )
     }
     fn packed_constant(
         &mut self,
@@ -984,6 +1054,72 @@ fn apply_storage(
                         continue;
                     }
                 }
+                // A float16 activation against a float16 dequantization closure: keep the
+                // stored bytes and let CoreML's blockwise constant decompress them.
+                let half_candidate = (|| {
+                    if op.r#type != "matmul"
+                        || op.outputs.len() != 1
+                        || !untransposed(op, &producers)
+                    {
+                        return None;
+                    }
+                    let x = vars.get(named_arg(op, "x")?)?;
+                    let y = producers.get(named_arg(op, "y")?)?;
+                    if y.r#type != "transpose"
+                        || !matches!(parameter(y,"perm",&producers),Some(m::tensor_value::Value::Ints(v)) if v.values==[1,0])
+                        || x.dtype != m::DataType::Float16
+                    {
+                        return None;
+                    }
+                    let packed = recognize_in(
+                        named_arg(y, "x")?,
+                        &producers,
+                        weights,
+                        m::DataType::Float16,
+                    )?;
+                    if x.shape.last() != Some(&packed.k) || shape(y)? != [packed.k, packed.n] {
+                        return None;
+                    }
+                    let data_dtype = variable(
+                        producers
+                            .get(packed.source_name.as_str())?
+                            .outputs
+                            .first()?,
+                    )?
+                    .dtype;
+                    Some((x.clone(), packed, data_dtype))
+                })();
+                if let Some((x, packed, data_dtype)) = half_candidate {
+                    let mut e = Emit {
+                        next: names.len(),
+                        ops: vec![],
+                        names: &mut names,
+                    };
+                    let w = e.blockwise_constexpr(&packed, data_dtype, weights);
+                    let out = variable(&op.outputs[0]).unwrap();
+                    let no = e.bool(false);
+                    let yes = e.bool(true);
+                    let product = e.op(
+                        "matmul",
+                        vec![
+                            ("x", reference(&x.name)),
+                            ("y", reference(&w.name)),
+                            ("transpose_x", reference(&no.name)),
+                            ("transpose_y", reference(&yes.name)),
+                        ],
+                        m::DataType::Float16,
+                        &out.shape,
+                    );
+                    e.ops.push(m::Operation {
+                        r#type: "identity".into(),
+                        inputs: [("x".into(), reference(&product.name))].into(),
+                        outputs: op.outputs.clone(),
+                        ..Default::default()
+                    });
+                    block.operations.extend(e.ops);
+                    count += 1;
+                    continue;
+                }
                 let runtime = (|| {
                     if op.r#type != "matmul"
                         || op.outputs.len() != 1
@@ -1294,6 +1430,7 @@ mod tests {
                 source_name: "weights".into(),
                 source_offset: None,
                 lookup_original: false,
+                zero: 0.,
             };
             let x = V {
                 name: "x".into(),
@@ -1399,6 +1536,133 @@ mod tests {
                 .operations
                 .iter()
                 .any(|o| o.r#type == "cast" && named_arg(o, "x") == Some("x"))
+        );
+    }
+
+    #[test]
+    fn float16_chain_becomes_a_blockwise_constexpr_consumed_by_a_transposed_matmul() {
+        use crate::operator_options::MLDimension;
+        let (n, k) = (64u32, 64u32);
+        let mut b = MLGraphBuilder::new_uncompiled();
+        let stored = (0..n * k).map(|i| (i * 7 % 251) as u8).collect::<Vec<_>>();
+        let data = b
+            .constant_from_bytes(
+                &MLOperandDescriptor::new(MLOperandDataType::Uint8, vec![n as u64, k as u64]),
+                stored.clone(),
+            )
+            .unwrap();
+        let zero = b
+            .constant_from_bytes(
+                &MLOperandDescriptor::new(MLOperandDataType::Float16, vec![]),
+                half::f16::from_f32(128.).to_bits().to_le_bytes().to_vec(),
+            )
+            .unwrap();
+        let scale_values = (0..n * 2)
+            .map(|i| 0.5 + i as f32 / 256.)
+            .collect::<Vec<_>>();
+        let scales = b
+            .constant_from_bytes(
+                &MLOperandDescriptor::new(MLOperandDataType::Float16, vec![n as u64, 2]),
+                scale_values
+                    .iter()
+                    .flat_map(|&v| half::f16::from_f32(v).to_bits().to_le_bytes())
+                    .collect(),
+            )
+            .unwrap();
+        let dims = |v: &[u32]| {
+            v.iter()
+                .map(|&d| MLDimension::Static(d))
+                .collect::<Vec<_>>()
+        };
+        let widened = b.cast(data, MLOperandDataType::Float16).unwrap();
+        let centered = b.sub(widened, zero).unwrap();
+        let grouped = b.reshape(centered, dims(&[n, 2, 32])).unwrap();
+        let scale_cast = b.cast(scales, MLOperandDataType::Float16).unwrap();
+        let scale_grouped = b.reshape(scale_cast, dims(&[n, 2, 1])).unwrap();
+        let scaled = b.mul(grouped, scale_grouped).unwrap();
+        let weight = b.reshape(scaled, dims(&[n, k])).unwrap();
+        let transposed = b.transpose(weight).unwrap();
+        let x = b
+            .input(
+                "x",
+                &MLOperandDescriptor::new(MLOperandDataType::Float16, vec![1, 1, k as u64]),
+            )
+            .unwrap();
+        let y = b.matmul(x, transposed).unwrap();
+        let g = b
+            .finish_graph_info(&MLNamedOperands::from([("y", y)]))
+            .unwrap();
+        let converted = CoremlMlProgramConverter.convert(&g).unwrap();
+        let mut weights = converted.weights_data.unwrap();
+        let mut model = Model::decode(converted.data.as_slice()).unwrap();
+        assert_eq!(apply(&mut model, &mut weights, false), 1);
+        let Some(model::Type::MlProgram(p)) = &model.r#type else {
+            panic!()
+        };
+        let f = &p.functions["main"];
+        assert_eq!(f.opset, "CoreML8");
+        let block = &f.block_specializations[&f.opset];
+        let producers = block
+            .operations
+            .iter()
+            .flat_map(|o| o.outputs.iter().map(move |v| (v.name.as_str(), o)))
+            .collect::<BTreeMap<_, _>>();
+        let leaf = block
+            .operations
+            .iter()
+            .find(|o| o.r#type == "constexpr_blockwise_shift_scale")
+            .expect("one blockwise constant");
+        let out = variable(&leaf.outputs[0]).unwrap();
+        assert_eq!(
+            (out.dtype, out.shape.clone()),
+            (m::DataType::Float16, vec![n, k])
+        );
+        let data_leaf = producers[named_arg(leaf, "data").unwrap()];
+        assert_eq!(
+            variable(&data_leaf.outputs[0]).unwrap().dtype,
+            m::DataType::Uint8
+        );
+        assert_eq!(raw(&data_leaf.attributes["val"], &weights).unwrap(), stored);
+        let scale_leaf = producers[named_arg(leaf, "scale").unwrap()];
+        let scale_var = variable(&scale_leaf.outputs[0]).unwrap();
+        assert_eq!(
+            (scale_var.dtype, scale_var.shape.clone()),
+            (m::DataType::Float16, vec![n, 2])
+        );
+        assert_eq!(
+            floats(&scale_leaf.outputs[0].name, &producers, &weights).unwrap(),
+            scale_values
+                .iter()
+                .map(|&v| half::f16::from_f32(v).to_f32())
+                .collect::<Vec<_>>()
+        );
+        let offset_leaf = producers[named_arg(leaf, "offset").unwrap()];
+        assert_eq!(
+            variable(&offset_leaf.outputs[0]).unwrap().dtype,
+            m::DataType::Uint8
+        );
+        assert_eq!(
+            raw(&offset_leaf.attributes["val"], &weights).unwrap(),
+            vec![128u8; (n * 2) as usize]
+        );
+        let product = block
+            .operations
+            .iter()
+            .find(|o| o.r#type == "matmul")
+            .expect("one float16 matmul");
+        assert_eq!(named_arg(product, "y"), Some(leaf.outputs[0].name.as_str()));
+        assert!(
+            matches!(parameter(product, "transpose_y", &producers), Some(m::tensor_value::Value::Bools(v)) if v.values == [true])
+        );
+        assert_eq!(
+            variable(&product.outputs[0]).unwrap().dtype,
+            m::DataType::Float16
+        );
+        assert!(
+            !block.operations.iter().any(|o| o.r#type == "cast"
+                && variable(&o.outputs[0])
+                    .is_some_and(|v| v.dtype == m::DataType::Float16 && v.shape == [n, k])),
+            "the widening cast of the stored bytes is gone"
         );
     }
 
