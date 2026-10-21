@@ -56,6 +56,7 @@ Use the Makefile targets; they set feature flags and environment variables consi
 | `test-coreml-gather` | Focused active-dimension gather regressions, including scalar indices; `TEST_FILTER` selects a test |
 | `test-coreml-dtypes` | Focused numeric boundary regressions for typed dispatch and the convenience API; CI runs with and without dynamic inputs |
 | `test-coreml-tensor-reuse` | Retained storage ownership, type conversion and shape regressions; CI runs with and without dynamic inputs |
+| `test-coreml-stride-two` | Static stride-two slice rewrite: MIL structure tests and, on macOS, exact exported-model results under every compute-unit permission; see [CoreML stride-two lowering](../testing/coreml-stride-two.md) |
 | `litert`, `cann` | LiteRT and CANN conversion of the sample graph |
 | `validate-cann-env`, `cann-build`, `cann-device-test` | OpenHarmony toolchain check, cross build, device test through `hdc`; see [CANN](../integration/cann.md) |
 | `validate-all-env` | Build, unit tests, ONNX and CoreML validation in one run |

@@ -20,27 +20,31 @@ lowering. Arithmetic, casts, weights, output names and native pipeline boundarie
 are unchanged. The pass runs after arithmetic lowering, immediately before model
 serialization, including inside existing native pipeline children.
 
-When combining this with [precision-boundary lowering (#279)](https://github.com/rustnn/rustnn/pull/279),
-keep the hook in `GraphConverter::convert()` after `convert_with_precision_boundaries()`,
-not inside `convert_program()`. This ensures slices introduced by later arithmetic
-lowering are rewritten, without changing the resulting pipeline partitioning.
+The pass is `rewrite_model()` in `src/converters/coreml_mlprogram/stride_two.rs`.
+The CoreML converter's `GraphConverter::convert()` calls it once the MLProgram is
+assembled, immediately before the model is serialized. When combining this with
+[precision-boundary lowering (#279)](https://github.com/rustnn/rustnn/pull/279),
+keep that call at the end of `convert()`, after #279's precision boundaries are
+materialized, rather than in the program-building helper that #279 factors out of
+`convert()`. This ensures slices introduced by later arithmetic lowering are
+rewritten, without changing the resulting pipeline partitioning.
 
 ## Device evidence (13 October 2026)
 
 These are the preserved integration runs of the same floating-point rewrite,
 not a fresh phone run of this standalone branch. The extracted pass was replayed
-against the sealed full TinyStories graph: all 2,034 eligible slices were replaced
-and every resulting operation, binding, type, output and attribute matched the
-sealed candidate across its three native children. The standalone pass leaves
-experimental partition metadata untouched rather than depending on it.
+against the sealed full TinyStories graph: every eligible slice was replaced and
+every resulting operation, binding, type, output and attribute matched the sealed
+candidate in each of its native children. The standalone pass leaves experimental
+partition metadata untouched rather than depending on it.
 
 Each admitted run held one model through five independent three-prompt
-conversations: 15 replies, 810 generated tokens, 1,305 serving predictions and
-261 initial reference predictions. Every serving logit vector and all 31,457,280
-returned-KV boundary words matched the qualified reference/hash replay. The
-initial gate requires finite values, matching token/argmax and
-`abs(actual-reference) <= 2e-5 + 1e-4*abs(reference)`; this application gate is
-separate from operator-level WebNN tolerance tests.
+conversations. Every serving logit vector and every returned-KV boundary word
+matched the qualified reference/hash replay. The initial gate requires finite
+values, matching token/argmax and `abs(actual-reference) <= 2e-5 + 1e-4*abs(reference)`;
+this application gate is separate from the operator-level WebNN tolerance tests,
+whose current results are on the
+[WPT conformance dashboard](https://rustnn.github.io/rustnn/wpt-conformance/).
 
 | Device / OS | Requested policy | Inclusive tokens/s | Median TTFT (s) | Peak / held charged memory (MB) |
 | --- | --- | ---: | ---: | ---: |
@@ -57,12 +61,12 @@ qualification are excluded. Peak is lifetime charged footprint, not RSS or a
 resettable reply-only peak. GPU does not outperform CPU here: the benefit is
 making the accurate native GPU path usable, not claiming a speed/energy win.
 
-Separate placement traces joined model prediction spans to GPU hardware buffers:
-1,518 active compute buffers on XS (PID 20347) and 348 on SE2 (PID 9811).
-An XS All trace also observed GPU work, with no ANE activity; an exact-convolution
-positive control exercised the ANE tracing channel. CPU+ANE is not qualified for
-this full model: the XS run exited during loading, and SE2 failed two logit cells
-at step 163. No power/thermal-spreading claim is made from these timing runs.
+Separate placement traces joined model prediction spans to GPU hardware buffers
+on both phones. An XS All trace also observed GPU work, with no ANE activity; an
+exact-convolution positive control exercised the ANE tracing channel. CPU+ANE is
+not qualified for this full model: the XS run exited during loading, and SE2 failed
+the logit gate at step 163. No power/thermal-spreading claim is made from these
+timing runs.
 
 SmolLM2's larger native-memory investigation is separate and remains tracked in
 [fork issue #38](https://github.com/rebeckerspecialties/rustnn/issues/38).
@@ -73,6 +77,9 @@ SmolLM2's larger native-memory investigation is separate and remains tracked in
 floating storage patterns, naming, no-op guards, chained consumers and native
 pipeline traversal. On macOS it also exercises the exported model across all
 four compute permissions, requiring exact outputs and rejecting GPU load fallback.
+The rewrite changes only the MIL layout of an already supported `slice`; the
+[backend operator support report](../development/backend-operator-support.md)
+remains the reference for which operations the CoreML converter lowers.
 
 Preserved evidence identifiers (SHA-256):
 
