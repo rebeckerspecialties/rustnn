@@ -606,4 +606,233 @@ mod runtime {
             assert_eq!(unaffected, expected);
         }
     }
+
+    /// The one-shot repro from review: `out` copies an `i32[4]` constant that the
+    /// converter stores as a MIL immediate. Only the copy proof refers to its raw
+    /// weight record, so the converted graph gains a small weights sidecar.
+    const IMMEDIATE_CONSTANT_COPY: &str = r#"webnn_graph "immediate_constant_copy" v1 {
+  inputs { x: f32[2]; }
+  consts { c: i32[4] @bytes([1, 0, 0, 0, 254, 255, 255, 255, 3, 0, 0, 0, 0, 8, 0, 0]); }
+  nodes {
+    y = relu(x);
+    out = identity(c);
+  }
+  outputs { y; out; }
+}
+"#;
+
+    /// `w` is stored in `weights.bin`, which the MIL program itself references.
+    const BLOB_CONSTANT_COPY: &str = r#"webnn_graph "blob_constant_copy" v1 {
+  inputs { x: f32[2]; }
+  consts { w: f32[2] @bytes([0, 0, 192, 63, 0, 0, 32, 192]); }
+  nodes {
+    y = add(x, w);
+    out = identity(w);
+  }
+  outputs { y; out; }
+}
+"#;
+
+    fn graph_file(text: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("graph.webnn");
+        std::fs::write(&path, text).unwrap();
+        (directory, path)
+    }
+
+    fn named_descriptors(graph: &GraphInfo, ids: &[u32]) -> HashMap<String, OperandDescriptor> {
+        ids.iter()
+            .map(|&id| {
+                let operand = &graph.operands[id as usize];
+                (operand.name.clone().unwrap(), operand.descriptor.clone())
+            })
+            .collect()
+    }
+
+    /// CPU is required; every policy that loaded must return the expected values.
+    fn assert_outputs(
+        attempts: &[rustnn::executors::coreml::CoremlRunAttempt],
+        expected: &[(&str, &[f32])],
+    ) {
+        assert!(
+            attempts
+                .iter()
+                .any(|attempt| attempt.compute_unit == "CPU_ONLY" && attempt.result.is_ok()),
+            "{attempts:?}"
+        );
+        for attempt in attempts {
+            let Ok(outputs) = &attempt.result else {
+                continue;
+            };
+            for &(name, values) in expected {
+                let output = outputs
+                    .iter()
+                    .find(|output| output.name == name)
+                    .unwrap_or_else(|| {
+                        panic!("{}: no `{name}` in {outputs:?}", attempt.compute_unit)
+                    });
+                assert_eq!(output.data, values, "{} `{name}`", attempt.compute_unit);
+            }
+        }
+    }
+
+    #[test]
+    fn one_shot_executors_match_mlcontext_for_an_immediate_constant_copy() {
+        use rustnn::executors::coreml::{
+            CoremlInput, run_coreml_with_inputs, run_coreml_with_inputs_checked,
+            run_coreml_with_inputs_with_weights, run_coreml_zeroed, run_coreml_zeroed_cached,
+            run_coreml_zeroed_cached_with_weights,
+        };
+        let (_directory, path) = graph_file(IMMEDIATE_CONSTANT_COPY);
+        let graph = rustnn::load_graph_from_path(&path).unwrap();
+        let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+        let weights = converted.weights_data.as_deref();
+        assert!(weights.is_some(), "the copy proof keeps a raw record");
+        let input_descriptors = named_descriptors(&graph, &graph.input_operands);
+        let output_descriptors = named_descriptors(&graph, &graph.output_operands);
+        let inputs = vec![CoremlInput {
+            name: "x".into(),
+            shape: vec![2],
+            data: vec![-1.5, 2.5],
+        }];
+        let copied: &[f32] = &[1.0, -2.0, 3.0, 2048.0];
+
+        // With the sidecar the copy comes from the original record; without it,
+        // CoreML computes the output, as it did before copy proofs existed.
+        for attempts in [
+            run_coreml_zeroed_cached_with_weights(
+                &converted.data,
+                weights,
+                &input_descriptors,
+                None,
+            ),
+            run_coreml_zeroed_cached(&converted.data, &input_descriptors, None),
+            run_coreml_zeroed(&converted.data, &input_descriptors),
+        ] {
+            assert_outputs(&attempts.unwrap(), &[("y", &[0.0, 0.0]), ("out", copied)]);
+        }
+        for attempts in [
+            run_coreml_with_inputs_with_weights(&converted.data, weights, inputs.clone()),
+            run_coreml_with_inputs(&converted.data, inputs.clone()),
+            run_coreml_with_inputs_checked(
+                &converted.data,
+                inputs,
+                &input_descriptors,
+                &output_descriptors,
+            ),
+        ] {
+            assert_outputs(&attempts.unwrap(), &[("y", &[0.0, 2.5]), ("out", copied)]);
+        }
+
+        // A supplied sidecar that does not match the proof still fails closed.
+        let copies: Value = serde_json::from_str(&metadata(&graph)[CONSTANT_COPIES]).unwrap();
+        let (_, source) = copies["sources"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .next()
+            .unwrap();
+        let offset = source["offset"].as_u64().unwrap() as usize;
+        let mut mismatched = weights.unwrap().to_vec();
+        mismatched[offset + 64] ^= 1;
+        assert!(
+            run_coreml_zeroed_cached_with_weights(
+                &converted.data,
+                Some(&mismatched),
+                &input_descriptors,
+                None,
+            )
+            .is_err()
+        );
+
+        // MLContext supplies the same values from the original bytes.
+        let mut context = MLContext::create(
+            &MLContextOptions::new(MLPowerPreference::Default, false)
+                .with_rustnn_backend_hint(Backend::Coreml),
+        )
+        .unwrap();
+        let constant = graph
+            .constant_operand_ids_to_handles
+            .values()
+            .next()
+            .unwrap();
+        let expected_out = constant.data.clone();
+        let mut built = context.rustnn_build_graph(graph).unwrap();
+        let descriptor = |data_type, length| {
+            MLTensorDescriptor::new(data_type, vec![length])
+                .to_readable()
+                .to_writable()
+        };
+        let x = context
+            .create_tensor(&descriptor(MLOperandDataType::Float32, 2))
+            .unwrap();
+        let y = context
+            .create_tensor(&descriptor(MLOperandDataType::Float32, 2))
+            .unwrap();
+        let out = context
+            .create_tensor(&descriptor(MLOperandDataType::Int32, 4))
+            .unwrap();
+        let f32_bytes = |values: [f32; 2]| -> Vec<u8> {
+            values.into_iter().flat_map(f32::to_le_bytes).collect()
+        };
+        context.write_tensor(&x, &f32_bytes([-1.5, 2.5])).unwrap();
+        context
+            .dispatch(
+                &mut built,
+                &MLNamedTensors::from([("x", &x)]),
+                &MLNamedTensors::from([("y", &y), ("out", &out)]),
+            )
+            .unwrap();
+        let mut actual = vec![0u8; expected_out.len()];
+        context.read_tensor(&out, &mut actual).unwrap();
+        assert_eq!(actual, expected_out);
+        let mut actual = vec![0u8; 8];
+        context.read_tensor(&y, &mut actual).unwrap();
+        assert_eq!(actual, f32_bytes([0.0, 2.5]));
+    }
+
+    #[test]
+    fn one_shot_executors_need_the_sidecar_for_referenced_weights() {
+        use rustnn::executors::coreml::{
+            run_coreml_zeroed_cached, run_coreml_zeroed_cached_with_weights,
+        };
+        let (_directory, path) = graph_file(BLOB_CONSTANT_COPY);
+        let graph = rustnn::load_graph_from_path(&path).unwrap();
+        let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+        let input_descriptors = named_descriptors(&graph, &graph.input_operands);
+        // CoreML cannot compile the program without the weights it references, so
+        // a missing sidecar never leaves a blob-backed copy to CoreML.
+        assert!(run_coreml_zeroed_cached(&converted.data, &input_descriptors, None).is_err());
+        let attempts = run_coreml_zeroed_cached_with_weights(
+            &converted.data,
+            converted.weights_data.as_deref(),
+            &input_descriptors,
+            None,
+        )
+        .unwrap();
+        assert_outputs(&attempts, &[("y", &[1.5, -2.5]), ("out", &[1.5, -2.5])]);
+    }
+
+    #[test]
+    fn cli_run_coreml_executes_constant_copy_outputs() {
+        for (text, shape) in [(IMMEDIATE_CONSTANT_COPY, 4), (BLOB_CONSTANT_COPY, 2)] {
+            let (_directory, path) = graph_file(text);
+            let output = std::process::Command::new(env!("CARGO_BIN_EXE_rustnn"))
+                .arg(&path)
+                .args(["--convert", "coreml", "--run-coreml"])
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "{stdout}{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(stdout.contains("  - CPU_ONLY succeeded:"), "{stdout}");
+            assert!(
+                stdout.contains(&format!("      out: shape=[{shape}]")),
+                "{stdout}"
+            );
+        }
+    }
 }

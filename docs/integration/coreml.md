@@ -46,15 +46,17 @@ establishes placement, energy savings or prediction-time fallback; use separate 
    model boundary, comparison and logical results are produced as `uint8`, and reductions with
    empty axes, `resample2d` on arbitrary axis pairs and the stable `reduceLogSumExp` form are
    lowered explicitly because MIL has no direct equivalent.
-2. Float16 weights are written as a separate weights blob (`ConvertedGraph::weights_data`), and
-   the model is packaged as an in-memory asset together with that blob. Graphs for which the
-   in-memory compiler is known to misbehave (`gather` with a rank-0 index) are written to a
-   temporary directory and compiled from its URL instead (`supports_in_memory_asset`).
+2. Non-scalar float16, float32, int8 and uint8 constants are written to a separate weights blob
+   (`ConvertedGraph::weights_data`), which also keeps the original bytes of constants that
+   outputs copy (see Tensor names below). The model is packaged as an in-memory asset together
+   with that blob. Graphs for which the in-memory compiler is known to misbehave (`gather` with
+   a rank-0 index) are written to a temporary directory and compiled from its URL instead
+   (`supports_in_memory_asset`).
 3. `MLGraphBuilder::build` compiles the model with `MLModel` and keeps the compiled model;
    `dispatch` binds `MLMultiArray`s over the tensor storage and runs a prediction.
-4. The legacy CLI path (`--convert coreml --run-coreml`) tries the compute-unit configurations in
-   turn and reports each attempt; `--coreml-compiled-output <dir>` stores the compiled
-   `.mlmodelc` for reuse.
+4. The legacy CLI path (`--convert coreml --run-coreml`) passes that blob to the one-shot
+   executor, tries the compute-unit configurations in turn and reports each attempt;
+   `--coreml-compiled-output <dir>` stores the compiled `.mlmodelc` for reuse.
 
 ## Tensor names
 
@@ -93,9 +95,14 @@ graphs retain that owner only when its capacity is at most twice the uniquely re
 bytes; otherwise they compact just those ranges into one shared allocation, so a tiny
 copy output does not retain a large unrelated weight file.
 Standalone consumers must retain the original weights sidecar alongside the compiled
-model; a `.mlmodelc` alone cannot supply RustNN's exact original-copy values. Missing or
-invalid source data fails closed, regardless of tensor size. Exported `.mlpackage`
-sources contain that sidecar and do not depend on the original Rust graph or its lifetime.
+model; a `.mlmodelc` alone cannot supply RustNN's exact original-copy values. RustNN does
+not export an `.mlpackage`: `--convert-output` writes the `.mlmodel` plus
+`rustnn_external_weights.data` (the `weights.bin` bytes), and `--coreml-compiled-output`
+keeps only the `.mlmodelc`. A supplied sidecar whose records, byte lengths or checksums do
+not match fails closed, regardless of tensor size. `MLContext`, `--run-coreml` and the
+`_with_weights` one-shot executors pass the sidecar. Without one, CoreML cannot compile a
+program that references `weights.bin`; in a model that still loads, every copied constant
+is a MIL immediate, and those outputs keep CoreML's computed values like other outputs.
 The native graph still runs; these proofs do not replace arithmetic-derived results.
 The same checked bindings apply with retained tensor storage enabled. Proven copies
 are snapshotted before prediction and written into independently owned outputs;

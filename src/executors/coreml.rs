@@ -202,6 +202,12 @@ pub struct CoremlRunAttempt {
 }
 
 /// Compile and run a CoreML model once with zero-filled inputs on each compute-unit configuration.
+///
+/// Passes no weights sidecar. Use [`run_coreml_zeroed_cached_with_weights`] for a model
+/// converted with [`ConvertedGraph::weights_data`] set; see there for what changes without
+/// it.
+///
+/// [`ConvertedGraph::weights_data`]: crate::converters::ConvertedGraph::weights_data
 pub fn run_coreml_zeroed(
     model_bytes: &[u8],
     inputs: &HashMap<String, OperandDescriptor>,
@@ -210,6 +216,12 @@ pub fn run_coreml_zeroed(
 }
 
 /// [`run_coreml_zeroed`] that stores or reuses the compiled `.mlmodelc` at `compiled_path`.
+///
+/// Passes no weights sidecar. Use [`run_coreml_zeroed_cached_with_weights`] for a model
+/// converted with [`ConvertedGraph::weights_data`] set; see there for what changes without
+/// it.
+///
+/// [`ConvertedGraph::weights_data`]: crate::converters::ConvertedGraph::weights_data
 pub fn run_coreml_zeroed_cached(
     model_bytes: &[u8],
     inputs: &HashMap<String, OperandDescriptor>,
@@ -219,6 +231,16 @@ pub fn run_coreml_zeroed_cached(
 }
 
 /// Run CoreML inference with zeroed inputs and optional weight file
+///
+/// `weights_data` is the converter's [`ConvertedGraph::weights_data`]. CoreML cannot
+/// compile a program that references `weights.bin` without it. The sidecar also holds the
+/// original bytes of constants that outputs are proven to copy; those outputs are supplied
+/// from its records, and a sidecar whose records, lengths or checksums do not match fails
+/// the call. Without a sidecar, such outputs keep CoreML's computed values like any other
+/// output: a program that compiles without one stored every copied constant as a MIL
+/// immediate.
+///
+/// [`ConvertedGraph::weights_data`]: crate::converters::ConvertedGraph::weights_data
 pub fn run_coreml_zeroed_cached_with_weights(
     model_bytes: &[u8],
     weights_data: Option<&[u8]>,
@@ -231,6 +253,12 @@ pub fn run_coreml_zeroed_cached_with_weights(
 }
 
 /// Run CoreML inference with actual input data
+///
+/// Passes no weights sidecar. Use [`run_coreml_with_inputs_with_weights`] for a model
+/// converted with [`ConvertedGraph::weights_data`] set; see
+/// [`run_coreml_zeroed_cached_with_weights`] for what changes without it.
+///
+/// [`ConvertedGraph::weights_data`]: crate::converters::ConvertedGraph::weights_data
 pub fn run_coreml_with_inputs(
     model_bytes: &[u8],
     inputs: Vec<CoremlInput>,
@@ -239,6 +267,8 @@ pub fn run_coreml_with_inputs(
 }
 
 /// Run CoreML inference with actual input data and optional weight file
+///
+/// `weights_data` is handled as in [`run_coreml_zeroed_cached_with_weights`].
 pub fn run_coreml_with_inputs_with_weights(
     model_bytes: &[u8],
     weights_data: Option<&[u8]>,
@@ -250,6 +280,12 @@ pub fn run_coreml_with_inputs_with_weights(
 }
 
 /// Run CoreML inference with actual input data and model caching
+///
+/// Passes no weights sidecar. Use [`run_coreml_with_inputs_with_weights`], which does not
+/// cache, for a model converted with [`ConvertedGraph::weights_data`] set; see
+/// [`run_coreml_zeroed_cached_with_weights`] for what changes without it.
+///
+/// [`ConvertedGraph::weights_data`]: crate::converters::ConvertedGraph::weights_data
 pub fn run_coreml_with_inputs_cached(
     model_bytes: &[u8],
     inputs: Vec<CoremlInput>,
@@ -263,6 +299,12 @@ pub fn run_coreml_with_inputs_cached(
 /// Run CoreML inference with runtime descriptor checks for dynamic dimensions.
 /// Invalid inputs or compilation failures fail the call; output validation
 /// failures are reported in the corresponding compute-policy attempt.
+///
+/// Passes no weights sidecar. Use [`run_coreml_with_inputs_with_weights`], which does not
+/// check descriptors, for a model converted with [`ConvertedGraph::weights_data`] set; see
+/// [`run_coreml_zeroed_cached_with_weights`] for what changes without it.
+///
+/// [`ConvertedGraph::weights_data`]: crate::converters::ConvertedGraph::weights_data
 pub fn run_coreml_with_inputs_checked(
     model_bytes: &[u8],
     inputs: Vec<CoremlInput>,
@@ -1578,10 +1620,6 @@ fn parse_constant_copies<'a>(
             "unsupported CoreML constant-copy metadata version",
         ));
     }
-    let weights = weights.ok_or_else(|| {
-        boundary_error("constant-copy metadata requires the original weights.bin sidecar")
-    })?;
-    let ranges = crate::converters::weight_ranges(weights.as_ref())?;
     for (name, source) in &metadata.outputs {
         let physical = outputs.get(name).unwrap_or(name);
         if name.is_empty()
@@ -1594,8 +1632,7 @@ fn parse_constant_copies<'a>(
             )));
         }
     }
-    let mut sources = HashMap::new();
-    for (id, source) in metadata.sources {
+    for (&id, source) in &metadata.sources {
         if !metadata.outputs.values().any(|&origin| origin == id)
             || source.descriptor.static_shape().is_none()
         {
@@ -1603,6 +1640,18 @@ fn parse_constant_copies<'a>(
                 "unused or dynamically shaped constant-copy source",
             ));
         }
+    }
+    // CoreML cannot compile a program that references weights.bin without the
+    // sidecar, so a model loaded without one stored every copied constant as a MIL
+    // immediate, and only this proof refers to their raw records. Those outputs keep
+    // CoreML's values, like any other output, rather than rejecting a model that
+    // runs without weights. A supplied sidecar must still match every record.
+    let Some(weights) = weights else {
+        return Ok(HashMap::new());
+    };
+    let ranges = crate::converters::weight_ranges(weights.as_ref())?;
+    let mut sources = HashMap::new();
+    for (id, source) in metadata.sources {
         let expected = source
             .descriptor
             .byte_length()
@@ -2779,6 +2828,19 @@ mod checked_attempt_tests {
                     _ => unreachable!(),
                 }
                 assert!(parse(&invalid).is_err(), "{changed}");
+                if matches!(changed, "version" | "source" | "unknown") {
+                    assert!(
+                        parse_constant_copies(
+                            &invalid.to_string(),
+                            &aliases,
+                            &["physical".into()],
+                            &HashMap::new(),
+                            None,
+                        )
+                        .is_err(),
+                        "{changed} without a sidecar"
+                    );
+                }
             }
             let input_copy = HashMap::from([(
                 "first".into(),
@@ -2807,6 +2869,7 @@ mod checked_attempt_tests {
                 )
                 .is_err()
             );
+            // Without a sidecar, valid proofs leave the outputs to CoreML.
             assert!(
                 parse_constant_copies(
                     &json.to_string(),
@@ -2815,7 +2878,12 @@ mod checked_attempt_tests {
                     &HashMap::new(),
                     None
                 )
-                .is_err()
+                .unwrap()
+                .is_empty()
+            );
+            assert!(
+                parse_constant_copies(&json.to_string(), &aliases, &[], &HashMap::new(), None)
+                    .is_err()
             );
             for location in [0, 4, 8, 64, 72, 80, 88, 128] {
                 let mut invalid = owner.as_ref().clone();
