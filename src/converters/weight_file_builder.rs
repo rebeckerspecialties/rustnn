@@ -37,7 +37,7 @@ pub mod blob_data_type {
 ///
 /// Reference: Chromium services/webnn/coreml/graph_builder_coreml.cc
 pub struct WeightFileBuilder {
-    data: Vec<u8>,
+    data: super::CoremlWeightStorage,
     offsets: HashMap<u32, u64>,
     entry_count: u32,
 }
@@ -45,13 +45,27 @@ pub struct WeightFileBuilder {
 impl WeightFileBuilder {
     pub fn new() -> Self {
         let mut builder = Self {
-            data: Vec::new(),
+            data: super::CoremlWeightStorage::memory(Vec::new()),
             offsets: HashMap::new(),
             entry_count: 0,
         };
         // Write the 64-byte file header (count = 0 for now; patched at finalize)
         builder.write_file_header(0);
         builder
+    }
+
+    /// Like `new`, but blobs go to a private memory-mapped scratch file instead
+    /// of a model-sized heap buffer. Each blob is flushed once it is written.
+    pub fn file_backed() -> Result<Self, GraphError> {
+        let mut data = super::CoremlWeightStorage::file_backed().map_err(storage_error)?;
+        data.try_reserve(64).map_err(storage_error)?;
+        let mut b = Self {
+            data,
+            offsets: HashMap::new(),
+            entry_count: 0,
+        };
+        b.write_file_header(0);
+        Ok(b)
     }
 
     /// Adds a weight entry. Returns the absolute file offset of the WeightMetadata
@@ -71,6 +85,13 @@ impl WeightFileBuilder {
             });
         }
 
+        self.data
+            .try_reserve(
+                data.len()
+                    .checked_add(128)
+                    .ok_or_else(|| storage_error("weight size overflow"))?,
+            )
+            .map_err(storage_error)?;
         // Align to 64-byte boundary before writing the metadata block
         let aligned_offset = align_to(self.data.len(), ALIGNMENT);
         self.data.resize(aligned_offset, 0);
@@ -93,6 +114,9 @@ impl WeightFileBuilder {
         // Write raw payload
         self.data.extend_from_slice(data);
 
+        self.data
+            .flush_range(metadata_offset as usize, 64 + data.len())
+            .map_err(storage_error)?;
         self.entry_count += 1;
         Ok(metadata_offset)
     }
@@ -100,8 +124,8 @@ impl WeightFileBuilder {
     /// Pre-allocate for the expected payload volume. Weight files reach
     /// hundreds of MB; growing by amortized doubling briefly holds ~3x the
     /// final size during the last realloc.
-    pub fn reserve(&mut self, additional: usize) {
-        self.data.reserve(additional);
+    pub fn reserve(&mut self, additional: usize) -> Result<(), GraphError> {
+        self.data.try_reserve(additional).map_err(storage_error)
     }
 
     /// Returns the file offset for a previously added weight.
@@ -111,7 +135,13 @@ impl WeightFileBuilder {
     }
 
     /// Finalizes the file: patches the entry count in the header and pads to alignment.
-    pub fn finalize(mut self) -> Vec<u8> {
+    pub fn finalize(self) -> Vec<u8> {
+        self.finalize_storage().into_memory()
+    }
+
+    /// Like `finalize`, but returns the bytes in their storage (memory or
+    /// scratch file) without copying them into a new buffer.
+    pub fn finalize_storage(mut self) -> super::CoremlWeightStorage {
         // Pad to 64-byte boundary
         let aligned = align_to(self.data.len(), ALIGNMENT);
         self.data.resize(aligned, 0);
@@ -141,6 +171,13 @@ impl WeightFileBuilder {
 
 fn align_to(offset: usize, alignment: usize) -> usize {
     (offset + (alignment - 1)) & !(alignment - 1)
+}
+
+fn storage_error(error: impl std::fmt::Display) -> GraphError {
+    GraphError::ConversionFailed {
+        format: "coreml".into(),
+        reason: format!("temporary weight storage: {error}"),
+    }
 }
 
 #[cfg(test)]

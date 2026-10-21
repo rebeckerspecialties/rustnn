@@ -614,8 +614,14 @@ impl CoremlMlProgramConverter {
             _ => None,
         };
         if let Some(mil_data_type) = blob_type.filter(|_| !operand.descriptor.shape.is_empty()) {
-            let offset =
-                weight_builder.add_weight(operand_id, mil_data_type, &constant_data.data)?;
+            let offset = if let Some(offset) = weight_builder.get_offset(operand_id) {
+                // The source compiler already validated and streamed this
+                // exact payload into its private file. Only its shape metadata
+                // remains in GraphInfo; no second tensor-sized allocation.
+                offset
+            } else {
+                weight_builder.add_weight(operand_id, mil_data_type, &constant_data.data)?
+            };
             let blob_file_value = Value {
                 doc_string: String::new(),
                 r#type: output_type.r#type.clone(),
@@ -5549,23 +5555,73 @@ impl super::GraphConverter for CoremlMlProgramConverter {
     }
 
     fn convert(&self, graph_info: &GraphInfo) -> Result<super::ConvertedGraph, GraphError> {
+        self.convert_graph(std::borrow::Cow::Borrowed(graph_info))
+    }
+}
+impl CoremlMlProgramConverter {
+    /// Consume a graph while exporting constants, releasing each source buffer
+    /// once its external blob has been written. The borrowed converter remains
+    /// available when the caller needs to retain the source graph.
+    pub fn convert_owned(&self, graph: GraphInfo) -> Result<super::ConvertedGraph, GraphError> {
+        self.convert_graph(std::borrow::Cow::Owned(graph))
+    }
+    /// Consume source constants into a private file instead of a second
+    /// model-sized heap allocation. The returned scratch storage stays local.
+    pub fn convert_owned_file_backed(
+        &self,
+        graph: GraphInfo,
+    ) -> Result<(Vec<u8>, super::CoremlWeightStorage), GraphError> {
+        let (data, weights) = self.convert_graph_storage(
+            std::borrow::Cow::Owned(graph),
+            super::WeightFileBuilder::file_backed()?,
+        )?;
+        Ok((data, weights.finalize_storage()))
+    }
+    fn convert_graph(
+        &self,
+        storage: std::borrow::Cow<'_, GraphInfo>,
+    ) -> Result<super::ConvertedGraph, GraphError> {
+        let (data, weights) =
+            self.convert_graph_storage(storage, super::WeightFileBuilder::new())?;
+        let weights_data = weights.has_weights().then(|| weights.finalize());
+        Ok(super::ConvertedGraph {
+            format: "coreml",
+            content_type: "application/x-coreml-model",
+            data,
+            weights_data,
+        })
+    }
+    fn convert_graph_storage(
+        &self,
+        mut storage: std::borrow::Cow<'_, GraphInfo>,
+        mut weight_builder: super::WeightFileBuilder,
+    ) -> Result<(Vec<u8>, super::WeightFileBuilder), GraphError> {
+        use std::borrow::Cow;
+        let owned_constants = match &mut storage {
+            Cow::Owned(graph) => Some(std::mem::take(&mut graph.constant_operand_ids_to_handles)),
+            _ => None,
+        };
+        let graph_info = storage.as_ref();
         if !crate::graph::dynamic_inputs_enabled() && graph_info.has_dynamic_dimensions() {
             return Err(GraphError::DynamicInputsFeatureDisabled);
         }
 
         // Create weight file builder for Float16 constants
-        let mut weight_builder = super::WeightFileBuilder::new();
         // Upper bound: every constant blob-written, plus a 64-byte metadata
         // block and up-to-64-byte alignment padding each. Reserved capacity is
         // virtual until written, so overshooting for immediate-value constants
         // costs nothing.
         weight_builder.reserve(
-            graph_info
-                .constant_operand_ids_to_handles
+            owned_constants
+                .as_ref()
+                .unwrap_or(&graph_info.constant_operand_ids_to_handles)
                 .values()
-                .map(|c| c.data.len() + 128)
+                // Owned lowering may repack transposed Int8 leaves and exact
+                // residuals next. Reserve address space up front so growth
+                // does not transiently copy a second model-sized buffer.
+                .map(|c| (c.data.len() + 128) * if owned_constants.is_some() { 2 } else { 1 })
                 .sum(),
-        );
+        )?;
 
         // Create MLProgram
         let mut program = Program {
@@ -5782,7 +5838,21 @@ impl super::GraphConverter for CoremlMlProgramConverter {
         }
 
         // Add constant operands as const operations
-        for (operand_id, constant_data) in &graph_info.constant_operand_ids_to_handles {
+        let consuming = owned_constants.is_some();
+        let constants: Box<dyn Iterator<Item = (u32, Cow<'_, crate::graph::ConstantData>)>> =
+            match owned_constants {
+                Some(c) => Box::new(c.into_iter().map(|(id, c)| (id, Cow::Owned(c)))),
+                None => Box::new(
+                    graph_info
+                        .constant_operand_ids_to_handles
+                        .iter()
+                        .map(|(&id, c)| (id, Cow::Borrowed(c))),
+                ),
+            };
+        let mut retained_constants = HashMap::new();
+        for (id, data) in constants {
+            let operand_id = &id;
+            let constant_data = data.as_ref();
             let operand =
                 graph_info
                     .operand(*operand_id)
@@ -5870,7 +5940,18 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                 )?;
                 main_block.operations.push(const_op);
             }
+            if consuming {
+                if weight_builder.get_offset(id).is_none() {
+                    retained_constants.insert(id, data.into_owned());
+                } else {
+                    drop(data);
+                }
+            }
         }
+        if let Cow::Owned(graph) = &mut storage {
+            graph.constant_operand_ids_to_handles = retained_constants;
+        }
+        let graph_info = storage.as_ref();
 
         // Operations that must be inserted right after the op that produces their input operand.
         // Keyed by the source operand_id.  Value = (transpose ops, transposed_name).
@@ -10585,19 +10666,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                 reason: format!("Failed to encode model: {}", e),
             })?;
 
-        // Finalize weight file if any weights were added
-        let weights_data = if weight_builder.has_weights() {
-            Some(weight_builder.finalize())
-        } else {
-            None
-        };
-
-        Ok(super::ConvertedGraph {
-            format: "coreml",
-            content_type: "application/x-coreml-model",
-            data: buffer,
-            weights_data,
-        })
+        Ok((buffer, weight_builder))
     }
 }
 
@@ -12865,6 +12934,72 @@ mod tests {
             strings.values.as_slice(),
             ["EXACT"],
             "mode must be the scalar string \"EXACT\" to match the WebNN spec default",
+        );
+    }
+
+    /// One float32 constant `c` added to an input, with sign, subnormal, NaN
+    /// payload and infinity bit patterns that must survive every storage path.
+    fn graph_with_bit_pattern_constant() -> GraphInfo {
+        use crate::mlcontext::{MLGraphBuilder, MLNamedOperands, MLOperandDescriptor};
+        use crate::operator_enums::MLOperandDataType;
+        let mut b = MLGraphBuilder::new_uncompiled();
+        let desc = MLOperandDescriptor::new(MLOperandDataType::Float32, vec![8]);
+        let bits = [
+            0u32, 0x80000000, 1, 0x007fffff, 0x7fc01234, 0x7f800000, 0xff800000, 0x3f800001,
+        ];
+        let bytes = bits
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let c = b.constant_from_bytes(&desc, bytes).unwrap();
+        let x = b.input("x", &desc).unwrap();
+        let y = b.add(x, c).unwrap();
+        b.finish_graph_info(&MLNamedOperands::from([("y", y)]))
+            .unwrap()
+    }
+
+    #[test]
+    fn consuming_and_file_backed_conversion_preserve_model_and_blobs() {
+        let g = graph_with_bit_pattern_constant();
+        let borrowed = CoremlMlProgramConverter.convert(&g).unwrap();
+        let owned = CoremlMlProgramConverter.convert_owned(g.clone()).unwrap();
+        let (data, storage) = CoremlMlProgramConverter
+            .convert_owned_file_backed(g)
+            .unwrap();
+        let expected = Model::decode(borrowed.data.as_slice()).unwrap();
+        assert_eq!(expected, Model::decode(owned.data.as_slice()).unwrap());
+        assert_eq!(expected, Model::decode(data.as_slice()).unwrap());
+        assert_eq!(borrowed.weights_data, owned.weights_data);
+        assert_eq!(borrowed.weights_data.unwrap().as_slice(), storage.as_ref());
+    }
+
+    #[test]
+    fn pre_streamed_constant_is_referenced_by_offset_without_a_second_write() {
+        // A source consumer streams a payload into the builder before
+        // conversion and leaves only the operand metadata in the graph. The
+        // converter must reuse that blob instead of reading or writing it again.
+        let mut g = graph_with_bit_pattern_constant();
+        let expected = CoremlMlProgramConverter.convert(&g).unwrap();
+        let (&id, constant) = g.constant_operand_ids_to_handles.iter_mut().next().unwrap();
+        let mut builder = super::super::WeightFileBuilder::file_backed().unwrap();
+        builder
+            .add_weight(
+                id,
+                super::super::weight_file_builder::blob_data_type::FLOAT32,
+                &constant.data,
+            )
+            .unwrap();
+        constant.data = Vec::new();
+        let (data, builder) = CoremlMlProgramConverter
+            .convert_graph_storage(std::borrow::Cow::Owned(g), builder)
+            .unwrap();
+        assert_eq!(
+            Model::decode(data.as_slice()).unwrap(),
+            Model::decode(expected.data.as_slice()).unwrap()
+        );
+        assert_eq!(
+            builder.finalize_storage().as_ref(),
+            expected.weights_data.unwrap().as_slice()
         );
     }
 }

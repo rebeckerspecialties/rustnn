@@ -14,6 +14,10 @@ use std::collections::HashMap;
 use crate::error::GraphError;
 use crate::graph::GraphInfo;
 
+/// Exact native blob compaction.
+pub mod coreml_assets;
+mod coreml_weight_storage;
+pub use coreml_weight_storage::CoremlWeightStorage;
 mod coreml_mlprogram;
 /// Explicit native MIL packed-weight scheduling; no host inference.
 pub mod coreml_packed;
