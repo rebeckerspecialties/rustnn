@@ -211,7 +211,12 @@ fn recognize_in(
     for (a, b) in [("x", "y"), ("y", "x")] {
         let Some(result) = (|| {
             let data = p.get(named_arg(mul, a)?)?;
-            let scale = p.get(named_arg(mul, b)?)?;
+            let mut scale = p.get(named_arg(mul, b)?)?;
+            // A float16 author may cast the scales after reshaping them (float32 scales
+            // of a Q8 table); look through a cast that lands in the chain's dtype.
+            if scale.r#type == "cast" && variable(scale.outputs.first()?)?.dtype == lane {
+                scale = p.get(named_arg(scale, "x")?)?;
+            }
             if data.r#type != "reshape" || scale.r#type != "reshape" {
                 return None;
             }
@@ -1615,11 +1620,8 @@ mod tests {
             .collect::<Vec<_>>();
         let scales = b
             .constant_from_bytes(
-                &MLOperandDescriptor::new(MLOperandDataType::Float16, vec![n as u64, 2]),
-                scale_values
-                    .iter()
-                    .flat_map(|&v| half::f16::from_f32(v).to_bits().to_le_bytes())
-                    .collect(),
+                &MLOperandDescriptor::new(MLOperandDataType::Float32, vec![n as u64, 2]),
+                scale_values.iter().flat_map(|v| v.to_le_bytes()).collect(),
             )
             .unwrap();
         let dims = |v: &[u32]| {
@@ -1630,8 +1632,10 @@ mod tests {
         let widened = b.cast(data, MLOperandDataType::Float16).unwrap();
         let centered = b.sub(widened, zero).unwrap();
         let grouped = b.reshape(centered, dims(&[n, 2, 32])).unwrap();
-        let scale_cast = b.cast(scales, MLOperandDataType::Float16).unwrap();
-        let scale_grouped = b.reshape(scale_cast, dims(&[n, 2, 1])).unwrap();
+        // Float32 scales reshaped first and cast after, as the float16 author emits for a
+        // Q8 table; the projection matrices use the cast-then-reshape order instead.
+        let scale_reshaped = b.reshape(scales, dims(&[n, 2, 1])).unwrap();
+        let scale_grouped = b.cast(scale_reshaped, MLOperandDataType::Float16).unwrap();
         let scaled = b.mul(grouped, scale_grouped).unwrap();
         let weight = b.reshape(scaled, dims(&[n, k])).unwrap();
         let transposed = b.transpose(weight).unwrap();
@@ -1725,10 +1729,13 @@ mod tests {
                 m::DataType::Float16
             );
         }
+        // The graph's own identity still names the closure's output; that name is now
+        // produced by an identity over the shared constant.
         let table_identity = producers["table"];
-        assert_eq!(table_identity.r#type, "identity");
+        let chain_output = producers[named_arg(table_identity, "x").unwrap()];
+        assert_eq!(chain_output.r#type, "identity");
         assert_eq!(
-            named_arg(table_identity, "x"),
+            named_arg(chain_output, "x"),
             Some(leaf.outputs[0].name.as_str())
         );
         assert!(
