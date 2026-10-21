@@ -23,6 +23,8 @@
 #include <stdio.h>
 #include <stdint.h>
 
+#include "coreml_pipeline.h"
+
 extern "C" {
 
 static void rustnn_copy_err(char *buf, size_t len, NSString *msg) {
@@ -98,6 +100,24 @@ int rustnn_coreml_load(void *compiled_url, void *config, void **out_model, char 
         rustnn_copy_err(err, err_len, @"caught non-Objective-C exception during CoreML load");
         return 3;
     }
+}
+
+// The plan is validated and serialized by Rust, never read from a model file.
+int rustnn_coreml_load_pipeline(void *compiled_url, void *config, const uint8_t *plan,
+    size_t plan_len, bool (*progress)(void *, size_t, size_t, bool), void *progress_context,
+    void **out_model, char *err, size_t err_len) {
+    *out_model = NULL;
+    @try {
+        NSError *error=nil;
+        NSDictionary *decoded=[NSJSONSerialization JSONObjectWithData:[NSData dataWithBytes:plan length:plan_len] options:0 error:&error];
+        RustNNPipeline *result=decoded ? rustnn_load_pipeline((__bridge NSURL *)compiled_url,
+            (__bridge MLModelConfiguration *)config, decoded, &error, progress, progress_context) : nil;
+        if (!result) { rustnn_copy_err(err, err_len, error.localizedDescription ?: @"Pipeline load failed"); return 1; }
+        *out_model=(__bridge_retained void *)result;
+        return 0;
+    } @catch (NSException *e) {
+        rustnn_copy_err(err, err_len, [NSString stringWithFormat:@"%@: %@", e.name, e.reason]); return 2;
+    } @catch (...) { rustnn_copy_err(err, err_len, @"Exception loading native pipeline"); return 3; }
 }
 
 // Run a prediction. On success `*out_provider` is a RETAINED output feature

@@ -3,6 +3,30 @@
 use crate::backend_selection::DeviceType;
 use crate::error::GraphError;
 
+/// Explicit CoreML scheduling permission for native applications.
+/// This is not an observation of accelerator placement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoremlComputeUnits {
+    /// Permit only CPU kernels.
+    CpuOnly,
+    /// Permit CPU and GPU kernels.
+    CpuAndGpu,
+    /// Permit CPU and Neural Engine kernels.
+    CpuAndNeuralEngine,
+    /// Permit all available CoreML execution devices.
+    All,
+}
+impl CoremlComputeUnits {
+    fn native(self) -> (i64, &'static str) {
+        match self {
+            Self::CpuOnly => (0, "CPU_ONLY"),
+            Self::CpuAndGpu => (1, "CPU_AND_GPU"),
+            Self::All => (2, "ALL"),
+            Self::CpuAndNeuralEngine => (3, "CPU_AND_NE"),
+        }
+    }
+}
+
 /// The CoreML loading route, not an execution device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CoremlLoadRoute {
@@ -51,6 +75,7 @@ pub(super) fn compute_unit_for_device(device: DeviceType) -> (i64, &'static str)
 
 pub(super) struct LoadTrace {
     preferred: (i64, &'static str),
+    allow_cpu_fallback: bool,
     failures: Vec<CoremlLoadFailure>,
 }
 
@@ -58,6 +83,15 @@ impl LoadTrace {
     pub(super) fn new(device: DeviceType) -> Self {
         Self {
             preferred: compute_unit_for_device(device),
+            allow_cpu_fallback: true,
+            failures: Vec::new(),
+        }
+    }
+
+    pub(super) fn strict(policy: CoremlComputeUnits) -> Self {
+        Self {
+            preferred: policy.native(),
+            allow_cpu_fallback: false,
             failures: Vec::new(),
         }
     }
@@ -82,7 +116,11 @@ impl LoadTrace {
         mut load: impl FnMut(i64) -> Result<T, String>,
     ) -> Result<(T, &'static str), GraphError> {
         let candidates = [self.preferred, (0, "CPU_ONLY")];
-        let count = if self.preferred.0 == 0 { 1 } else { 2 };
+        let count = if self.preferred.0 == 0 || !self.allow_cpu_fallback {
+            1
+        } else {
+            2
+        };
         let mut last_error = String::from("MLModel load failed");
         for &(code, name) in &candidates[..count] {
             match load(code) {
@@ -138,6 +176,28 @@ impl LoadTrace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_permissions_never_silently_fall_back() {
+        for policy in [
+            CoremlComputeUnits::CpuOnly,
+            CoremlComputeUnits::CpuAndGpu,
+            CoremlComputeUnits::All,
+            CoremlComputeUnits::CpuAndNeuralEngine,
+        ] {
+            let mut trace = LoadTrace::strict(policy);
+            let mut attempts = Vec::new();
+            assert!(
+                trace
+                    .policies::<()>(CoremlLoadRoute::RustExport, |code| {
+                        attempts.push(code);
+                        Err("rejected".into())
+                    })
+                    .is_err()
+            );
+            assert_eq!(attempts, vec![policy.native().0]);
+        }
+    }
 
     fn simulate(
         device: DeviceType,

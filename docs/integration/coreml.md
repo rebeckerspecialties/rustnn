@@ -189,3 +189,15 @@ relocating live spans and externalizing large immediate values; it does not
 quantize weights or change arithmetic. Borrowed conversion remains available.
 Peak setup memory still includes one source tensor and native compiler workspace.
 A scratch file and a smaller weight blob do not imply a process-memory bound.
+
+### Native feature-provider sessions
+
+`CoremlNativeSession` is an opt-in Apple provider API alongside the portable
+WebNN tensor interface. Native pipeline children forward retained `MLFeatureValue`
+objects through versioned slots and release intermediates after their last use.
+Repeated feature names do not overwrite retained earlier versions. No Rust
+arithmetic closure or intermediate readback is used; CoreML may still copy
+internally. Explicit `CoremlComputeUnits` permissions fail without retrying a
+CPU-only policy and do not prove actual placement. Setup-only load callbacks
+never inspect runtime tensors. Read terminal outputs only as the application
+requires. File-backed compiler storage is dropped before native preparation.
