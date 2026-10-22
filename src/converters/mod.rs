@@ -18,6 +18,7 @@ use crate::graph::GraphInfo;
 pub mod coreml_assets;
 mod coreml_weight_storage;
 pub use coreml_weight_storage::CoremlWeightStorage;
+mod coreml_constant_fold;
 /// Bounded pure-producer placement for explicit Watch source profiles.
 pub mod coreml_local_producers;
 mod coreml_mlprogram;
