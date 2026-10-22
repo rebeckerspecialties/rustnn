@@ -5915,6 +5915,11 @@ impl super::GraphConverter for CoremlMlProgramConverter {
         if !crate::graph::dynamic_inputs_enabled() && graph_info.has_dynamic_dimensions() {
             return Err(GraphError::DynamicInputsFeatureDisabled);
         }
+        // Fold transposes, reshapes and casts of constants into new constants first: the
+        // Neural Engine admits `matmul(x, const)` but not `matmul(x, transpose(const))`, and
+        // the literal lowering would also transpose the weight on every dispatch.
+        let folded = super::coreml_constant_fold::fold_constant_views(graph_info);
+        let graph_info = folded.as_ref().unwrap_or(graph_info);
         let lowering_graph = LoweringGraph::new(graph_info)?;
         let graph_info = &lowering_graph;
 

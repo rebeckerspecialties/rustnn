@@ -114,6 +114,15 @@ Rules that hold for every converter:
   A scalar result keeps the `[1]` CoreML boundary representation without changing the WebNN rank.
 - Float16 weights go to the weight blob written by `weight_file_builder.rs` and returned as
   `weights_data`.
+- `transpose`, `reshape` and `cast` of a constant are folded into a new constant before
+  emission (`coreml_constant_fold.rs`, applied to a copy of the graph at the start of
+  `convert`). The Neural Engine admits `matmul(x, const)` but refuses
+  `matmul(x, transpose(const))`, and a literal lowering would also transpose the weight on
+  every dispatch on the CPU and GPU paths; GPT-Neo style graphs carry one such transpose per
+  projection. The folded operand keeps its index and name, graph inputs and outputs are never
+  rewritten, a constant with other consumers keeps its payload, and chains fold in one pass.
+  Four-bit constants and casts that WebNN leaves implementation-defined (a float whose
+  truncation does not fit the integer target, or NaN) stay in the graph.
 - WebNN names need not be MIL identifiers, and its input/output namespaces are independent.
   Unsafe or colliding names receive unique physical identifiers. Creator-defined
   `rustnn.webnn.input_aliases` and `rustnn.webnn.output_aliases` JSON mappings preserve
