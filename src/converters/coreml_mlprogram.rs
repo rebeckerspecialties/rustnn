@@ -5595,6 +5595,11 @@ impl CoremlMlProgramConverter {
             .flat_map(|op| op.input_operands().into_iter().skip(1))
             .collect::<std::collections::HashSet<_>>();
         let mut builder = super::WeightFileBuilder::file_backed()?;
+        // Transposes of single-use weight constants fold while the weights stream in: the
+        // bytes are permuted and registered under the transpose's output, so the consumer
+        // reaches Core ML as matmul(x, const), which the Neural Engine admits.
+        let transpose_plans = super::coreml_constant_fold::plan_transposes(&graph);
+        let mut folded_transposes = std::collections::HashSet::new();
         resolve_external_weights_with_consumer(
             &mut source,
             path,
@@ -5632,9 +5637,17 @@ impl CoremlMlProgramConverter {
                             "constant {name} byte extent does not match its descriptor"
                         )));
                     }
-                    builder
-                        .add_weight(id, dtype, &bytes)
-                        .map_err(|e| fail(e.to_string()))?;
+                    if let Some(plan) = transpose_plans.get(&id) {
+                        let permuted = super::coreml_constant_fold::permute_for_plan(&bytes, plan);
+                        builder
+                            .add_weight(plan.output, dtype, &permuted)
+                            .map_err(|e| fail(e.to_string()))?;
+                        folded_transposes.insert(id);
+                    } else {
+                        builder
+                            .add_weight(id, dtype, &bytes)
+                            .map_err(|e| fail(e.to_string()))?;
+                    }
                 } else {
                     graph
                         .constant_operand_ids_to_handles
@@ -5647,6 +5660,11 @@ impl CoremlMlProgramConverter {
         )
         .map_err(crate::loader::map_weight_resolve_error)?;
         drop(source);
+        super::coreml_constant_fold::apply_transpose_plans(
+            &mut graph,
+            &transpose_plans,
+            &folded_transposes,
+        );
         let (data, weights) =
             self.convert_graph_storage(std::borrow::Cow::Owned(graph), builder)?;
         Ok((data, weights.finalize_storage()))
@@ -5689,6 +5707,25 @@ impl CoremlMlProgramConverter {
         mut weight_builder: super::WeightFileBuilder,
     ) -> Result<(Vec<u8>, super::WeightFileBuilder), GraphError> {
         use std::borrow::Cow;
+        // Fold transposes, reshapes and casts of constants into new constants first: the
+        // Neural Engine admits `matmul(x, const)` but not `matmul(x, transpose(const))`, and
+        // the literal lowering would also transpose the weight on every dispatch. The owned
+        // (file-backed) path folds in place so no model-sized payload is cloned.
+        // Transposes only: the projection pass that follows recognizes dequantization chains by
+        // their `reshape` and `cast` of scale constants, which a fold would erase.
+        let scope = super::coreml_constant_fold::FoldScope::TransposesOnly;
+        match &mut storage {
+            Cow::Owned(graph) => {
+                super::coreml_constant_fold::fold_in_place_with(graph, scope);
+            }
+            Cow::Borrowed(graph) => {
+                if let Some(folded) =
+                    super::coreml_constant_fold::fold_constant_views_with(graph, scope)
+                {
+                    storage = Cow::Owned(folded);
+                }
+            }
+        }
         let owned_constants = match &mut storage {
             Cow::Owned(graph) => Some(std::mem::take(&mut graph.constant_operand_ids_to_handles)),
             _ => None,

@@ -114,6 +114,16 @@ Rules that hold for every converter:
   A scalar result keeps the `[1]` CoreML boundary representation without changing the WebNN rank.
 - Float16 weights go to the weight blob written by `weight_file_builder.rs` and returned as
   `weights_data`.
+- `transpose`, `reshape` and `cast` of a constant are folded into a new constant before
+  emission (`coreml_constant_fold.rs`, applied to a copy of the graph at the start of
+  `convert`). The Neural Engine admits `matmul(x, const)` but refuses
+  `matmul(x, transpose(const))`, and a literal lowering would also transpose the weight on
+  every dispatch on the CPU and GPU paths; GPT-Neo style graphs carry one such transpose per
+  projection. The folded operand keeps its index and name, graph inputs and outputs are never
+  rewritten, a constant with other consumers keeps its payload, and chains fold in one pass.
+  Narrow integer constants (8-bit and 4-bit, the quantized weights whose casts and reshapes
+  are the dequantization chains later passes recognize), and casts that WebNN leaves implementation-defined (a float whose
+  truncation does not fit the integer target, or NaN) stay in the graph.
 - The internal `shape` extension lowers to MIL `shape`, retaining its native int32 result
   inside CoreML and widening the public int64 result at readback. Imported shape tensors
   retain their type and rank through the shared `unsqueeze` inference path.
