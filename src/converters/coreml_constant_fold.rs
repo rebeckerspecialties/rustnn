@@ -125,6 +125,12 @@ fn fold_one(graph: &GraphInfo, operation: &Operation) -> Option<(u32, u32, Vec<u
     if source.kind != OperandKind::Constant || destination.kind != OperandKind::Intermediate {
         return None;
     }
+    // Narrow integer constants are quantized weights: their casts, reshapes and transposes
+    // are the dequantization chains that later lowering recognizes (and a folded cast would
+    // store the widened payload). Leave them for those passes.
+    if is_quantized_storage(source.descriptor.data_type) {
+        return None;
+    }
     if !source.descriptor.pending_permutation.is_empty()
         || !destination.descriptor.pending_permutation.is_empty()
     {
@@ -196,6 +202,13 @@ fn fold_one(graph: &GraphInfo, operation: &Operation) -> Option<(u32, u32, Vec<u
         _ => return None,
     };
     Some((input, output, payload))
+}
+
+fn is_quantized_storage(data_type: DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int8 | DataType::Uint8 | DataType::Int4 | DataType::Uint4
+    )
 }
 
 fn is_packed(data_type: DataType) -> bool {
@@ -409,6 +422,49 @@ mod tests {
             .chunks_exact(2)
             .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
             .collect()
+    }
+
+    #[test]
+    fn narrow_integer_constants_are_left_for_the_dequantization_passes() {
+        let mut graph = GraphInfo {
+            operands: vec![
+                operand(OperandKind::Constant, DataType::Int8, &[4, 2], "w"),
+                operand(OperandKind::Intermediate, DataType::Float32, &[4, 2], "w32"),
+                operand(OperandKind::Intermediate, DataType::Int8, &[2, 4], "wT"),
+                operand(OperandKind::Output, DataType::Float32, &[4, 2], "y"),
+            ],
+            output_operands: vec![3],
+            operations: vec![
+                Operation::Cast {
+                    input: 0,
+                    data_type: MLOperandDataType::Float32,
+                    options: None,
+                    outputs: vec![1],
+                },
+                Operation::Transpose {
+                    input: 0,
+                    options: Some(MLTransposeOptions {
+                        label: "t".into(),
+                        permutation: vec![1, 0],
+                    }),
+                    outputs: vec![2],
+                },
+                Operation::Identity {
+                    input: 1,
+                    options: None,
+                    outputs: vec![3],
+                },
+            ],
+            ..Default::default()
+        };
+        graph.constant_operand_ids_to_handles.insert(
+            0,
+            ConstantData {
+                data: vec![1, 2, 3, 4, 5, 6, 7, 8],
+                label: Some("w".into()),
+            },
+        );
+        assert!(fold_constant_views(&graph).is_none());
     }
 
     /// `x: [1, 256]` input, `w: [256, 256]` float16 constant, `matmul(x, transpose(w))`.
