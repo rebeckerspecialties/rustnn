@@ -38,7 +38,7 @@
 //! Chains fold in one ordered pass because operations are recorded topologically: once
 //! `cast(const)` has become a constant, a later `transpose` of it is a transpose of a constant.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::graph::{ConstantData, DataType, Dimension, GraphInfo, OperandKind};
 use crate::operators::Operation;
@@ -115,6 +115,140 @@ pub(crate) fn fold_in_place_with(folded: &mut GraphInfo, scope: FoldScope) -> bo
     }
     folded.operations = kept;
     changed
+}
+
+/// A transpose of a single-use constant whose payload lives outside the graph (the file-backed
+/// source path streams large weights straight into the weight file): the caller permutes the
+/// bytes as it consumes them and registers the blob under `output`, then applies the plan.
+#[derive(Clone, Debug)]
+pub(crate) struct TransposePlan {
+    pub(crate) output: u32,
+    pub(crate) shape: Vec<u32>,
+    pub(crate) permutation: Vec<usize>,
+    pub(crate) element_size: usize,
+}
+
+/// Plans keyed by the constant's operand id, for transposes the fold would perform if it had
+/// the payload: single-use constant input, static shapes, same type, a valid permutation,
+/// an intermediate output that is not a graph output, no narrow-integer or packed type.
+pub(crate) fn plan_transposes(graph: &GraphInfo) -> HashMap<u32, TransposePlan> {
+    let mut use_count: HashMap<u32, usize> = HashMap::new();
+    for operation in &graph.operations {
+        for id in operation
+            .input_operands()
+            .into_iter()
+            .chain(operation.option_operands())
+        {
+            *use_count.entry(id).or_default() += 1;
+        }
+    }
+    for &id in &graph.output_operands {
+        *use_count.entry(id).or_default() += 1;
+    }
+    let mut plans = HashMap::new();
+    for operation in &graph.operations {
+        let Operation::Transpose {
+            input,
+            options,
+            outputs,
+        } = operation
+        else {
+            continue;
+        };
+        let [output] = outputs.as_slice() else {
+            continue;
+        };
+        if use_count.get(input).copied() != Some(1)
+            || graph.output_operands.contains(output)
+            || graph.input_operands.contains(output)
+        {
+            continue;
+        }
+        let (Some(source), Some(destination)) = (graph.operand(*input), graph.operand(*output))
+        else {
+            continue;
+        };
+        if source.kind != OperandKind::Constant
+            || destination.kind != OperandKind::Intermediate
+            || !graph.constant_operand_ids_to_handles.contains_key(input)
+            || is_quantized_storage(source.descriptor.data_type)
+            || is_packed(source.descriptor.data_type)
+            || source.descriptor.data_type != destination.descriptor.data_type
+            || !source.descriptor.pending_permutation.is_empty()
+            || !destination.descriptor.pending_permutation.is_empty()
+        {
+            continue;
+        }
+        let (Some(shape), Some(destination_shape)) = (
+            source.descriptor.static_shape(),
+            destination.descriptor.static_shape(),
+        ) else {
+            continue;
+        };
+        let rank = shape.len();
+        let permutation: Vec<usize> = match options.as_ref().map(|o| o.permutation.as_slice()) {
+            Some(permutation) if !permutation.is_empty() => {
+                permutation.iter().map(|&axis| axis as usize).collect()
+            }
+            _ => (0..rank).rev().collect(),
+        };
+        if !is_permutation(&permutation, rank) {
+            continue;
+        }
+        let permuted: Vec<u32> = permutation.iter().map(|&p| shape[p]).collect();
+        if permuted != destination_shape {
+            continue;
+        }
+        plans.insert(
+            *input,
+            TransposePlan {
+                output: *output,
+                shape,
+                permutation,
+                element_size: source.descriptor.data_type.bytes_per_element(),
+            },
+        );
+    }
+    plans
+}
+
+/// Apply the structural half of the plans whose payloads the caller has already permuted and
+/// registered under the output id: the output becomes a constant (with the input's label and
+/// an empty in-graph payload, the blob being in the weight file), the input's entry goes, and
+/// the transpose is removed.
+pub(crate) fn apply_transpose_plans(
+    graph: &mut GraphInfo,
+    plans: &HashMap<u32, TransposePlan>,
+    applied: &HashSet<u32>,
+) {
+    if applied.is_empty() {
+        return;
+    }
+    for (&input, plan) in plans {
+        if !applied.contains(&input) {
+            continue;
+        }
+        let label = graph
+            .constant_operand_ids_to_handles
+            .remove(&input)
+            .and_then(|constant| constant.label);
+        graph.operands[plan.output as usize].kind = OperandKind::Constant;
+        graph.constant_operand_ids_to_handles.insert(
+            plan.output,
+            ConstantData {
+                data: Vec::new(),
+                label,
+            },
+        );
+    }
+    graph.operations.retain(|operation| {
+        !matches!(operation, Operation::Transpose { input, .. } if applied.contains(input))
+    });
+}
+
+/// Permute a constant payload for a planned transpose.
+pub(crate) fn permute_for_plan(data: &[u8], plan: &TransposePlan) -> Vec<u8> {
+    transpose_bytes(data, &plan.shape, &plan.permutation, plan.element_size)
 }
 
 fn in_scope(operation: &Operation, scope: FoldScope) -> bool {
