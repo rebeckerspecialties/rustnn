@@ -5,7 +5,7 @@
 | Tool | Notes |
 |---|---|
 | Rust | `rust-toolchain.toml` pins the channel (1.97.0 at the time of writing) with `rustfmt` and `clippy`; rustup installs it on first use. The CI workflows pin the same version, so bump them together |
-| `protoc` | Required: `build.rs` compiles the ONNX and CoreML protobuf schemas. Linux `apt-get install protobuf-compiler`, macOS `brew install protobuf`, Windows `winget install Google.Protobuf` |
+| `protoc` | Required: `build.rs` compiles the CoreML protobuf schemas, and `webnn-onnx-utils` the ONNX one (default `onnx` feature). Linux `apt-get install protobuf-compiler`, macOS `brew install protobuf`, Windows `winget install Google.Protobuf` |
 | `flatc` | Required for `litert-runtime` (TFLite schema). CI downloads the flatbuffers release binary; macOS `brew install flatbuffers` |
 | Node.js | WPT corpus fetch and evaluation (`scripts/fetch_wpt.mjs`, `scripts/wpt_bridge/`) |
 | Python 3 | Only for MkDocs (`pip install -r docs/requirements.txt`) and `scripts/generate_backend_operator_report.py` |
@@ -33,6 +33,10 @@ The default build needs no native runtime beyond the prerequisites above.
 The mock backend features and `dynamic-inputs`, `native-examples`, `pollster`, and
 `zstd-cache-compression` do not add external runtime prerequisites.
 
+The default `cli` feature builds the `rustnn` binary and pulls in `clap` and
+`tracing-subscriber`, and enables `onnx` for CLI conversion. Library consumers can drop
+these with `default-features = false`.
+
 ## Build and test
 
 Use the Makefile targets; they set feature flags and environment variables consistently.
@@ -52,7 +56,7 @@ Use the Makefile targets; they set feature flags and environment variables consi
 | `coreml`, `coreml-validate` | CoreML conversion and execution (macOS) |
 | `benchmark-coreml-kv` | Self-contained attention/cache comparison; optionally set `COREML_KV_CONFIG` for an external model/reference fixture; see [Examples](../user-guide/examples.md#coreml-kv-cache-benchmark) |
 | `test-coreml-kv-benchmark` | Oracle and cache-content regressions for all storage modes, without external fixtures; run in macOS CI |
-| `build-coreml`, `test-coreml` | Build all targets; run library and ordinary integration tests. `COREML_FEATURES=coreml-runtime` also checks the build without dynamic inputs |
+| `build-coreml`, `test-coreml` | Build all targets; run library and ordinary integration tests, including CLI execution. Both explicitly enable `cli`. `COREML_FEATURES=coreml-runtime` also checks the build without dynamic inputs |
 | `test-coreml-gather` | Focused active-dimension gather regressions, including scalar indices; `TEST_FILTER` selects a test |
 | `test-coreml-dtypes` | Focused numeric boundary regressions for typed dispatch and the convenience API; CI runs with and without dynamic inputs |
 | `test-coreml-tensor-reuse` | Retained storage ownership, type conversion and shape regressions; CI runs with and without dynamic inputs |
