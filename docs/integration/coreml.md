@@ -48,19 +48,54 @@ establishes placement, energy savings or prediction-time fallback; use separate 
    lowered explicitly because MIL has no direct equivalent.
 2. Non-scalar float16, float32, int8 and uint8 constants are written to a separate shared weights
    blob (`ConvertedGraph::weights_data`), which also keeps the original bytes of constants that
-   outputs copy (see Tensor names below). Arithmetic and typed boundaries compile locally from a
-   URL: the in-memory route changes represented values on multiple tested CoreML stacks.
-   Input-free single programs consisting entirely of proven constant copies prefer the in-memory
-   asset route to avoid a BNNS URL constant-fold crash. Narrowing, arithmetic and mixed computed
-   outputs cannot take this exception. Neither route forces CPU-only execution.
-   Real precision boundaries are materialized as native Pipeline children where needed.
-   The children expose live values only and reuse the original weight storage; the public
-   WebNN graph, types and shapes are unchanged.
+   outputs copy (see Tensor names below). The in-memory and URL compile routes do not produce
+   identical results for every program, and neither is uniformly closer to WebNN, so the route
+   follows the float16 lowering. With `Native`, the model is packaged as an in-memory asset
+   together with that blob, and graphs with a reproduced difference compile from a temporary
+   directory's URL instead (`supports_in_memory_asset`): `gather` with a rank-0 index, int32
+   `neg`, int32 off-diagonal `triangular`, `convTranspose2d`, and `instanceNormalization` with
+   zero epsilon. With `Exact`, graphs compile from a URL, the route through which its float16
+   guarantees were qualified: in memory, widened float16 subtraction loses NaN classes under a
+   CPU and Neural Engine request. Input-free programs made entirely of proven constant copies
+   stay in memory with either lowering, because the URL compiler can crash in BNNS for such
+   data-free programs under a CPU and Neural Engine request. Neither route forces CPU-only
+   execution.
+   With [`CoremlFloat16Precision::Exact`](#float16-precision), explicit float16 rounding
+   boundaries are materialized as native Pipeline children, and with either lowering a
+   `layerNormalization` over nontrailing axes keeps its affine work in its own child. The
+   children expose live values only and reuse the original weight storage; the public WebNN
+   graph, types and shapes are unchanged.
 3. `MLGraphBuilder::build` compiles the model with `MLModel` and keeps the compiled model;
    `dispatch` binds `MLMultiArray`s over the tensor storage and runs a prediction.
 4. The legacy CLI path (`--convert coreml --run-coreml`) passes that blob to the one-shot
    executor, tries the compute-unit configurations in turn and reports each attempt;
    `--coreml-compiled-output <dir>` stores the compiled `.mlmodelc` for reuse.
+
+## Float16 precision
+
+WebNN leaves the accumulation precision of float16 operations to the implementation
+([webmachinelearning/webnn#948](https://github.com/webmachinelearning/webnn/issues/948)), and
+whether represented subnormals must survive is open
+([webmachinelearning/webnn#967](https://github.com/webmachinelearning/webnn/issues/967)). Core ML
+uses that freedom differently per compute unit and chip, so the converter offers two lowerings,
+selected with `RustNNOptions::coreml.float16_precision`:
+
+- `Native` (default) lowers float16 to native float16 MIL kernels. It adds no operations, keeps
+  one MIL program and is the only form the Neural Engine can execute. In the CoreML WPT corpus
+  on an M4 Max (macOS 27.2), CPU requests pass every float16 trial and GPU requests fail only
+  the `resample2d` nearest-neighbour ties they share with float32. Neural Engine requests fail
+  some float16 trials: arg reductions, widening of subnormals, `elu`, `l2Pool2d` and
+  `roundEven` ties.
+- `Exact` keeps float16 storage but evaluates float16 arithmetic, activations, normalization and
+  data movement in float32, rounding once at each WebNN result, and materializes explicit
+  float16 rounding boundaries as Pipeline children. In the same WPT corpus it passes every
+  trial under CPU, GPU and Neural Engine requests, and on A12 and A10X it removed every native
+  float16 GELU failure under all three. The cost is more operations, Pipelines, URL compilation
+  and longer builds. Float32 work is not eligible for the Neural Engine, so under a Neural
+  Engine request `Exact` gets its values by running that work elsewhere.
+
+`docs/development/converters.md` lists the lowering rules for both. The WPT harness selects the
+lowering with `WPT_COREML_FLOAT16=native|exact` and the device with `WPT_COREML_DEVICE`.
 
 ## Tensor names
 
@@ -169,14 +204,15 @@ These count rustnn-side work, not total memory traffic or internal CoreML alloca
 reported compute-unit policy includes load fallback but does not measure accelerator
 placement. Take counter differences around the decode loop to exclude prefill and setup.
 
-Native precision Pipelines retain input tensor storage but copy returned outputs.
+Precision Pipelines (the `Exact` float16 lowering, and the explicit LayerNorm affine child for
+nontrailing axes) retain input tensor storage but copy returned outputs.
 CoreML applies the outer output-backing names while evaluating earlier children,
 which reject final features absent from their own descriptions. Backings are therefore
 proposed only for a single MLProgram, even when a Pipeline's source graph is static.
 
 ## Converter-private input views
 
-Precision lowerings can request a compact native Half input through creator-defined
+The `Exact` float16 lowering can request a compact native Half input through creator-defined
 `rustnn.webnn.compact_input_views` metadata: a JSON array of `{source, view}` bindings
 between declared physical input features. These are backend details, not additional
 WebNN inputs; the original graph, logical dtype and shape remain unchanged.
@@ -201,6 +237,7 @@ make wpt-sync-coreml              # regenerate tests/wpt_conformance/coreml_expe
 make test-coreml                  # unit and integration tests
 WPT_COREML_TENSOR_MODE=persistent make test-wpt-coreml
 WPT_COREML_TENSOR_MODE=backings make test-wpt-coreml
+WPT_COREML_FLOAT16=exact WPT_COREML_DEVICE=gpu make test-wpt-coreml   # Exact lowering, GPU request
 ```
 
 CoreML has no PASS snapshots; failing trials are listed in

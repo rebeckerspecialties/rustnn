@@ -293,6 +293,10 @@ impl CoremlMlProgramConverter {
 struct LoweringGraph<'a> {
     graph: &'a GraphInfo,
     names: Vec<String>,
+    /// `CoremlFloat16Precision::Exact`: float16 arithmetic, activations, normalization and
+    /// transport are evaluated in float32 and explicit float16 boundaries are materialized.
+    /// Otherwise float16 lowers to native float16 MIL kernels.
+    exact_float16: bool,
 }
 
 impl<'a> LoweringGraph<'a> {
@@ -363,6 +367,7 @@ impl<'a> LoweringGraph<'a> {
             names: physical_operand_names(
                 (0..graph.operands.len()).map(|id| logical_operand_name(graph, id as u32)),
             ),
+            exact_float16: false,
         })
     }
 }
@@ -452,6 +457,27 @@ fn equivalent_output_names(graph: &LoweringGraph<'_>) -> HashMap<String, String>
         .collect()
 }
 mod precision;
+
+/// Whether a layerNormalization normalizes the trailing axes in ascending order, the layout
+/// in which MIL `layer_norm` applies constant `gamma`/`beta` exactly as WebNN's scale and
+/// bias. Omitted axes default to every axis after the first, which is trailing.
+fn layer_norm_has_trailing_axes(graph: &GraphInfo, operation: &Operation) -> bool {
+    let Operation::LayerNormalization { input, options, .. } = operation else {
+        return false;
+    };
+    let Some(axes) = options.as_ref().and_then(|options| options.axes.as_ref()) else {
+        return true;
+    };
+    let rank = graph
+        .operand(*input)
+        .map_or(0, |operand| operand.descriptor.shape.len());
+    !axes.is_empty()
+        && rank.checked_sub(axes.len()).is_some_and(|start| {
+            axes.iter()
+                .enumerate()
+                .all(|(index, &axis)| axis as usize == start + index)
+        })
+}
 
 /// Convert zero_point byte data from a source dtype to a target dtype.
 /// Only Int32 → Uint8 and Int32 → Int8 are supported; all other pairs are returned as-is.
@@ -1781,9 +1807,11 @@ impl CoremlMlProgramConverter {
         ));
     }
 
-    /// MIL round uses away-from-zero ties on some GPU kernels. Compute the
-    /// nearest integer explicitly, incrementing a tie only when floor(x) is odd.
-    /// FP32 evaluation also keeps FP16 subnormals visible to the comparisons.
+    /// MIL round uses away-from-zero ties on GPU and Neural Engine kernels. Compute
+    /// the nearest integer explicitly, incrementing a tie only when floor(x) is odd.
+    /// Every step is exact in the input type, so native float16 evaluates in float16;
+    /// exact float16 evaluates in float32, which also keeps subnormals visible to the
+    /// comparisons on paths that flush them.
     fn emit_round_even(
         graph: &LoweringGraph<'_>,
         block: &mut Block,
@@ -1830,14 +1858,26 @@ impl CoremlMlProgramConverter {
             tensor.data_type = dtype;
             value
         };
-        let fp32 = MilType::Float32 as i32;
-        let x = if dtype == fp32 {
+        let work = if dtype == MilType::Float16 as i32 && !graph.exact_float16 {
+            dtype
+        } else {
+            MilType::Float32 as i32
+        };
+        let immediate = |value: f32| {
+            if work == MilType::Float16 as i32 {
+                Self::create_immediate_float16(value)
+            } else {
+                Self::create_immediate_float(value)
+            }
+        };
+        // `work` is float32 unless native float16 evaluates in place.
+        let x = if dtype == work {
             input
         } else {
             let name = fresh("wide");
             block.operations.push(Self::create_cast_operation(
                 input,
-                typed(name.clone(), fp32),
+                typed(name.clone(), work),
                 "fp32",
             ));
             name
@@ -1856,46 +1896,40 @@ impl CoremlMlProgramConverter {
             name
         };
         let named = |name: &str| Self::create_name_argument(name.into());
-        let floor = emit(block, "floor", "floor", fp32, vec![("x", named(&x))]);
+        let floor = emit(block, "floor", "floor", work, vec![("x", named(&x))]);
         let fraction = emit(
             block,
             "sub",
             "fraction",
-            fp32,
+            work,
             vec![("x", named(&x)), ("y", named(&floor))],
         );
         let half_floor = emit(
             block,
             "mul",
             "half_floor",
-            fp32,
-            vec![
-                ("x", named(&floor)),
-                ("y", Self::create_immediate_float(0.5)),
-            ],
+            work,
+            vec![("x", named(&floor)), ("y", immediate(0.5))],
         );
         let pairs = emit(
             block,
             "floor",
             "pairs",
-            fp32,
+            work,
             vec![("x", named(&half_floor))],
         );
         let paired = emit(
             block,
             "mul",
             "paired",
-            fp32,
-            vec![
-                ("x", named(&pairs)),
-                ("y", Self::create_immediate_float(2.0)),
-            ],
+            work,
+            vec![("x", named(&pairs)), ("y", immediate(2.0))],
         );
         let parity = emit(
             block,
             "sub",
             "parity",
-            fp32,
+            work,
             vec![("x", named(&floor)), ("y", named(&paired))],
         );
         let boolean = MilType::Bool as i32;
@@ -1904,30 +1938,21 @@ impl CoremlMlProgramConverter {
             "greater",
             "above",
             boolean,
-            vec![
-                ("x", named(&fraction)),
-                ("y", Self::create_immediate_float(0.5)),
-            ],
+            vec![("x", named(&fraction)), ("y", immediate(0.5))],
         );
         let tie = emit(
             block,
             "equal",
             "tie",
             boolean,
-            vec![
-                ("x", named(&fraction)),
-                ("y", Self::create_immediate_float(0.5)),
-            ],
+            vec![("x", named(&fraction)), ("y", immediate(0.5))],
         );
         let odd = emit(
             block,
             "equal",
             "odd",
             boolean,
-            vec![
-                ("x", named(&parity)),
-                ("y", Self::create_immediate_float(1.0)),
-            ],
+            vec![("x", named(&parity)), ("y", immediate(1.0))],
         );
         let odd_tie = emit(
             block,
@@ -1943,12 +1968,12 @@ impl CoremlMlProgramConverter {
             boolean,
             vec![("x", named(&above)), ("y", named(&odd_tie))],
         );
-        let next = emit(block, "ceil", "next", fp32, vec![("x", named(&x))]);
+        let next = emit(block, "ceil", "next", work, vec![("x", named(&x))]);
         let rounded = emit(
             block,
             "select",
             "rounded",
-            fp32,
+            work,
             vec![
                 ("cond", named(&increment)),
                 ("a", named(&next)),
@@ -1958,7 +1983,11 @@ impl CoremlMlProgramConverter {
         block.operations.push(Self::create_cast_operation(
             rounded,
             output,
-            if dtype == fp32 { "fp32" } else { "fp16" },
+            if dtype == MilType::Float32 as i32 {
+                "fp32"
+            } else {
+                "fp16"
+            },
         ));
     }
 
@@ -2115,9 +2144,14 @@ impl CoremlMlProgramConverter {
                         .insert("y".into(), Self::create_immediate_float(1.0));
                 }
             }
-            // Repeated concat/scatter inputs share one promotion in this op.
+            // Repeated concat/scatter inputs share one promotion in this op. Inputs
+            // are visited in name order: MIL keeps them in a HashMap, and the order of
+            // the emitted casts decides which Pipeline child a constant widening joins.
             let mut promoted = HashMap::<String, String>::new();
-            for argument in operation.inputs.values_mut() {
+            let mut input_names: Vec<String> = operation.inputs.keys().cloned().collect();
+            input_names.sort_unstable();
+            for input_name in input_names {
+                let argument = operation.inputs.get_mut(&input_name).unwrap();
                 for binding in &mut argument.arguments {
                     if let Some(Binding::Name(name)) = &mut binding.binding
                         && let Some(value_type) = types.get(name)
@@ -5161,10 +5195,21 @@ impl CoremlMlProgramConverter {
                     inputs.insert("y".to_string(), Self::create_argument(&input_names[0]));
                 }
                 // MIL inverse loses the sign of -0 on older CoreML stacks,
-                // even with epsilon=-0. Division implements WebNN's 1/x.
+                // even with epsilon=-0. Division implements WebNN's 1/x. Native
+                // float16 divides in float16; exact float16 widens the operand.
+                let native_half = !graph.exact_float16
+                    && op
+                        .input_operands()
+                        .first()
+                        .and_then(|&id| graph.operand(id))
+                        .is_some_and(|operand| operand.descriptor.data_type == DataType::Float16);
                 inputs.insert(
                     "x".to_string(),
-                    Self::create_immediate_float(1.0),
+                    if native_half {
+                        Self::create_immediate_float16(1.0)
+                    } else {
+                        Self::create_immediate_float(1.0)
+                    },
                 );
             }
 
@@ -6464,24 +6509,29 @@ impl CoremlMlProgramConverter {
             &graph.operations,
             weights,
         )?;
-        Self::fold_constant_half_casts(graph, &mut model, weights)?;
-        let promoted =
-            if let Some(crate::protos::coreml::specification::model::Type::MlProgram(program)) =
-                &mut model.r#type
-            {
-                let function = program.functions.get_mut("main").unwrap();
-                let mut block = function
-                    .block_specializations
-                    .remove(&function.opset)
-                    .unwrap();
-                let promoted = Self::preserve_float16_transport(function, &mut block);
-                function
-                    .block_specializations
-                    .insert(function.opset.clone(), block);
-                promoted
-            } else {
-                std::collections::HashSet::new()
-            };
+        if graph.exact_float16 {
+            // Exact float16 rounds constant narrowings on the host; native float16
+            // leaves them to Core ML, as before.
+            Self::fold_constant_half_casts(graph, &mut model, weights)?;
+        }
+        let promoted = if !graph.exact_float16 {
+            std::collections::HashSet::new()
+        } else if let Some(crate::protos::coreml::specification::model::Type::MlProgram(program)) =
+            &mut model.r#type
+        {
+            let function = program.functions.get_mut("main").unwrap();
+            let mut block = function
+                .block_specializations
+                .remove(&function.opset)
+                .unwrap();
+            let promoted = Self::preserve_float16_transport(function, &mut block);
+            function
+                .block_specializations
+                .insert(function.opset.clone(), block);
+            promoted
+        } else {
+            std::collections::HashSet::new()
+        };
         self.materialize_precision_boundaries(graph, model, &promoted)
     }
 
@@ -7077,10 +7127,9 @@ impl CoremlMlProgramConverter {
 
             if let Operation::Sign { input, .. } = op
                 && graph_info.operand(*input).is_some_and(|value| {
-                    matches!(
-                        value.descriptor.data_type,
-                        DataType::Float16 | DataType::Float32
-                    )
+                    value.descriptor.data_type == DataType::Float32
+                        || (graph_info.exact_float16
+                            && value.descriptor.data_type == DataType::Float16)
                 })
             {
                 // WebNN sign(NaN) is zero; some native CPU sign kernels return NaN.
@@ -7203,10 +7252,11 @@ impl CoremlMlProgramConverter {
                 continue;
             }
 
-            // The half kernels below exceed WebNN's error bounds on older
-            // accelerator paths, including flushing represented subnormals.
-            // Evaluate the entire activation in fp32 and round once at its
-            // fp16 boundary; retain fp16 storage and CoreML device selection.
+            // Exact float16 only. The half kernels below exceed WebNN's error
+            // bounds on older accelerator paths, including flushing represented
+            // subnormals. Compute is float32: the activation is evaluated in
+            // float32 and rounded once at its float16 result. Storage stays
+            // float16 and the compute units requested are unchanged.
             let wide_activation_input = match op {
                 Operation::Gelu { input, .. }
                 | Operation::Sigmoid { input, .. }
@@ -7222,6 +7272,7 @@ impl CoremlMlProgramConverter {
                 _ => None,
             };
             if let Some(input) = wide_activation_input
+                && graph_info.exact_float16
                 && graph_info
                     .operand(input)
                     .is_some_and(|operand| operand.descriptor.data_type == DataType::Float16)
@@ -7523,6 +7574,7 @@ impl CoremlMlProgramConverter {
                 // Inspect represented Half NaN/infinity values in FP32, using
                 // the source operand's shape rather than the uint8 result.
                 if matches!(op_type_lower.as_str(), "isnan" | "isinfinite")
+                    && graph_info.exact_float16
                     && let Some(&input_id) = op.input_operands().first()
                     && graph_info
                         .operand(input_id)
@@ -7710,7 +7762,9 @@ impl CoremlMlProgramConverter {
                         .map(|o| &o.descriptor.data_type)
                         .cloned()
                         .unwrap_or(DataType::Float32);
-                    let abs_mil_dtype = if input_dtype == DataType::Float16 {
+                    // Exact float16 inspects the value classes in float32 (see above).
+                    let wide = graph_info.exact_float16 && input_dtype == DataType::Float16;
+                    let abs_mil_dtype = if wide {
                         MilDataType::Float32 as i32
                     } else {
                         Self::mil_data_type(&input_dtype)?
@@ -7734,7 +7788,11 @@ impl CoremlMlProgramConverter {
                     } else {
                         f32::MAX
                     };
-                    let max_val_arg = Self::create_immediate_float(max_val);
+                    let max_val_arg = if input_dtype == DataType::Float16 && !wide {
+                        Self::create_immediate_float16(max_val)
+                    } else {
+                        Self::create_immediate_float(max_val)
+                    };
                     let mut gt_inputs = HashMap::new();
                     gt_inputs.insert("x".to_string(), Self::create_name_argument(abs_name));
                     gt_inputs.insert("y".to_string(), max_val_arg);
@@ -9214,15 +9272,16 @@ impl CoremlMlProgramConverter {
                 }
             }
 
-            // Layer normalization with any affine parameters, and instance
-            // normalization with runtime scale/bias:
+            // Normalization with runtime scale/bias, and layer normalization
+            // whose constant affine parameters native layer_norm cannot apply:
             // CoreML's native layer_norm/instance_norm require const
             // gamma/beta ("Param 'gamma' must be const"), so run the native op
             // without them and apply `y = norm(x) * scale + bias` with explicit
             // mul/add, reshaping scale/bias to a broadcast-compatible shape.
-            // Some native layer_norm plans also omit constant gamma on
-            // nontrailing axes, so keep its affine work explicit for both
-            // constant and runtime parameters.
+            // Native layer_norm plans can omit or reorder constant gamma/beta on
+            // nontrailing or permuted axes, so those keep their affine work
+            // explicit; trailing ascending axes keep the fused native op.
+            // Exact float16 also applies the affine work explicitly in float32.
             // Both params are stripped together: the native op computes
             // `norm * gamma + beta`, so applying one after the fact while the
             // other stays inside would change the result.
@@ -9248,6 +9307,7 @@ impl CoremlMlProgramConverter {
                 };
                 let layer_norm = matches!(op, Operation::LayerNormalization { .. });
                 let half_layer_norm = layer_norm
+                    && graph_info.exact_float16
                     && op
                         .input_operands()
                         .first()
@@ -9255,7 +9315,9 @@ impl CoremlMlProgramConverter {
                         .is_some_and(|operand| operand.descriptor.data_type == DataType::Float16);
                 if is_runtime(scale_id)
                     || is_runtime(bias_id)
-                    || (layer_norm && (scale_id.is_some() || bias_id.is_some()))
+                    || (layer_norm
+                        && (scale_id.is_some() || bias_id.is_some())
+                        && (half_layer_norm || !layer_norm_has_trailing_axes(graph_info, op)))
                 {
                     let x_id = *op.input_operands().first().ok_or_else(|| {
                         GraphError::ConversionFailed {
@@ -9580,7 +9642,7 @@ impl CoremlMlProgramConverter {
             {
                 let (_, out_type) =
                     Self::create_output_value(graph_info, out_id, &operand_name_overrides)?;
-                if id_in_op.descriptor.data_type == DataType::Float16 {
+                if graph_info.exact_float16 && id_in_op.descriptor.data_type == DataType::Float16 {
                     let mut reserved: std::collections::HashSet<String> = graph_info
                         .operands
                         .iter()
@@ -12252,16 +12314,24 @@ impl CoremlMlProgramConverter {
     }
 }
 
-impl super::GraphConverter for CoremlMlProgramConverter {
-    fn format(&self) -> &'static str {
-        "coreml"
-    }
-
-    fn convert(&self, graph_info: &GraphInfo) -> Result<super::ConvertedGraph, GraphError> {
+impl CoremlMlProgramConverter {
+    /// Convert with an explicit float16 lowering (rustnn extension).
+    ///
+    /// [`GraphConverter::convert`](super::GraphConverter::convert) uses
+    /// [`CoremlFloat16Precision::Native`](crate::mlcontext::CoremlFloat16Precision::Native);
+    /// the CoreML backend passes
+    /// [`CoremlOptions::float16_precision`](crate::mlcontext::CoremlOptions::float16_precision).
+    pub fn convert_with_float16_precision(
+        &self,
+        graph_info: &GraphInfo,
+        precision: crate::mlcontextoptions::CoremlFloat16Precision,
+    ) -> Result<super::ConvertedGraph, GraphError> {
         if !crate::graph::dynamic_inputs_enabled() && graph_info.has_dynamic_dimensions() {
             return Err(GraphError::DynamicInputsFeatureDisabled);
         }
-        let lowering_graph = LoweringGraph::new(graph_info)?;
+        let mut lowering_graph = LoweringGraph::new(graph_info)?;
+        lowering_graph.exact_float16 =
+            precision == crate::mlcontextoptions::CoremlFloat16Precision::Exact;
         let graph_info = &lowering_graph;
         let mut weight_builder = super::WeightFileBuilder::new();
         weight_builder.reserve(
@@ -12295,6 +12365,19 @@ impl super::GraphConverter for CoremlMlProgramConverter {
             data: buffer,
             weights_data,
         })
+    }
+}
+
+impl super::GraphConverter for CoremlMlProgramConverter {
+    fn format(&self) -> &'static str {
+        "coreml"
+    }
+
+    fn convert(&self, graph_info: &GraphInfo) -> Result<super::ConvertedGraph, GraphError> {
+        self.convert_with_float16_precision(
+            graph_info,
+            crate::mlcontextoptions::CoremlFloat16Precision::Native,
+        )
     }
 }
 

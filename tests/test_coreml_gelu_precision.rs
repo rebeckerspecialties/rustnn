@@ -1,10 +1,21 @@
 //! Precision and shape boundaries for the CoreML exact-GELU lowering.
 
+/// These suites qualify the exact float16 lowering; the default is native float16.
+const EXACT: rustnn::mlcontext::CoremlFloat16Precision =
+    rustnn::mlcontext::CoremlFloat16Precision::Exact;
+
+#[allow(dead_code)]
+fn exact_options() -> rustnn::mlcontext::RustNNOptions {
+    let mut options = rustnn::mlcontext::RustNNOptions::default();
+    options.coreml.float16_precision = EXACT;
+    options
+}
+
 #[path = "common/half_reference.rs"]
 mod half_reference;
 
 use prost::Message;
-use rustnn::converters::{CoremlMlProgramConverter, GraphConverter};
+use rustnn::converters::CoremlMlProgramConverter;
 use rustnn::graph::{DataType, Dimension, GraphInfo, Operand, OperandDescriptor, OperandKind};
 use rustnn::operators::Operation;
 use rustnn::protos::coreml::{mil_spec, specification};
@@ -40,7 +51,9 @@ fn graph(data_type: DataType, shape: Vec<Dimension>) -> GraphInfo {
 }
 
 fn block(graph: &GraphInfo) -> mil_spec::Block {
-    let converted = CoremlMlProgramConverter.convert(graph).unwrap();
+    let converted = CoremlMlProgramConverter
+        .convert_with_float16_precision(graph, EXACT)
+        .unwrap();
     let model = specification::Model::decode(converted.data.as_slice()).unwrap();
     // Precision promotion must not raise the existing platform requirement.
     assert_eq!(model.specification_version, 9);
@@ -170,7 +183,8 @@ mod runtime {
             &MLContextOptions::new(MLPowerPreference::Default, policy != DeviceType::Cpu)
                 .with_rustnn_device_hint(BackendDevice::Coreml {
                     device_type: policy,
-                }),
+                })
+                .with_rustnn_options(exact_options()),
         )
         .unwrap()
     }

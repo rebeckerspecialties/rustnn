@@ -1,7 +1,18 @@
 //! Explicit narrowing casts remain observable after CoreML graph optimization.
 
+/// These suites qualify the exact float16 lowering; the default is native float16.
+const EXACT: rustnn::mlcontext::CoremlFloat16Precision =
+    rustnn::mlcontext::CoremlFloat16Precision::Exact;
+
+#[allow(dead_code)]
+fn exact_options() -> rustnn::mlcontext::RustNNOptions {
+    let mut options = rustnn::mlcontext::RustNNOptions::default();
+    options.coreml.float16_precision = EXACT;
+    options
+}
+
 use prost::Message;
-use rustnn::converters::{CoremlMlProgramConverter, GraphConverter};
+use rustnn::converters::CoremlMlProgramConverter;
 use rustnn::graph::{
     ConstantData, DataType, Dimension, GraphInfo, Operand, OperandDescriptor, OperandKind,
 };
@@ -85,7 +96,9 @@ fn escaped_pair() -> GraphInfo {
 fn precision_pipeline_keeps_logical_binding_metadata_only_on_the_top_level() {
     let graph = escaped_pair();
     let original = serde_json::to_value(&graph).unwrap();
-    let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+    let converted = CoremlMlProgramConverter
+        .convert_with_float16_precision(&graph, EXACT)
+        .unwrap();
     assert_eq!(serde_json::to_value(&graph).unwrap(), original);
     let model = Model::decode(converted.data.as_slice()).unwrap();
     let description = model.description.as_ref().unwrap();
@@ -115,7 +128,9 @@ fn precision_pipeline_keeps_logical_binding_metadata_only_on_the_top_level() {
 fn precision_pipeline_binds_escaped_logical_names_without_losing_rounding() {
     use rustnn::executors::coreml::{CoremlInput, run_coreml_with_inputs_with_weights};
     let input = vec![1.0003f32, 1.0007, -0.0, -2f32.powi(-25)];
-    let converted = CoremlMlProgramConverter.convert(&escaped_pair()).unwrap();
+    let converted = CoremlMlProgramConverter
+        .convert_with_float16_precision(&escaped_pair(), EXACT)
+        .unwrap();
     let attempts = run_coreml_with_inputs_with_weights(
         &converted.data,
         converted.weights_data.as_deref(),
@@ -217,6 +232,7 @@ fn constant_transpose_uses_asset_without_policy_fallback() {
     for policy in [DeviceType::Cpu, DeviceType::Gpu, DeviceType::Npu] {
         for (reuse, backings) in [(false, false), (true, false), (true, true)] {
             let mut options = RustNNOptions::default();
+            options.coreml.float16_precision = EXACT;
             options.coreml.reuse_tensor_storage = reuse;
             options.coreml.output_backings = backings;
             let mut context = MLContext::create(
@@ -281,6 +297,7 @@ fn precision_pipeline_preserves_typed_boundaries_with_retained_tensor_storage() 
                 ] {
                     let dynamic = shape.iter().any(|d| !matches!(d, Dimension::Static(_)));
                     let mut options = RustNNOptions::default();
+                    options.coreml.float16_precision = EXACT;
                     options.coreml.reuse_tensor_storage = reuse;
                     options.coreml.output_backings = backings;
                     let mut context = MLContext::create(
@@ -302,7 +319,9 @@ fn precision_pipeline_preserves_typed_boundaries_with_retained_tensor_storage() 
                     source.operands[0].name = Some("state input".into());
                     let last = *source.output_operands.first().unwrap() as usize;
                     source.operands[last].name = Some("state result".into());
-                    let converted = CoremlMlProgramConverter.convert(&source).unwrap();
+                    let converted = CoremlMlProgramConverter
+                        .convert_with_float16_precision(&source, EXACT)
+                        .unwrap();
                     let is_pipeline = matches!(
                         Model::decode(converted.data.as_slice()).unwrap().r#type,
                         Some(model::Type::Pipeline(_))
@@ -593,7 +612,9 @@ fn precision_pipeline_dynamic_prelu_retains_binary_broadcast_provenance() {
         .collect(),
         ..Default::default()
     };
-    let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+    let converted = CoremlMlProgramConverter
+        .convert_with_float16_precision(&graph, EXACT)
+        .unwrap();
     let model = Model::decode(converted.data.as_slice()).unwrap();
     let Some(model::Type::Pipeline(pipeline)) = &model.r#type else {
         panic!("pipeline")
@@ -686,7 +707,8 @@ fn precision_pipeline_half_subtraction_preserves_all_encoding_classes() {
     for device_type in [DeviceType::Cpu, DeviceType::Gpu, DeviceType::Npu] {
         let mut context = MLContext::create(
             &MLContextOptions::new(MLPowerPreference::Default, device_type != DeviceType::Cpu)
-                .with_rustnn_device_hint(BackendDevice::Coreml { device_type }),
+                .with_rustnn_device_hint(BackendDevice::Coreml { device_type })
+                .with_rustnn_options(exact_options()),
         )
         .unwrap();
         let mut graph = context
@@ -786,7 +808,7 @@ fn precision_pipeline_signed_zero_sensitive_half_math_preserves_all_encodings() 
         .collect();
     for kind in ["reciprocal", "roundEven", "neg"] {
         let converted = CoremlMlProgramConverter
-            .convert(&half_unary(kind, values.len() as u32))
+            .convert_with_float16_precision(&half_unary(kind, values.len() as u32), EXACT)
             .unwrap();
         for attempt in run_coreml_with_inputs_with_weights(
             &converted.data,
@@ -863,7 +885,9 @@ fn precision_pipeline_nearest_even_float32_preserves_edges_without_native_round(
     for operand in &mut graph.operands {
         operand.descriptor.data_type = DataType::Float32;
     }
-    let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+    let converted = CoremlMlProgramConverter
+        .convert_with_float16_precision(&graph, EXACT)
+        .unwrap();
     for attempt in run_coreml_with_inputs_with_weights(
         &converted.data,
         converted.weights_data.as_deref(),
@@ -957,7 +981,9 @@ fn precision_pipeline_packs_high_rank_half_widening_without_changing_public_shap
         let dimensions: Vec<_> = shape.iter().copied().map(Dimension::Static).collect();
         let graph = direct_half_widening(&dimensions);
         let before = serde_json::to_value(&graph).unwrap();
-        let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+        let converted = CoremlMlProgramConverter
+            .convert_with_float16_precision(&graph, EXACT)
+            .unwrap();
         assert_eq!(serde_json::to_value(&graph).unwrap(), before);
         let model = Model::decode(converted.data.as_slice()).unwrap();
         let description = model.description.as_ref().unwrap();
@@ -1022,7 +1048,9 @@ fn precision_pipeline_compact_input_views_are_deduplicated_and_collision_free() 
         .operations
         .push(cast(0, 2, MLOperandDataType::Float32));
     graph.output_operands.push(2);
-    let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+    let converted = CoremlMlProgramConverter
+        .convert_with_float16_precision(&graph, EXACT)
+        .unwrap();
     let model = Model::decode(converted.data.as_slice()).unwrap();
     let description = model.description.unwrap();
     assert_eq!(description.input.len(), 2);
@@ -1042,7 +1070,9 @@ fn precision_pipeline_rejects_overflowing_compact_bounds() {
         Dimension::Static(2),
         Dimension::Static(1),
     ]);
-    let error = CoremlMlProgramConverter.convert(&graph).unwrap_err();
+    let error = CoremlMlProgramConverter
+        .convert_with_float16_precision(&graph, EXACT)
+        .unwrap_err();
     assert!(error.to_string().contains("compact feature size limit"));
 }
 
@@ -1060,7 +1090,9 @@ fn precision_pipeline_packed_half_widening_preserves_special_value_bits() {
         .collect();
     let shape = [1, 16, 1, 1];
     let graph = direct_half_widening(&shape.map(Dimension::Static));
-    let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+    let converted = CoremlMlProgramConverter
+        .convert_with_float16_precision(&graph, EXACT)
+        .unwrap();
     let attempts = run_coreml_with_inputs_with_weights(
         &converted.data,
         converted.weights_data.as_deref(),
@@ -1110,7 +1142,9 @@ fn precision_pipeline_packed_half_widening_restores_actual_dynamic_shape() {
         }),
         Dimension::Static(1),
     ]);
-    let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+    let converted = CoremlMlProgramConverter
+        .convert_with_float16_precision(&graph, EXACT)
+        .unwrap();
     for length in [1usize, 3] {
         let expected: Vec<_> = (0..16 * length)
             .map(|index| {
@@ -1163,7 +1197,7 @@ fn same_type_float32_cast() -> GraphInfo {
 #[test]
 fn precision_pipeline_same_type_float32_cast_is_exact_transport() {
     let converted = CoremlMlProgramConverter
-        .convert(&same_type_float32_cast())
+        .convert_with_float16_precision(&same_type_float32_cast(), EXACT)
         .unwrap();
     let model = Model::decode(converted.data.as_slice()).unwrap();
     let Some(model::Type::MlProgram(program)) = model.r#type else {
@@ -1207,7 +1241,7 @@ fn precision_pipeline_same_type_float32_cast_preserves_bits() {
         f32::NAN,
     ];
     let converted = CoremlMlProgramConverter
-        .convert(&same_type_float32_cast())
+        .convert_with_float16_precision(&same_type_float32_cast(), EXACT)
         .unwrap();
     for attempt in run_coreml_with_inputs_with_weights(
         &converted.data,
@@ -1271,7 +1305,9 @@ fn precision_pipeline_keeps_successive_exposed_casts_in_distinct_children() {
 }
 
 fn pipeline(graph: &GraphInfo) -> Vec<Model> {
-    let converted = CoremlMlProgramConverter.convert(graph).unwrap();
+    let converted = CoremlMlProgramConverter
+        .convert_with_float16_precision(graph, EXACT)
+        .unwrap();
     let model = Model::decode(converted.data.as_slice()).unwrap();
     let Some(model::Type::Pipeline(pipeline)) = model.r#type else {
         panic!("expected precision Pipeline")
@@ -1299,7 +1335,9 @@ fn precision_pipeline_materializes_only_observable_explicit_half_casts() {
     let mut terminal = graph;
     terminal.operations.pop();
     terminal.output_operands = vec![1];
-    let converted = CoremlMlProgramConverter.convert(&terminal).unwrap();
+    let converted = CoremlMlProgramConverter
+        .convert_with_float16_precision(&terminal, EXACT)
+        .unwrap();
     assert!(matches!(
         Model::decode(converted.data.as_slice()).unwrap().r#type,
         Some(model::Type::MlProgram(_))
@@ -2044,7 +2082,9 @@ fn precision_pipeline_adapts_mask_values_and_retains_original_input_fanout() {
 #[test]
 fn precision_pipeline_shares_one_blob_for_constants_consumed_in_both_stages() {
     let graph = weighted();
-    let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+    let converted = CoremlMlProgramConverter
+        .convert_with_float16_precision(&graph, EXACT)
+        .unwrap();
     let weights = converted.weights_data.unwrap();
     assert_eq!(u32::from_le_bytes(weights[..4].try_into().unwrap()), 1);
     assert_eq!(pipeline(&graph).len(), 4);
@@ -2056,7 +2096,7 @@ fn precision_pipeline_shares_one_blob_for_constants_consumed_in_both_stages() {
         std::fs::write(
             directory.join("cast_pipeline.mlmodel"),
             CoremlMlProgramConverter
-                .convert(&pair(&[Dimension::Static(4)]))
+                .convert_with_float16_precision(&pair(&[Dimension::Static(4)]), EXACT)
                 .unwrap()
                 .data,
         )
@@ -2068,7 +2108,9 @@ fn precision_pipeline_shares_one_blob_for_constants_consumed_in_both_stages() {
             ("pad_pipeline", half_pad()),
             ("scalar_pipeline", pair(&[])),
         ] {
-            let fixture = CoremlMlProgramConverter.convert(&graph).unwrap();
+            let fixture = CoremlMlProgramConverter
+                .convert_with_float16_precision(&graph, EXACT)
+                .unwrap();
             std::fs::write(directory.join(format!("{name}.mlmodel")), fixture.data).unwrap();
         }
         #[cfg(feature = "dynamic-inputs")]
@@ -2077,10 +2119,12 @@ fn precision_pipeline_shares_one_blob_for_constants_consumed_in_both_stages() {
                 name: "tokens".into(),
                 max_size: 8,
             })]);
-            let fixture = CoremlMlProgramConverter.convert(&graph).unwrap();
+            let fixture = CoremlMlProgramConverter
+                .convert_with_float16_precision(&graph, EXACT)
+                .unwrap();
             std::fs::write(directory.join("dynamic_pipeline.mlmodel"), fixture.data).unwrap();
             let fixture = CoremlMlProgramConverter
-                .convert(&half_dynamic_identity())
+                .convert_with_float16_precision(&half_dynamic_identity(), EXACT)
                 .unwrap();
             std::fs::write(
                 directory.join("dynamic_identity_pipeline.mlmodel"),
@@ -2128,7 +2172,9 @@ fn precision_pipeline_rematerializes_half_weight_cast_closures_without_features(
         },
     );
     graph.operations[2] = cast(5, 1, MLOperandDataType::Float16);
-    let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+    let converted = CoremlMlProgramConverter
+        .convert_with_float16_precision(&graph, EXACT)
+        .unwrap();
     let model = Model::decode(converted.data.as_slice()).unwrap();
     let Some(model::Type::Pipeline(pipeline)) = model.r#type else {
         panic!("pipeline")
@@ -2213,7 +2259,9 @@ fn precision_pipeline_rematerializes_constant_transpose_transport_closures() {
             cast(6, 1, MLOperandDataType::Float16),
             cast(1, 2, MLOperandDataType::Float32),
         ];
-        let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+        let converted = CoremlMlProgramConverter
+            .convert_with_float16_precision(&graph, EXACT)
+            .unwrap();
         let model = Model::decode(converted.data.as_slice()).unwrap();
         let Some(model::Type::Pipeline(pipeline)) = model.r#type else {
             panic!("pipeline")
@@ -2287,7 +2335,7 @@ fn precision_pipeline_retains_nonfolded_constant_narrowing_boundaries() {
 fn precision_pipeline_rounds_nonfolded_constant_transpose_casts() {
     use rustnn::executors::coreml::run_coreml_with_inputs_with_weights;
     let converted = CoremlMlProgramConverter
-        .convert(&transposed_constant_narrowing())
+        .convert_with_float16_precision(&transposed_constant_narrowing(), EXACT)
         .unwrap();
     let expected: Vec<_> = [1.0003f32, 1.0007, -1.0003, -1.0007]
         .iter()
@@ -2326,7 +2374,9 @@ fn precision_pipeline_half_select_shared_condition_preserves_all_encodings() {
         half_where_shared_condition(&[Dimension::Static(65536)]),
         half_where_computed_condition(&[Dimension::Static(65536)]),
     ] {
-        let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+        let converted = CoremlMlProgramConverter
+            .convert_with_float16_precision(&graph, EXACT)
+            .unwrap();
         let inputs = vec![
             CoremlInput {
                 name: "condition".into(),
@@ -2426,7 +2476,9 @@ fn precision_pipeline_half_select_and_pad_preserve_represented_values() {
         ),
     ];
     for (graph, inputs, expected) in cases {
-        let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+        let converted = CoremlMlProgramConverter
+            .convert_with_float16_precision(&graph, EXACT)
+            .unwrap();
         for attempt in run_coreml_with_inputs_with_weights(
             &converted.data,
             converted.weights_data.as_deref(),
@@ -2450,7 +2502,7 @@ fn precision_pipeline_half_select_and_pad_preserve_represented_values() {
     }
     for shared in [false, true] {
         let converted = CoremlMlProgramConverter
-            .convert(&half_where_constant_condition(shared))
+            .convert_with_float16_precision(&half_where_constant_condition(shared), EXACT)
             .unwrap();
         let inputs = vec![
             CoremlInput {
@@ -2537,7 +2589,9 @@ fn precision_pipeline_rounds_constant_casts_without_runtime_inputs() {
                 label: None,
             },
         );
-        let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+        let converted = CoremlMlProgramConverter
+            .convert_with_float16_precision(&graph, EXACT)
+            .unwrap();
         let model = Model::decode(converted.data.as_slice()).unwrap();
         let Some(model::Type::Pipeline(pipeline)) = model.r#type else {
             panic!("public Half constants must be materialized")
@@ -2598,7 +2652,9 @@ fn precision_pipeline_constant_identity_preserves_every_half_encoding() {
     let mut outputs = MLNamedOperands::new();
     outputs.insert("result", result);
     let graph = builder.finish_graph_info(&outputs).unwrap();
-    let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+    let converted = CoremlMlProgramConverter
+        .convert_with_float16_precision(&graph, EXACT)
+        .unwrap();
     for attempt in run_coreml_with_inputs_with_weights(
         &converted.data,
         converted.weights_data.as_deref(),
@@ -2773,7 +2829,7 @@ fn precision_pipeline_rounds_ties_subnormals_overflow_and_signed_zero() {
         f32::NAN,
     ];
     let converted = CoremlMlProgramConverter
-        .convert(&pair(&[Dimension::Static(values.len() as u32)]))
+        .convert_with_float16_precision(&pair(&[Dimension::Static(values.len() as u32)]), EXACT)
         .unwrap();
     let input = CoremlInput {
         name: "input".into(),
@@ -2840,7 +2896,9 @@ fn precision_pipeline_successive_exposed_casts_preserve_every_logical_output() {
         f32::NAN,
     ];
     let graph = successive_exposed_casts(&[Dimension::Static(values.len() as u32)]);
-    let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+    let converted = CoremlMlProgramConverter
+        .convert_with_float16_precision(&graph, EXACT)
+        .unwrap();
     for attempt in run_coreml_with_inputs_with_weights(
         &converted.data,
         converted.weights_data.as_deref(),
@@ -2890,7 +2948,9 @@ fn precision_pipeline_predicts_actual_dynamic_lengths() {
         name: "tokens".into(),
         max_size: 8,
     })]);
-    let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+    let converted = CoremlMlProgramConverter
+        .convert_with_float16_precision(&graph, EXACT)
+        .unwrap();
     for length in [1, 3, 7] {
         let input = vec![1.0003f32; length];
         let attempts = run_coreml_with_inputs_with_weights(
@@ -2930,7 +2990,9 @@ fn precision_pipeline_predicts_direct_input_and_constant_outputs() {
     use rustnn::executors::coreml::{CoremlInput, run_coreml_with_inputs_with_weights};
     let mut graph = weighted();
     graph.output_operands = vec![0, 1, 3, 5];
-    let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+    let converted = CoremlMlProgramConverter
+        .convert_with_float16_precision(&graph, EXACT)
+        .unwrap();
     let input = vec![1.0003f32; 4];
     for attempt in run_coreml_with_inputs_with_weights(
         &converted.data,
@@ -2998,7 +3060,9 @@ fn precision_pipeline_weighted_and_masked_compositions_predict_exact_values() {
                 .to_vec(),
         ),
     ] {
-        let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+        let converted = CoremlMlProgramConverter
+            .convert_with_float16_precision(&graph, EXACT)
+            .unwrap();
         let attempts = run_coreml_with_inputs_with_weights(
             &converted.data,
             converted.weights_data.as_deref(),
@@ -3033,5 +3097,113 @@ fn precision_pipeline_weighted_and_masked_compositions_predict_exact_values() {
                 );
             }
         }
+    }
+}
+
+/// Each Pipeline child's constants (as a set: independent constants have no defined order)
+/// and its other operations with their result names, in emission order. Encoded bytes are
+/// not compared: protobuf map fields serialize in hash order.
+type ChildShape = (Vec<String>, Vec<(String, Vec<String>)>);
+
+fn lowering_shape(converted: &[u8]) -> Vec<ChildShape> {
+    let model = Model::decode(converted).unwrap();
+    let children: Vec<Model> = match model.r#type {
+        Some(model::Type::Pipeline(pipeline)) => pipeline.models,
+        other => vec![Model {
+            r#type: other,
+            ..Default::default()
+        }],
+    };
+    children
+        .iter()
+        .map(|child| {
+            let Some(model::Type::MlProgram(program)) = &child.r#type else {
+                panic!("child is an MLProgram")
+            };
+            let function = &program.functions["main"];
+            let operations = &function.block_specializations[&function.opset].operations;
+            let mut constants: Vec<String> = operations
+                .iter()
+                .filter(|operation| operation.r#type == "const")
+                .flat_map(|operation| operation.outputs.iter().map(|value| value.name.clone()))
+                .collect();
+            constants.sort();
+            let computed = operations
+                .iter()
+                .filter(|operation| operation.r#type != "const")
+                .map(|operation| {
+                    (
+                        operation.r#type.clone(),
+                        operation
+                            .outputs
+                            .iter()
+                            .map(|value| value.name.clone())
+                            .collect(),
+                    )
+                })
+                .collect();
+            (constants, computed)
+        })
+        .collect()
+}
+
+#[test]
+fn exact_lowering_is_deterministic() {
+    use rustnn::mlcontext::{MLNamedOperands, MLOperandDescriptor};
+    use rustnn::mlgraphbuilder::MLGraphBuilder;
+    use rustnn::operator_options::MLLayerNormalizationOptions;
+    // matmul -> add -> gelu -> layerNormalization over float16: the transport widening
+    // visits MIL inputs, which live in a HashMap, so emission order must not follow it.
+    let graph = || {
+        let half = MLOperandDataType::Float16;
+        let constant = |builder: &mut MLGraphBuilder, shape: Vec<u64>| {
+            let count: u64 = shape.iter().product();
+            let bytes = (0..count)
+                .flat_map(|i| half::f16::from_f32(i as f32 / count as f32).to_le_bytes())
+                .collect();
+            builder
+                .constant_from_bytes(&MLOperandDescriptor::new(half, shape), bytes)
+                .unwrap()
+        };
+        let mut builder = MLGraphBuilder::new_uncompiled();
+        let x = builder
+            .input("x", &MLOperandDescriptor::new(half, vec![1, 4, 8]))
+            .unwrap();
+        let weight = constant(&mut builder, vec![8, 8]);
+        let bias = constant(&mut builder, vec![8]);
+        let scale = constant(&mut builder, vec![8]);
+        let beta = constant(&mut builder, vec![8]);
+        let product = builder.matmul(x, weight).unwrap();
+        let sum = builder.add(product, bias).unwrap();
+        let activation = builder.gelu(sum).unwrap();
+        let result = builder
+            .layer_normalization_with_options(
+                activation,
+                MLLayerNormalizationOptions {
+                    axes: Some(vec![2]),
+                    scale: Some(scale.into()),
+                    bias: Some(beta.into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        builder
+            .finish_graph_info(&MLNamedOperands::from([("y", result)]))
+            .unwrap()
+    };
+    let first = lowering_shape(
+        &CoremlMlProgramConverter
+            .convert_with_float16_precision(&graph(), EXACT)
+            .unwrap()
+            .data,
+    );
+    for _ in 0..24 {
+        let next = lowering_shape(
+            &CoremlMlProgramConverter
+                .convert_with_float16_precision(&graph(), EXACT)
+                .unwrap()
+                .data,
+        );
+        assert_eq!(next, first);
     }
 }

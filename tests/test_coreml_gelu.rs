@@ -1,5 +1,16 @@
 //! FP16 GELU must retain WebNN's exact formula under every requested policy.
 
+/// These suites qualify the exact float16 lowering; the default is native float16.
+const EXACT: rustnn::mlcontext::CoremlFloat16Precision =
+    rustnn::mlcontext::CoremlFloat16Precision::Exact;
+
+#[allow(dead_code)]
+fn exact_options() -> rustnn::mlcontext::RustNNOptions {
+    let mut options = rustnn::mlcontext::RustNNOptions::default();
+    options.coreml.float16_precision = EXACT;
+    options
+}
+
 use rustnn::graph::{DataType, GraphInfo, Operand, OperandDescriptor, OperandKind};
 use rustnn::operators::Operation;
 
@@ -115,11 +126,11 @@ fn convolution_graph(gelu_filter: bool) -> GraphInfo {
 #[test]
 fn gelu_float16_emits_deferred_activation_and_filter_transposes() {
     use prost::Message;
-    use rustnn::converters::{CoremlMlProgramConverter, GraphConverter};
+    use rustnn::converters::CoremlMlProgramConverter;
     use rustnn::protos::coreml::{mil_spec::argument::binding::Binding, specification};
     for gelu_filter in [false, true] {
         let converted = CoremlMlProgramConverter
-            .convert(&convolution_graph(gelu_filter))
+            .convert_with_float16_precision(&convolution_graph(gelu_filter), EXACT)
             .unwrap();
         let model = specification::Model::decode(converted.data.as_slice()).unwrap();
         let programs = match model.r#type.unwrap() {
@@ -205,7 +216,8 @@ fn gelu_float16_convolution_compositions_predict_correct_values() {
         for device_type in [DeviceType::Cpu, DeviceType::Gpu, DeviceType::Npu] {
             let mut context = MLContext::create(
                 &MLContextOptions::new(MLPowerPreference::Default, device_type != DeviceType::Cpu)
-                    .with_rustnn_device_hint(BackendDevice::Coreml { device_type }),
+                    .with_rustnn_device_hint(BackendDevice::Coreml { device_type })
+                    .with_rustnn_options(exact_options()),
             )
             .unwrap();
             let source = convolution_graph(gelu_filter);
@@ -250,10 +262,12 @@ fn gelu_float16_convolution_compositions_predict_correct_values() {
 #[test]
 fn gelu_float16_lowering_preserves_half_boundaries_and_float32_evaluation() {
     use prost::Message;
-    use rustnn::converters::{CoremlMlProgramConverter, GraphConverter};
+    use rustnn::converters::CoremlMlProgramConverter;
     use rustnn::protos::coreml::{mil_spec, specification};
 
-    let converted = CoremlMlProgramConverter.convert(&graph()).unwrap();
+    let converted = CoremlMlProgramConverter
+        .convert_with_float16_precision(&graph(), EXACT)
+        .unwrap();
     let model = specification::Model::decode(converted.data.as_slice()).unwrap();
     let specification::model::Type::MlProgram(program) = model.r#type.unwrap() else {
         panic!("expected MLProgram");
@@ -322,7 +336,8 @@ fn gelu_float16_matches_wpt_tolerance_under_all_requested_policies() {
     for device_type in [DeviceType::Cpu, DeviceType::Gpu, DeviceType::Npu] {
         let options =
             MLContextOptions::new(MLPowerPreference::Default, device_type != DeviceType::Cpu)
-                .with_rustnn_device_hint(BackendDevice::Coreml { device_type });
+                .with_rustnn_device_hint(BackendDevice::Coreml { device_type })
+                .with_rustnn_options(exact_options());
         let mut context = MLContext::create(&options).unwrap();
         let mut graph = context.rustnn_build_graph(graph()).unwrap();
         let input = context
@@ -365,7 +380,7 @@ fn gelu_float16_matches_wpt_tolerance_under_all_requested_policies() {
 #[test]
 fn gelu_float16_temporaries_do_not_shadow_graph_names() {
     use prost::Message;
-    use rustnn::converters::{CoremlMlProgramConverter, GraphConverter};
+    use rustnn::converters::CoremlMlProgramConverter;
     use rustnn::protos::coreml::specification;
 
     let mut graph = graph();
@@ -375,7 +390,9 @@ fn gelu_float16_temporaries_do_not_shadow_graph_names() {
         operand.name = Some(name.into());
         graph.operands.push(operand);
     }
-    let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
+    let converted = CoremlMlProgramConverter
+        .convert_with_float16_precision(&graph, EXACT)
+        .unwrap();
     let model = specification::Model::decode(converted.data.as_slice()).unwrap();
     let specification::model::Type::MlProgram(program) = model.r#type.unwrap() else {
         panic!("expected MLProgram");

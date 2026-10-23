@@ -364,6 +364,57 @@ fn argument_shape(
     }
 }
 
+/// MIL operations whose result has the shape of their `x` input. Bounds flow through them
+/// in both directions, so a boundary placed after any of them (for example a cut after
+/// `layer_norm`) keeps the dynamic-dimension provenance of its input.
+const SAME_SHAPE_AS_X: &[&str] = &[
+    // Conversions and copies.
+    "cast",
+    "identity",
+    "band_part",
+    "reverse",
+    "cumsum",
+    // Elementwise unary arithmetic and classification.
+    "abs",
+    "ceil",
+    "floor",
+    "round",
+    "sign",
+    "exp",
+    "log",
+    "sqrt",
+    "rsqrt",
+    "inverse",
+    "square",
+    "sin",
+    "cos",
+    "tan",
+    "erf",
+    "logical_not",
+    "is_nan",
+    "is_inf",
+    "clip",
+    // Activations.
+    "relu",
+    "sigmoid",
+    "sigmoid_hard",
+    "tanh",
+    "gelu",
+    "elu",
+    "leaky_relu",
+    "prelu",
+    "softplus",
+    "softsign",
+    "silu",
+    // Normalization over axes of an unchanged tensor.
+    "layer_norm",
+    "instance_norm",
+    "batch_norm",
+    "l2_norm",
+    "local_response_norm",
+    "softmax",
+];
+
 fn shape_bounds(
     graph: &LoweringGraph<'_>,
     types: &HashMap<String, NamedValueType>,
@@ -484,10 +535,12 @@ fn shape_bounds_seeded(
                 }
                 continue;
             }
-            let input = match operation.r#type.as_str() {
-                "cast" | "identity" | "band_part" => named_input(operation, "x"),
-                "fill_like" => named_input(operation, "ref_tensor"),
-                _ => None,
+            let input = if SAME_SHAPE_AS_X.contains(&operation.r#type.as_str()) {
+                named_input(operation, "x")
+            } else if operation.r#type == "fill_like" {
+                named_input(operation, "ref_tensor")
+            } else {
+                None
             };
             let Some(input) = input else {
                 continue;
@@ -1103,7 +1156,12 @@ impl CoremlMlProgramConverter {
         let Some(model::Type::MlProgram(program)) = &mut model.r#type else {
             return Ok(model);
         };
-        let (preparation, packed, protected_widenings) = {
+        // Native float16 materializes only the LayerNorm affine boundary below; the
+        // select, packing and widening boundaries exist for exact float16.
+        let exact = graph.exact_float16;
+        let (preparation, packed, protected_widenings) = if !exact {
+            Default::default()
+        } else {
             let function = program.functions.get_mut("main").unwrap();
             let block = function
                 .block_specializations
@@ -1321,7 +1379,9 @@ impl CoremlMlProgramConverter {
         let constant_operations = constant_closure(&block.operations);
         let mut cuts = BTreeSet::new();
         let graph_outputs: HashSet<_> = block.outputs.iter().cloned().collect();
-        let float32_affine_layer_norm_inputs: HashSet<_> = graph
+        // Nontrailing or permuted LayerNorm axes apply scale and bias explicitly; a
+        // native plan that fuses that work back into layer_norm can omit or reorder it.
+        let explicit_affine_layer_norm_inputs: HashSet<_> = graph
             .operations
             .iter()
             .filter_map(|operation| {
@@ -1334,9 +1394,13 @@ impl CoremlMlProgramConverter {
                     return None;
                 };
                 ((options.scale.is_some() || options.bias.is_some())
-                    && graph
-                        .operand(*input)
-                        .is_some_and(|operand| operand.descriptor.data_type == DataType::Float32))
+                    && !super::layer_norm_has_trailing_axes(graph, operation)
+                    && graph.operand(*input).is_some_and(|operand| {
+                        matches!(
+                            operand.descriptor.data_type,
+                            DataType::Float32 | DataType::Float16
+                        )
+                    }))
                 .then(|| operand_name(graph, *input))
             })
             .collect();
@@ -1369,22 +1433,27 @@ impl CoremlMlProgramConverter {
         for (index, operation) in block.operations.iter().enumerate() {
             // Keep explicitly lowered LayerNorm affine work outside the
             // native normalization plan. A fused native gamma/beta plan can
-            // omit or reorder nontrailing-axis affine parameters.
+            // omit or reorder nontrailing-axis affine parameters. This is a
+            // correctness boundary, materialized for both float16 lowerings.
             if operation.r#type == "layer_norm"
                 && named_input(operation, "x")
-                    .is_some_and(|name| float32_affine_layer_norm_inputs.contains(name))
+                    .is_some_and(|name| explicit_affine_layer_norm_inputs.contains(name))
                 && !operation.inputs.contains_key("gamma")
                 && !operation.inputs.contains_key("beta")
                 && operation.outputs.iter().any(|output| {
-                    tensor(output)
-                        .is_some_and(|value| value.data_type == MilDataType::Float32 as i32)
-                        && block.operations.iter().skip(index + 1).any(|consumer| {
-                            matches!(consumer.r#type.as_str(), "mul" | "add")
-                                && inputs(consumer).contains(&output.name)
-                        })
+                    tensor(output).is_some_and(|value| {
+                        value.data_type == MilDataType::Float32 as i32
+                            || value.data_type == MilDataType::Float16 as i32
+                    }) && block.operations.iter().skip(index + 1).any(|consumer| {
+                        matches!(consumer.r#type.as_str(), "mul" | "add")
+                            && inputs(consumer).contains(&output.name)
+                    })
                 })
             {
                 cuts.insert(index + 1);
+            }
+            if !exact {
+                continue;
             }
             // A source FP32 result must exist before an explicit Half cast.
             // Otherwise the compiler can fuse the producer into a Half kernel
