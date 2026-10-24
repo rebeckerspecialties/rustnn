@@ -26,6 +26,8 @@ jobs:
       - name: Metal compute smoke test
         continue-on-error: true
         run: swift ci-probe/metal.swift; echo "metal exit=$?"
+      - name: Install protoc
+        run: brew install protobuf && protoc --version
       - uses: dtolnay/rust-toolchain@1.97.0
       - name: Build the CLI
         run: cargo build --release --no-default-features --features cli,coreml-runtime --bin rustnn
