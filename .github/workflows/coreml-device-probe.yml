@@ -1,0 +1,47 @@
+# Probe only: what Core ML and Metal can use on GitHub-hosted macOS runners.
+name: CoreML device probe
+
+on:
+  push:
+    branches: [ci-probe/coreml-devices]
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-26, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Machine
+        run: |
+          sw_vers
+          sysctl -n hw.model machdep.cpu.brand_string hw.ncpu hw.memsize
+          system_profiler SPHardwareDataType SPDisplaysDataType 2>/dev/null | sed -n '1,60p'
+          ioreg -l -w0 2>/dev/null | grep -i -E 'ANE|H1[0-9]ANE|neural' | head -10 || true
+      - name: Core ML and Metal devices
+        run: swift ci-probe/devices.swift
+      - name: Metal compute smoke test
+        continue-on-error: true
+        run: swift ci-probe/metal.swift; echo "metal exit=$?"
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - name: Build the CLI
+        run: cargo build --release --no-default-features --features cli,coreml-runtime --bin rustnn
+      - name: Convert and run the probe graph under each policy
+        continue-on-error: true
+        run: |
+          mkdir -p out
+          set +e
+          target/release/rustnn ci-probe/ane_probe.webnn --convert coreml \
+            --convert-output out/ane_probe.mlmodel --run-coreml \
+            --coreml-compiled-output out/ane_probe.mlmodelc
+          echo "cli exit=$?"
+      - name: Compute plan per policy
+        continue-on-error: true
+        run: |
+          for policy in 3 2 1 0; do
+            echo "== policy $policy (0 cpuOnly, 1 cpuAndGPU, 2 all, 3 cpuAndNeuralEngine)"
+            swift ci-probe/plan.swift out/ane_probe.mlmodelc $policy; echo "plan exit=$?"
+          done

@@ -1,0 +1,25 @@
+webnn_graph "ane_probe" v1 {
+  inputs {
+    x: f16[1, 256, 1024];
+  }
+
+  consts {
+    w1: f16[1024, 1024] @scalar(0.001);
+    w2: f16[1024, 1024] @scalar(0.001);
+    w3: f16[1024, 1024] @scalar(0.001);
+    b: f16[1024] @scalar(0.5);
+  }
+
+  nodes {
+    m1 = matmul(x, w1);
+    a1 = add(m1, b);
+    r1 = relu(a1);
+    m2 = matmul(r1, w2);
+    a2 = add(m2, b);
+    r2 = relu(a2);
+    m3 = matmul(r2, w3);
+    s = sigmoid(m3);
+  }
+
+  outputs { s; }
+}
