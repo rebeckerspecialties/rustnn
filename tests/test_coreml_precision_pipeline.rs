@@ -2326,8 +2326,20 @@ fn transposed_constant_narrowing() -> GraphInfo {
 }
 
 #[test]
-fn precision_pipeline_retains_nonfolded_constant_narrowing_boundaries() {
-    assert_eq!(pipeline(&transposed_constant_narrowing()).len(), 2);
+fn precision_pipeline_rounds_transposed_constant_narrowing_on_the_host() {
+    // The constant fold transposes the constant and narrows it to float16 on the host
+    // (round to nearest even), so no runtime narrowing boundary is left to materialize.
+    // precision_pipeline_rounds_nonfolded_constant_transpose_casts checks the values.
+    let converted = CoremlMlProgramConverter
+        .convert_with_float16_precision(&transposed_constant_narrowing(), EXACT)
+        .unwrap();
+    assert_eq!(
+        lowering_shape(&converted.data),
+        vec![(
+            vec!["rounded".to_string()],
+            vec![("cast".to_string(), vec!["result".to_string()])]
+        )]
+    );
 }
 
 #[cfg(all(target_os = "macos", feature = "coreml-runtime"))]

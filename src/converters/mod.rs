@@ -18,6 +18,7 @@ pub use burn::BurnConverter;
 use crate::error::GraphError;
 use crate::graph::GraphInfo;
 
+mod coreml_constant_fold;
 mod coreml_mlprogram;
 pub(crate) mod coreml_names;
 #[cfg(feature = "litert-runtime")]
