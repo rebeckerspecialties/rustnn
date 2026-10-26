@@ -21,7 +21,9 @@ use bytemuck::NoUninit;
 use log::{debug, trace};
 use webnn_graph::serialize::SerializeOptions;
 
-use crate::error::{GraphBuilderError, GraphError, ShapeInferenceError};
+use crate::error::{
+    GraphBuilderError, GraphError, QuantizationParameterError, ShapeInferenceError,
+};
 use crate::graph::{Dimension, get_static_or_max_size, to_dimension_vector};
 use crate::graph_recorder::GraphRecorder;
 use crate::mlcontext::{MLGraph, MLNamedOperands, MLOperand, MLOperandDescriptor, MLTensor};
@@ -1053,14 +1055,7 @@ fn validate_quantization_parameters(
         .map(|id| get_operand(MLOperand { id: id as usize }, graph))
         .transpose()?
         .map(|operand| &operand.descriptor);
-    crate::validator::validate_quantization_parameters(
-        &operation.display_name(),
-        is_quantize,
-        input,
-        scale,
-        zero_point,
-    )
-    .map_err(|source| {
+    check_quantization_parameters(is_quantize, input, scale, zero_point).map_err(|source| {
         Box::new(ShapeInferenceError::InferError {
             op_name: if is_quantize {
                 "quantizeLinear"
@@ -1068,10 +1063,101 @@ fn validate_quantization_parameters(
                 "dequantizeLinear"
             },
             operation: operation.clone(),
-            source,
+            source: GraphError::QuantizationParameters {
+                operation: operation.display_name(),
+                source,
+            },
         })
         .into()
     })
+}
+
+/// The data type and shape rules that the scale and optional zero point of a `quantizeLinear`
+/// (`is_quantize`) or `dequantizeLinear` must meet against its input. The builder applies them
+/// when it records the operation; `GraphValidator` reuses them for GraphInfo from other sources.
+pub(crate) fn check_quantization_parameters(
+    is_quantize: bool,
+    input: &OperandDescriptor,
+    scale: &OperandDescriptor,
+    zero_point: Option<&OperandDescriptor>,
+) -> std::result::Result<(), QuantizationParameterError> {
+    use QuantizationParameterError as E;
+    if !matches!(scale.data_type, DataType::Float16 | DataType::Float32) {
+        return Err(E::ScaleDataType {
+            found: scale.data_type,
+        });
+    }
+    let integer_type = |dtype| {
+        matches!(
+            dtype,
+            DataType::Int4 | DataType::Uint4 | DataType::Int8 | DataType::Uint8 | DataType::Int32
+        )
+    };
+    if is_quantize {
+        if !matches!(
+            input.data_type,
+            DataType::Float16 | DataType::Float32 | DataType::Int32
+        ) {
+            return Err(E::QuantizeInputDataType {
+                found: input.data_type,
+            });
+        }
+    } else if !integer_type(input.data_type) {
+        return Err(E::DequantizeInputDataType {
+            found: input.data_type,
+        });
+    }
+    // Retain the existing int32 quantize extension, while requiring matching
+    // floating-point input/scale dtypes for the WebNN operation.
+    if is_quantize
+        && matches!(input.data_type, DataType::Float16 | DataType::Float32)
+        && input.data_type != scale.data_type
+    {
+        return Err(E::ScaleInputDataTypeMismatch {
+            scale: scale.data_type,
+            input: input.data_type,
+        });
+    }
+    if let Some(zero_point) = zero_point {
+        if !integer_type(zero_point.data_type) {
+            return Err(E::ZeroPointDataType {
+                found: zero_point.data_type,
+            });
+        }
+        if !is_quantize && zero_point.data_type != input.data_type {
+            return Err(E::ZeroPointInputDataTypeMismatch {
+                zero_point: zero_point.data_type,
+                input: input.data_type,
+            });
+        }
+        if zero_point.shape != scale.shape {
+            return Err(E::ZeroPointShapeMismatch {
+                zero_point: zero_point.shape.clone(),
+                scale: scale.shape.clone(),
+            });
+        }
+    }
+    if scale.shape.len() != input.shape.len() {
+        return Err(E::ScaleRankMismatch {
+            scale_rank: scale.shape.len(),
+            input_rank: input.shape.len(),
+        });
+    }
+    for (axis, (&scale_dim, &input_dim)) in scale
+        .static_or_max_shape()
+        .iter()
+        .zip(input.static_or_max_shape().iter())
+        .enumerate()
+    {
+        if scale_dim == 0 || (input_dim != 0 && input_dim % scale_dim != 0) {
+            return Err(E::ScaleDoesNotDivideInput {
+                axis,
+                scale_dim,
+                input_dim,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Generates `fn_name(input)` / `fn_name(input, extra, …)` and matching `_with_options` on `MLGraphBuilder`.

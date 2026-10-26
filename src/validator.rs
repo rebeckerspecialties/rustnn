@@ -67,99 +67,6 @@ pub struct GraphValidator<'a> {
     operand_to_producer: HashMap<u32, String>,
 }
 
-/// Shared builder/GraphInfo checks for quantization parameter relationships.
-pub(crate) fn validate_quantization_parameters(
-    operation: &str,
-    is_quantize: bool,
-    input: &OperandDescriptor,
-    scale: &OperandDescriptor,
-    zero_point: Option<&OperandDescriptor>,
-) -> Result<(), GraphError> {
-    let invalid = |reason: String| GraphError::QuantizationValidation {
-        operation: operation.to_string(),
-        reason,
-    };
-    if !matches!(scale.data_type, DataType::Float16 | DataType::Float32) {
-        return Err(invalid(format!(
-            "scale must be float16 or float32 (got {:?})",
-            scale.data_type
-        )));
-    }
-    let integer_type = |dtype| {
-        matches!(
-            dtype,
-            DataType::Int4 | DataType::Uint4 | DataType::Int8 | DataType::Uint8 | DataType::Int32
-        )
-    };
-    if is_quantize {
-        if !matches!(
-            input.data_type,
-            DataType::Float16 | DataType::Float32 | DataType::Int32
-        ) {
-            return Err(invalid(format!(
-                "quantize input must be float16/float32/int32 (got {:?})",
-                input.data_type
-            )));
-        }
-    } else if !integer_type(input.data_type) {
-        return Err(invalid(format!(
-            "dequantize input must be int4/uint4/int8/uint8/int32 (got {:?})",
-            input.data_type
-        )));
-    }
-    // Retain the existing int32 quantize extension, while requiring matching
-    // floating-point input/scale dtypes for the WebNN operation.
-    if is_quantize
-        && matches!(input.data_type, DataType::Float16 | DataType::Float32)
-        && input.data_type != scale.data_type
-    {
-        return Err(invalid(format!(
-            "scale dtype {:?} must match quantize input dtype {:?}",
-            scale.data_type, input.data_type
-        )));
-    }
-    if let Some(zero_point) = zero_point {
-        if !integer_type(zero_point.data_type) {
-            return Err(invalid(format!(
-                "zeroPoint must be int4/uint4/int8/uint8/int32 (got {:?})",
-                zero_point.data_type
-            )));
-        }
-        if !is_quantize && zero_point.data_type != input.data_type {
-            return Err(invalid(format!(
-                "zeroPoint dtype {:?} must match dequantize input dtype {:?}",
-                zero_point.data_type, input.data_type
-            )));
-        }
-        if zero_point.shape != scale.shape {
-            return Err(invalid(format!(
-                "zeroPoint shape {:?} must match scale shape {:?}",
-                zero_point.shape, scale.shape
-            )));
-        }
-    }
-    if scale.shape.len() != input.shape.len() {
-        return Err(invalid(format!(
-            "scale rank {} must match input rank {}",
-            scale.shape.len(),
-            input.shape.len()
-        )));
-    }
-    for (axis, (&scale_dim, &input_dim)) in scale
-        .static_or_max_shape()
-        .iter()
-        .zip(input.static_or_max_shape().iter())
-        .enumerate()
-    {
-        if scale_dim == 0 || (input_dim != 0 && input_dim % scale_dim != 0) {
-            return Err(invalid(format!(
-                "scale dim {axis} (value {scale_dim}) must divide input dim {axis} (value {input_dim}) for blockwise quantization"
-            )));
-        }
-    }
-    Ok(())
-}
-
 impl<'a> GraphValidator<'a> {
     /// Validator for `graph` with the given limits.
     pub fn new(graph: &'a GraphInfo, context: ContextProperties) -> Self {
@@ -458,6 +365,19 @@ impl<'a> GraphValidator<'a> {
                 })?;
         let output_desc = &output_operand.descriptor;
 
+        // The parameters decide the output, so their errors come first. The parameter rules are
+        // the builder's, so GraphInfo from any source meets the same checks.
+        crate::mlgraphbuilder::check_quantization_parameters(
+            is_quantize,
+            input_desc,
+            scale_desc,
+            Some(zero_point_desc),
+        )
+        .map_err(|source| GraphError::QuantizationParameters {
+            operation: op_name.clone(),
+            source,
+        })?;
+
         if is_quantize {
             if output_desc.data_type != zero_point_desc.data_type {
                 return Err(invalid(format!(
@@ -477,13 +397,6 @@ impl<'a> GraphValidator<'a> {
         // Shape constraints
         let input_shape_dims = &input_desc.shape;
         let input_shape = input_desc.static_or_max_shape();
-        validate_quantization_parameters(
-            &op_name,
-            is_quantize,
-            input_desc,
-            scale_desc,
-            Some(zero_point_desc),
-        )?;
         if output_desc.static_or_max_shape() != input_shape {
             return Err(invalid(format!(
                 "output shape {:?} must match input shape {:?}",
@@ -708,9 +621,13 @@ mod tests {
         let validator = GraphValidator::new(&graph, ContextProperties::default());
         let err = validator.validate().unwrap_err();
         match err {
-            GraphError::QuantizationValidation { reason, .. } => {
-                assert!(reason.contains("rank"), "unexpected reason: {}", reason);
-            }
+            GraphError::QuantizationParameters { source, .. } => assert_eq!(
+                source,
+                crate::error::QuantizationParameterError::ScaleRankMismatch {
+                    scale_rank: 1,
+                    input_rank: 2,
+                }
+            ),
             other => panic!("unexpected error {:?}", other),
         }
     }
@@ -728,9 +645,12 @@ mod tests {
         let validator = GraphValidator::new(&graph, ContextProperties::default());
         let err = validator.validate().unwrap_err();
         match err {
-            GraphError::QuantizationValidation { reason, .. } => {
-                assert!(reason.contains("scale"), "unexpected reason: {}", reason);
-            }
+            GraphError::QuantizationParameters { source, .. } => assert_eq!(
+                source,
+                crate::error::QuantizationParameterError::ScaleDataType {
+                    found: DataType::Uint8,
+                }
+            ),
             other => panic!("unexpected error {:?}", other),
         }
     }
