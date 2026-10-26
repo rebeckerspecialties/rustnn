@@ -188,6 +188,13 @@ test-wpt: onnxruntime-download
 test-wpt-trtx: onnxruntime-download trtxruntime-download
 	$(ORT_ENV_VARS) $(TRT_ENV_VARS) $(CARGO) test --test run_wpt_conformance --features "onnx-runtime,trtx-runtime" -- trtx --test-threads 1
 
+test-wpt-burn-cpu:
+	WPT_BACKEND=burn-cpu $(CARGO) test --test run_wpt_conformance --features burn-runtime-cpu -- $(TEST_FILTER) --test-threads 1
+
+wpt-sync-burn-cpu: fetch-wpt
+	./scripts/update_expected_failures.sh burn-cpu 2>&1 | tee /tmp/wpt-burn-cpu.log || true
+	@grep -q -F '[WPT] result:' /tmp/wpt-burn-cpu.log
+
 test-wpt-litert:
 	@WPT_REPORT_JSON="$(WPT_REPORT_LITERT_JSON)" \
 	$(CARGO) test --test run_wpt_conformance --features "litert-runtime" -- litert --test-threads=1
@@ -196,7 +203,7 @@ test-wpt-coreml:
 	WPT_BACKEND=coreml $(CARGO) test --test run_wpt_conformance --features coreml-runtime -- $(if $(TEST_FILTER),$(TEST_FILTER),coreml) --test-threads 1
 	$(MAKE) test-wpt-tolerance-parity
 
-.PHONY: test-wpt-tolerance test-wpt-tolerance-parity
+.PHONY: test-wpt-burn-cpu wpt-sync-burn-cpu test-wpt-tolerance test-wpt-tolerance-parity
 test-wpt-tolerance:
 	$(CARGO) test --test test_wpt_tolerance --test test_wpt_report
 
@@ -217,12 +224,12 @@ test-coreml-tensor-reuse:
 
 # Build every target, including examples and the separately run WPT harness.
 build-coreml:
-	$(CARGO) build --all-targets --no-default-features --features $(COREML_FEATURES)
+	$(CARGO) build --all-targets --no-default-features --features cli,$(COREML_FEATURES)
 
 # Ordinary integration suites use test_*. The live WPT and browser harnesses
 # have their own targets and corpus/device setup; do not run them here.
 test-coreml:
-	$(CARGO) test --lib --bins --test 'test_*' --no-default-features --features $(COREML_FEATURES) -- $(TEST_FILTER) --test-threads=1
+	$(CARGO) test --lib --bins --test 'test_*' --no-default-features --features cli,$(COREML_FEATURES) -- $(TEST_FILTER) --test-threads=1
 
 # Defaults to self-contained attention/cache chaining with an independent oracle.
 benchmark-coreml-kv:
@@ -451,7 +458,7 @@ docs-clean:
 
 # Rust API documentation (rustdoc). Warnings are errors so broken doc links fail CI.
 # The feature list matches what CI type-checks on Linux; coreml-runtime is macOS-only.
-DOCS_API_FEATURES ?= onnx-runtime,trtx-runtime,litert-runtime,cann-runtime,coreml-runtime,dynamic-inputs
+DOCS_API_FEATURES ?= onnx-runtime,trtx-runtime,litert-runtime,cann-runtime,coreml-runtime,burn-runtime-cpu,dynamic-inputs
 docs-api:
 	@echo "Building Rust API documentation..."
 	RUSTDOCFLAGS="-D warnings" $(CARGO) doc --no-deps --lib --features $(DOCS_API_FEATURES)
@@ -522,6 +529,8 @@ help:
 	@echo "  test-wpt-report    - Run full WPT suite and write JSON/HTML reports (ignores trial failures)"
 	@echo "  test-wpt-trtx      - Run WPT suite via TensorRT (skips when GPU unavailable)"
 	@echo "  test-wpt-cann      - Run WPT conformance suite via CANN on device"
+	@echo "  test-wpt-burn-cpu  - Run WPT suite via Burn NdArray CPU"
+	@echo "  wpt-sync-burn-cpu  - Regenerate Burn CPU expected failures"
 	@echo "  test-wpt-litert    - Run WPT suite via LiteRT"
 	@echo "  wpt-sync-onnx      - Regenerate ONNX expected-failures"
 	@echo "  wpt-sync-litert    - Regenerate LiteRT expected-failures"
