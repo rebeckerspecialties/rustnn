@@ -1075,6 +1075,16 @@ fn validate_quantization_parameters(
 /// The data type and shape rules that the scale and optional zero point of a `quantizeLinear`
 /// (`is_quantize`) or `dequantizeLinear` must meet against its input. The builder applies them
 /// when it records the operation; `GraphValidator` reuses them for GraphInfo from other sources.
+///
+/// The data types follow the specification's tensor-limits tables, which change as WebNN
+/// evolves; compare against them when updating this function:
+/// [quantizeLinear](https://www.w3.org/TR/webnn/#tensor-limits-quantizelinear),
+/// [dequantizeLinear](https://www.w3.org/TR/webnn/#tensor-limits-dequantizelinear)
+/// (editor's draft source:
+/// <https://github.com/webmachinelearning/webnn/blob/main/index.bs>). Deliberate differences:
+/// int4 and uint4 are accepted as rustnn's packed 4-bit weight types, an int32 quantize input
+/// is accepted as an extension, and the float8e4m3 and bfloat16 types of the current draft
+/// have no rustnn data type yet.
 pub(crate) fn check_quantization_parameters(
     is_quantize: bool,
     input: &OperandDescriptor,
@@ -1090,7 +1100,12 @@ pub(crate) fn check_quantization_parameters(
     let integer_type = |dtype| {
         matches!(
             dtype,
-            DataType::Int4 | DataType::Uint4 | DataType::Int8 | DataType::Uint8 | DataType::Int32
+            DataType::Int4
+                | DataType::Uint4
+                | DataType::Int8
+                | DataType::Uint8
+                | DataType::Int32
+                | DataType::Uint32
         )
     };
     if is_quantize {

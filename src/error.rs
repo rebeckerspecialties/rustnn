@@ -413,13 +413,13 @@ pub enum QuantizationParameterError {
     #[error("quantize input must be float16/float32/int32 (got {found:?})")]
     QuantizeInputDataType { found: DataType },
     /// The dequantize input is not a quantized integer type.
-    #[error("dequantize input must be int4/uint4/int8/uint8/int32 (got {found:?})")]
+    #[error("dequantize input must be int4/uint4/int8/uint8/int32/uint32 (got {found:?})")]
     DequantizeInputDataType { found: DataType },
     /// A floating-point quantize input and its scale have different types.
     #[error("scale dtype {scale:?} must match quantize input dtype {input:?}")]
     ScaleInputDataTypeMismatch { scale: DataType, input: DataType },
     /// The zero point is not a quantized integer type.
-    #[error("zeroPoint must be int4/uint4/int8/uint8/int32 (got {found:?})")]
+    #[error("zeroPoint must be int4/uint4/int8/uint8/int32/uint32 (got {found:?})")]
     ZeroPointDataType { found: DataType },
     /// The dequantize zero point and input have different types.
     #[error("zeroPoint dtype {zero_point:?} must match dequantize input dtype {input:?}")]

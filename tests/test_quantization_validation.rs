@@ -405,3 +405,34 @@ fn quantization_retains_existing_integer_parameter_dtypes() {
     .validate()
     .unwrap();
 }
+
+/// The specification's tensor-limits tables allow uint32 for the dequantize input and for both
+/// zero points (https://www.w3.org/TR/webnn/#tensor-limits-dequantizelinear,
+/// https://www.w3.org/TR/webnn/#tensor-limits-quantizelinear).
+#[test]
+fn quantization_accepts_the_specification_uint32_parameters() {
+    for quantize in [false, true] {
+        let graph = graph(
+            quantize,
+            if quantize {
+                DataType::Float32
+            } else {
+                DataType::Uint32
+            },
+            DataType::Float32,
+            DataType::Uint32,
+            &[2],
+            &[1],
+            &[1],
+        );
+        GraphValidator::new(&graph, ContextProperties::default())
+            .validate()
+            .unwrap();
+        GraphValidator::new(
+            &builder_result(&graph).unwrap(),
+            ContextProperties::default(),
+        )
+        .validate()
+        .unwrap();
+    }
+}
