@@ -58,8 +58,11 @@ establishes placement, energy savings or prediction-time fallback; use separate 
    guarantees were qualified: in memory, widened float16 subtraction loses NaN classes under a
    CPU and Neural Engine request. Input-free programs made entirely of proven constant copies
    stay in memory with either lowering, because the URL compiler can crash in BNNS for such
-   data-free programs under a CPU and Neural Engine request. Neither route forces CPU-only
-   execution.
+   data-free programs under a CPU and Neural Engine request. An input-free program with no
+   float16 operand follows the `Native` rule under `Exact` as well: the exact lowering changes
+   nothing in it, and the URL compiler, which evaluates such a program itself, returns 0 on
+   iOS and tvOS 26 and 27 for a constant `uint8` clamp that saturates to 255 (WPT mlNumber
+   "cast float to integer overflows"). Neither route forces CPU-only execution.
    With [`CoremlFloat16Precision::Exact`](#float16-precision), explicit float16 rounding
    boundaries are materialized as native Pipeline children, and with either lowering a
    `layerNormalization` over nontrailing axes keeps its affine work in its own child. The

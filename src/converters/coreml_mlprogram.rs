@@ -13315,6 +13315,94 @@ mod tests {
         assert_eq!(parsed_finite, 3.5);
     }
 
+    /// The backend routes an input-free program without float16 operands by the native rule
+    /// under either lowering, because the exact lowering emits the same model for it. Graphs
+    /// with float32 inputs and integer constants are covered here.
+    #[test]
+    fn exact_lowering_matches_native_without_float16_operands() {
+        use crate::mlcontext::CoremlFloat16Precision;
+        let operand = |name: &str, kind, data_type| Operand {
+            name: Some(name.to_string()),
+            kind,
+            descriptor: OperandDescriptor {
+                data_type,
+                shape: s(&[4]),
+                pending_permutation: vec![],
+            },
+        };
+        let pow = GraphInfo {
+            input_operands: vec![0, 1],
+            output_operands: vec![2],
+            operands: vec![
+                operand("base", OperandKind::Input, DataType::Float32),
+                operand("exponent", OperandKind::Input, DataType::Float32),
+                operand("result", OperandKind::Output, DataType::Float32),
+            ],
+            operations: vec![Operation::Pow {
+                a: 0,
+                b: 1,
+                options: None,
+                outputs: vec![2],
+            }],
+            constant_operand_ids_to_handles: HashMap::new(),
+            quantized: false,
+        };
+        let is_nan = GraphInfo {
+            input_operands: vec![0],
+            output_operands: vec![1],
+            operands: vec![
+                operand("input", OperandKind::Input, DataType::Float32),
+                operand("result", OperandKind::Output, DataType::Uint8),
+            ],
+            operations: vec![Operation::IsNaN {
+                input: 0,
+                options: None,
+                outputs: vec![1],
+            }],
+            constant_operand_ids_to_handles: HashMap::new(),
+            quantized: false,
+        };
+        let clamp = GraphInfo {
+            input_operands: vec![],
+            output_operands: vec![1],
+            operands: vec![
+                operand("clampInput", OperandKind::Constant, DataType::Uint8),
+                operand("clampOutput", OperandKind::Output, DataType::Uint8),
+            ],
+            operations: vec![Operation::Clamp {
+                input: 0,
+                options: Some(crate::operator_options::MLClampOptions {
+                    min_value: Some(serde_json::json!(1000)),
+                    ..Default::default()
+                }),
+                outputs: vec![1],
+            }],
+            constant_operand_ids_to_handles: HashMap::from([(
+                0,
+                ConstantData {
+                    data: vec![255, 127, 5, 0],
+                    label: None,
+                },
+            )]),
+            quantized: false,
+        };
+        for (name, graph) in [("pow", pow), ("isNaN", is_nan), ("clamp", clamp)] {
+            let native = CoremlMlProgramConverter
+                .convert_with_float16_precision(&graph, CoremlFloat16Precision::Native)
+                .expect("native conversion");
+            let exact = CoremlMlProgramConverter
+                .convert_with_float16_precision(&graph, CoremlFloat16Precision::Exact)
+                .expect("exact conversion");
+            // Protobuf map fields serialize in hash order, so compare the decoded models.
+            assert_eq!(
+                Model::decode(native.data.as_slice()).unwrap(),
+                Model::decode(exact.data.as_slice()).unwrap(),
+                "{name}: model"
+            );
+            assert_eq!(native.weights_data, exact.weights_data, "{name}: weights");
+        }
+    }
+
     #[test]
     fn test_parse_clamp_bound_nan_uses_default() {
         let nan = serde_json::json!("NaN");

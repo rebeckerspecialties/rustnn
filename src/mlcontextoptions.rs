@@ -178,7 +178,8 @@ pub enum CoremlFloat16Precision {
     /// Float16 storage with float32 evaluation of float16 arithmetic, activations,
     /// normalization and data movement, rounded once at each WebNN float16 result. Explicit
     /// float16 rounding boundaries that Core ML would otherwise fuse away become native
-    /// Pipeline children, and the model compiles from a URL. This keeps CPU, GPU and
+    /// Pipeline children, and the model compiles from a URL (the CoreML integration guide
+    /// lists the input-free programs that load in memory instead). This keeps CPU, GPU and
     /// Neural Engine requests within WebNN's bounds on the devices measured, at the cost
     /// of more operations and longer builds. Float32 work is not eligible for the Neural
     /// Engine, so under a Neural Engine request the values come from running it elsewhere.

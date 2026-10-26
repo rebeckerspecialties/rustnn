@@ -107,11 +107,17 @@ impl<'context, 'builder> MLBackendBuilder<'context, 'builder> for CoremlBuilder 
             .map_err(|e| Error::GraphBuildError { source: e.into() })?;
         // Native float16 keeps the in-memory default with its reproduced URL cases.
         // Exact float16 was qualified through URL compilation: in memory, its widened
-        // float16 subtraction loses NaN classes under a CPU and Neural Engine request.
+        // float16 subtraction loses NaN classes under a CPU and Neural Engine request,
+        // and the A12 GPU flushes float16 subnormals when it widens a constant.
         // Data-free programs of proven constant copies stay in memory, where BNNS does
-        // not crash on them.
+        // not crash on them. An input-free program with no float16 operand has nothing
+        // for the exact lowering to change, and the URL compiler evaluates such a program
+        // itself, so it follows the Native rule: through the URL compiler, iOS and tvOS 26
+        // and 27 return 0 for WPT's data-free uint8 clamp that saturates to 255.
         let use_asset = match self.float16_precision {
-            CoremlFloat16Precision::Exact => {
+            CoremlFloat16Precision::Exact
+                if !graph_info.input_operands.is_empty() || has_float16_operand(&graph_info) =>
+            {
                 CoremlMlProgramConverter::constant_copy_asset_eligible(&graph_info, &converted.data)
             }
             _ => supports_in_memory_asset(&graph_info),
@@ -143,6 +149,15 @@ fn supports_output_backings(graph: &GraphInfo) -> bool {
             .iter()
             .all(|dimension| matches!(dimension, crate::graph::Dimension::Static(_)))
     })
+}
+
+/// The exact float16 lowering differs from the native one only where a float16 operand
+/// exists.
+fn has_float16_operand(graph: &GraphInfo) -> bool {
+    graph
+        .operands
+        .iter()
+        .any(|operand| operand.descriptor.data_type == DataType::Float16)
 }
 
 /// CoreML's in-memory model compiler does not currently behave identically to
@@ -669,6 +684,75 @@ mod test {
                 };
                 assert_eq!(diagnostic.route, expected, "{precision:?} {dtype:?}");
             }
+        }
+    }
+
+    /// Input-free programs keep the exact lowering's URL route only for float16 work. WPT
+    /// mlNumber "cast float to integer overflows" (a uint8 constant clamped with minValue
+    /// 1000) returns 0 through the URL compiler on iOS and tvOS 26 and 27, and 255 in memory;
+    /// a float16 constant widened to float32 loses its subnormals in memory on the A12 GPU.
+    #[test]
+    fn input_free_exact_programs_keep_the_url_route_only_for_float16_work() {
+        use crate::executors::coreml::CoremlLoadRoute;
+        use crate::mlcontext::CoremlFloat16Precision;
+        use crate::operator_options::MLClampOptions;
+        for precision in [
+            CoremlFloat16Precision::Native,
+            CoremlFloat16Precision::Exact,
+        ] {
+            let Some(mut context) = coreml_context_with(precision) else {
+                return;
+            };
+            {
+                let mut builder = MLGraphBuilder::new(&mut context).unwrap();
+                let constant = builder
+                    .constant_from_bytes(
+                        &MLOperandDescriptor::new(MLOperandDataType::Uint8, vec![4]),
+                        vec![255, 127, 5, 0],
+                    )
+                    .unwrap();
+                let output = builder
+                    .clamp_with_options(
+                        constant,
+                        MLClampOptions {
+                            min_value: Some(serde_json::json!(1000)),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                let graph = builder
+                    .build(&MLNamedOperands::from([("result", output)]))
+                    .unwrap();
+                assert_eq!(
+                    load_route(&graph),
+                    CoremlLoadRoute::InMemoryAsset,
+                    "{precision:?} uint8 clamp"
+                );
+            }
+            let mut builder = MLGraphBuilder::new(&mut context).unwrap();
+            let half = builder
+                .constant_from_bytes(
+                    &MLOperandDescriptor::new(MLOperandDataType::Float16, vec![4]),
+                    [0x03ff_u16, 0x0001, 0x3c00, 0x8001]
+                        .into_iter()
+                        .flat_map(u16::to_le_bytes)
+                        .collect(),
+                )
+                .unwrap();
+            let wide = builder.cast(half, MLOperandDataType::Float32).unwrap();
+            let graph = builder
+                .build(&MLNamedOperands::from([("result", wide)]))
+                .unwrap();
+            let expected = if precision == CoremlFloat16Precision::Exact {
+                CoremlLoadRoute::CompiledUrl
+            } else {
+                CoremlLoadRoute::InMemoryAsset
+            };
+            assert_eq!(
+                load_route(&graph),
+                expected,
+                "{precision:?} float16 widening"
+            );
         }
     }
 
