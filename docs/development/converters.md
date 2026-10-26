@@ -29,7 +29,7 @@ runtime (compiling, transposing runtime tensors, refitting weights) belongs to
 
 | Converter | File | Output | Registered when |
 |---|---|---|---|
-| `OnnxConverter` | `onnx.rs` | ONNX `ModelProto` (prost) | always |
+| `OnnxConverter` | `onnx.rs` | ONNX `ModelProto` (prost) | `onnx` (default), `onnx-runtime` |
 | `CoremlMlProgramConverter` | `coreml_mlprogram.rs` | CoreML MLProgram (`protos::coreml`) | always |
 | `TrtxConverter` | `trtx.rs`, `trtx_gru.rs`, `trtx_lstm.rs`, `trtx_rnn.rs` | TensorRT network built through the `trtx` crate, serialized engine | `trtx-runtime`, `trtx-runtime-mock` |
 | `LiteRtConverter` | `litert.rs` | TFLite flatbuffer (`flatc`-generated schema) | `litert-runtime` |
@@ -114,6 +114,42 @@ Rules that hold for every converter:
   A scalar result keeps the `[1]` CoreML boundary representation without changing the WebNN rank.
 - Float16 weights go to the weight blob written by `weight_file_builder.rs` and returned as
   `weights_data`.
+- `transpose`, `reshape` and `cast` of a constant are folded into a new constant before
+  emission (`coreml_constant_fold.rs`, applied to a copy of the graph at the start of
+  `convert`). The Neural Engine admits `matmul(x, const)` but refuses
+  `matmul(x, transpose(const))`, and a literal lowering would also transpose the weight on
+  every dispatch on the CPU and GPU paths; GPT-Neo style graphs carry one such transpose per
+  projection. The folded operand keeps its index and name, graph inputs and outputs are never
+  rewritten, a constant with other consumers keeps its payload, and chains fold in one pass.
+  Narrow integer constants (8-bit and 4-bit, the quantized weights whose casts and reshapes
+  are dequantization chains that would otherwise be stored widened), and casts that WebNN leaves implementation-defined (a float whose
+  truncation does not fit the integer target, or NaN) stay in the graph.
+- WebNN names need not be MIL identifiers, and its input/output namespaces are independent.
+  Unsafe or colliding names receive unique physical identifiers. Creator-defined
+  `rustnn.webnn.input_aliases` and `rustnn.webnn.output_aliases` JSON mappings preserve
+  logical bindings in byte-buffer, retained-tensor and one-shot execution, and standalone
+  exports. The JSON maps define the binding contract; models without them keep literal names.
+  See the [tensor-name contract](https://rustnn.github.io/rustnn/integration/coreml/#tensor-names).
+  Source-proven copies with identical type, shape and pending layout share one
+  physical result: CoreML can omit duplicate scalar/dynamic copy features from prediction.
+  Logical tensors still receive independent results. Unequal computations and real dtype
+  conversions remain distinct. Same-float32 casts lower as identity rather than the native
+  cast kernel, which can narrow represented values through float16.
+  Produced copies rooted in a graph input additionally record that source and its descriptor
+  in `rustnn.webnn.output_passthroughs`. Execution snapshots the original bound input before
+  prediction, validates its dtype, actual shape and byte length, then supplies independent
+  output bytes. This also preserves a public float32 copy when CoreML narrows another consumer.
+  Copy proofs cover identity, same-type cast, same-shape reshape, identity transpose, and
+  static full-span, unit-stride slice. An equal square shape does not prove a transpose is
+  an identity; dynamic maximum extents do not prove a full-span slice.
+  Copies rooted in original constants use version-2 `rustnn.webnn.output_constant_copies`
+  metadata: output bindings reference a descriptor, original weight-record offset and
+  consistency checksum, without embedding tensor payloads. Unchanged blob weights reuse
+  their record; immediate or converted constants retain one original raw record per source.
+  Execution validates referenced ranges and byte lengths, shares the immutable weight owner
+  or compacts only the required ranges, then supplies independently owned results. Standalone
+  compiled models require the original weights sidecar. The valid native graph still
+  runs; arithmetic-derived outputs are not reconstructed from inputs or constants.
 - The internal `shape` extension lowers to MIL `shape`, retaining its native int32 result
   inside CoreML and widening the public int64 result at readback. Imported shape tensors
   retain their type and rank through the shared `unsqueeze` inference path.
@@ -171,3 +207,73 @@ inference.
 
 Then write the regression test first, fix the lowering, and run the WPT cases for the operation
 on every backend you have.
+
+## Burn CPU
+
+With `burn-runtime-cpu`, `BurnConverter` lowers typed operations and embedded constants
+into an in-memory execution plan when the graph is built. The CPU runtime prepares and
+replays it using Burn NdArray and host kernels. Conversion and execution are enabled
+together by this single feature.
+The MLContext builder passes its validated graph to Burn preparation, which checks only
+backend tensor representation limits and initializes constants and lifetimes. Operation
+arity, datatype and graph structure rules belong to the builder and are not revalidated
+by Burn preparation. Dispatch does not serialize or deserialize the graph. Prepared
+execution retains graph outputs and constants, releases intermediate tensors after their final consumer, and
+clears temporary state after failed runs. Serialized standalone execution validates plan
+structure and metadata at its external entry point and prepares a fresh runtime per call.
+Both paths retain tensor payload validation and kernel-result publication checks.
+Constant dimensions must be static; runtime inputs may use bounded dynamic dimensions.
+Resampling shape inference floors scaled dimensions and dynamic bounds. Burn float
+resampling uses the same flooring rule as its integer path; explicit sizes override
+scales, and sampling coordinates use the actual output-to-input size ratio.
+Packed int4/uint4 constants and tensors use the shared nibble codecs from `graph.rs`.
+Decoding uses the logical shape's element count, so the unused high nibble of odd-length
+buffers is ignored. Quantization computes logical values, clamps to the target 4-bit range,
+and packs outputs with zero padding. The typed host interpreter handles integer arithmetic,
+comparisons, casts, reductions, tensor movement and integer indices using exact integer
+payloads. Broadcast and block quantization parameters preserve integer zero points;
+dequantization subtracts them before converting to floating point. Integer arithmetic wraps
+to the operand width, integer casts reinterpret the low bits, and float-to-integer casts
+truncate and saturate (NaN becomes zero). Strided slices use WebNN input-window
+extents, with output sizes computed as `ceil(size / stride)`, for floating-point and integer
+tensors. Integer clamp and padding bounds are parsed without
+passing through floating point. An operation involving integers must have an explicit typed
+implementation; dispatch rejects it rather than falling back to a float kernel.
+The runtime stores each operand in one opaque, validated value containing a Burn float
+tensor, signed integers, or unsigned integers. Its private storage variants and restricted
+integer kinds determine the datatype. Constructors check shape, length and integer range;
+only the environment owns its value map. Integer kernels use borrowed exact views and
+apply wrapping or cast conversion before constructing results. Import rejects out-of-range
+exact integers and fractional or non-finite narrow integers supplied as floats. Integer operands
+never acquire persistent float mirrors. The public serialized-plan executor generates its
+legacy float output view only when collecting results. Device outputs declared as float16
+are rounded at every operation boundary, as are host outputs. Accumulation inside
+a float16 operation can still use float32. See
+[Burn CPU](https://rustnn.github.io/rustnn/integration/burn-cpu/) for setup and precision limits.
+
+
+Burn runtime maintenance keeps datatype-independent movement in `typed/movement.rs`,
+integer arithmetic and conversion in `typed.rs`, recurrent kernels in `rnn.rs`, and floating
+host kernels in `float_ops.rs` and `host_array.rs`. `value.rs` owns operand storage and output
+conversion; `tensor_env.rs` owns the operand map and exposes read-only inputs to kernels.
+`execute.rs` explicitly routes operations to shared movement, typed arithmetic or float
+execution. Every kernel writes through `outputs.rs`, which requires datatype metadata,
+checks output ownership and exactly-once completeness, and stages all results until the
+operation succeeds. Checked value construction enforces storage shape, length and datatype;
+graph output binding shapes are checked before publication, including dynamic dimensions.
+Float16 rounding occurs at this shared output boundary.
+`shape.rs` owns validated slice and reduction descriptors, broadcasting and axis helpers.
+Slice windows and reduction output shapes reuse the main shape-inference functions with
+resolved input dimensions; coordinate mapping is independent of datatype. Intermediate
+shapes are computed from runtime inputs, without adding serialized plan metadata.
+`runtime_tensor.rs` adapts runtime ranks to Burn const generics. Its local macros expand
+mechanical read, map, matching-rank binary and construction dispatch; scalar rank remains
+explicit, and numerical formulas stay in ordinary Rust functions. Adapter rank coverage is
+separate from backend capability: NdArray's native reshape and kernels that depend on it
+are limited to six ranks. Shared movement can use the plan's eight-rank limit for float
+and exact integer values. Layout and activation choices
+use the existing WebNN enums. Shared options that still contain strings are parsed at kernel
+entry by `options.rs`; empty strings retain their documented defaults and other invalid
+values return errors. Keep string conversion at serialization and API boundaries, not in
+numeric loops. The operator report scans both numeric dispatchers and the shared movement
+module, so moving an operation between them does not remove it from the report.

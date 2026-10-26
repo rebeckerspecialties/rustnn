@@ -16,6 +16,11 @@ The in-repo WPT harness runs upstream [WebNN conformance tests](https://github.c
 
 Unavailable backends are skipped at startup with a log message.
 
+The local fixture tests also exercise Node's module loader. Preloaded fixture modules use
+relative specifiers from the fixture directory so Windows drive letters are not interpreted
+as URL schemes. If a Windows launcher shim silently drops multiline `node -e` scripts,
+put the actual Node installation directory first on `PATH` when running the tests.
+
 ## Quick start
 
 ```bash
@@ -149,16 +154,18 @@ Callbacks that require intermediate operands are reevaluated with shapes and
 types from the Rust builder, using Node.js and the fetched source file. No
 tolerance formula is reimplemented. An upstream callback that still returns
 an undefined or nonfinite budget remains a test failure.
-The strict finite-value comparator follows the upstream helpers: raw half-bit
-distance except signed zero, the helper's FP16 halfway rounding, and unrounded
+The strict finite-value comparator follows the upstream helpers: signed-magnitude
+bit distance for FP32 and FP16 (signed zeros are equal), expected values rounded
+directly to FP16 with ties-to-even as `Float16Array` does, and unrounded
 JavaScript-number expected values for ATOL. Its audit uses the same comparator
 and applied budget. Nonfinite values use classification rules instead of the
 upstream bit-distance helper: NaN matches NaN regardless of payload, and
 infinities must match in sign. A large budget cannot hide a class mismatch.
 ULP classification uses the expected value after conversion to the output
 dtype; ATOL retains the original source number, including at overflow boundaries.
-Strict FP16 runtime inputs and constants also use
-the upstream halfway-rounding helper; compatibility packing is unchanged.
+Strict FP16 runtime inputs and constants are also rounded directly from the
+source number, as upstream `toHalf` does; compatibility packing rounds through FP32
+and is unchanged.
 The JavaScript fixture bridge preserves negative zero in tensor data and floating-point
 options rather than losing its sign during JSON serialization. This source fidelity is
 separate from the ULP comparator, which continues to treat signed zeros as equal.
@@ -296,6 +303,13 @@ any published summary rather than combining these runs into one pass rate.
 
 `make test-wpt-report` (or `WPT_REPORT_JSON=...`) writes a JSON conformance report compatible with `scripts/wpt_bridge/render_conformance_html.mjs`. HTML is generated automatically unless `WPT_REPORT_HTML=""`.
 
+CoreML cases include `coremlExecution`: `logicalOutputs`, `provenCopyOutputs`, and
+`outputCopyBytes`. These are per-trial deltas even when a context is reused; observations
+are retained if comparison fails. `provenCopyOutputs` counts outputs supplied from
+graph-proven input/constant copies in successful dispatches, not CoreML's returned
+features. Those bytes are also included in `outputCopyBytes`. A zero count does not
+establish accelerator placement, and none of these counters measures CoreML-internal work.
+
 Report schema: per-file summaries, per-case status (`pass`/`fail`/`skip`), duration, and error messages.
 
 ## Module layout
@@ -358,3 +372,17 @@ A scheduled workflow (`.github/workflows/wpt-sync.yml`) runs these and opens a P
 **Parse warnings (`file_errors`)** — Some WPT files may fail to parse; warnings are logged but do not fail the run.
 
 **Slow TRTX runs** — TensorRT engine compilation per trial makes a full debug-build run take tens of minutes. Use `make test-wpt-op OP=<op>` to iterate on a single operation.
+
+### Burn CPU
+
+`make test-wpt-burn-cpu` uses `burn-runtime-cpu` and selects `Backend::BurnCpu` through the
+shared MLContext runner. `TEST_FILTER=relu` limits trials. Regenerate
+`tests/wpt_conformance/burn-cpu_expected_failures.txt` with `make wpt-sync-burn-cpu`.
+Direct Cargo runs use `WPT_BACKEND=burn-cpu`. No GPU or external runtime is required.
+
+The Node fixture sandbox exposes `structuredClone` for upstream fixtures that derive graphs
+by cloning their resources, including affine instance-normalization layout cases.
+
+On pushes and pull requests to `main`, `wpt-conformance.yml` runs the full Burn CPU
+conformance suite in release mode on Linux. Unexpected failures fail CI; JSON and HTML
+reports are uploaded even when tests fail. The job enforces the pinned WPT revision.
