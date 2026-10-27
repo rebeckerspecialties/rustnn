@@ -793,10 +793,16 @@ mod tests {
                     } else {
                         builder.input("x", &descriptor).unwrap()
                     };
-                    let scale = builder.constant_from_value(T::Float32, 0.5f32).unwrap();
+                    // WebNN requires the scale and zero point to have the input's rank.
+                    let scale = builder
+                        .constant_from_slice(
+                            &MLOperandDescriptor::new(T::Float32, vec![1]),
+                            &[0.5f32],
+                        )
+                        .unwrap();
                     let zero_point = builder
                         .constant_from_bytes(
-                            &MLOperandDescriptor::new(data_type, vec![]),
+                            &MLOperandDescriptor::new(data_type, vec![1]),
                             vec![zero_point],
                         )
                         .unwrap();
@@ -892,9 +898,12 @@ mod tests {
                 let input = builder
                     .input("x", &MLOperandDescriptor::new(T::Float32, shape.clone()))
                     .unwrap();
-                let scale = builder.constant_from_value(T::Float32, 1.0f32).unwrap();
+                // WebNN requires the scale and zero point to have the input's rank.
+                let scale = builder
+                    .constant_from_slice(&MLOperandDescriptor::new(T::Float32, vec![1]), &[1.0f32])
+                    .unwrap();
                 let zero_point = builder
-                    .constant_from_bytes(&MLOperandDescriptor::new(data_type, vec![]), vec![0xf0])
+                    .constant_from_bytes(&MLOperandDescriptor::new(data_type, vec![1]), vec![0xf0])
                     .unwrap();
                 let quantized = builder
                     .quantize_linear_with_zeropoint(input, scale, zero_point)
