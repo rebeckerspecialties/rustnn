@@ -12,14 +12,16 @@ recurrent operations); there is no ONNX intermediate. The backend itself is
 | Feature | Use |
 |---|---|
 | `trtx-runtime` | The backend and converter; pulls in `trtx`, `cudarc` and `zstd-cache-compression` |
-| `trtx-runtime-mock` | Builds the converter and the `--run-trtx` CLI path against the mock `trtx` API, without TensorRT |
+| `trtx-converter` | Builds serialized engines through the NVIDIA SDK without rustnn dispatch |
 | `trtx-enterprise` | `trtx-runtime` linked against full TensorRT 10 (`nvinfer`, `nvonnxparser`) instead of the TensorRT-RTX libraries; RTX-only features such as CUDA graphs and the JIT runtime cache are compiled out. For validation only |
 | `zstd-cache-compression` | Compresses the on-disk caches; enabled by `trtx-runtime` |
 
 ## Requirements
 
 - An NVIDIA RTX GPU with a current driver. The CUDA driver API is loaded at run time through
-  `cudarc`; the CUDA toolkit is not required.
+  `cudarc`; the CUDA toolkit is not required. Device enumeration checks for the driver library
+  before initializing CUDA. If the library is missing or initialization fails, it reports no
+  TensorRT-RTX devices so automatic selection can try another backend.
 - The TensorRT-RTX 1.6 library. The `trtx` crate loads it by name (`tensorrt_rtx_1_6`), so the
   SDK's `lib` directory (Linux) or `bin` directory (Windows) must be on `LD_LIBRARY_PATH` or
   `PATH`, or the application calls `rustnn::backends::trtx::dynamically_load_tensorrt(Some(path))`
