@@ -204,6 +204,11 @@ Rules that hold for every converter:
     nontrailing or permuted axes that work is placed in its own Pipeline child, because a
     native plan that fuses it back can omit or reorder the parameters. A missing epsilon
     defaults to 1e-5.
+  - `instanceNormalization` with runtime scale or bias runs native `instance_norm` without
+    them and applies `mul`/`add` over the channel axis. An NHWC input takes the same
+    NHWC→NCHW and NCHW→NHWC transposes around the native op as the constant-affine path.
+    Scale or bias computed from constants (a widening `cast` of float16 constants, which
+    the constant-view fold keeps in the graph) takes this path too.
   - Pipeline boundaries take shape bounds through every shape-preserving MIL operation
     (casts and copies, unary arithmetic, activations, normalization, `softmax`), so a
     bounded dynamic dimension keeps its provenance across a cut.
