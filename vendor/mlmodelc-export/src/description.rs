@@ -20,6 +20,8 @@ pub(crate) struct FeatureDescription {
     pub optional: bool,
     pub shape: Vec<i64>,
     pub flexibility: Option<ShapeFlexibility>,
+    /// Declared through `FeatureType.stateType` (a model state, not an input).
+    pub state: bool,
 }
 
 impl FeatureDescription {
@@ -44,6 +46,8 @@ pub(crate) struct FunctionDescription {
     pub name: String,
     pub inputs: Vec<FeatureDescription>,
     pub outputs: Vec<FeatureDescription>,
+    /// Model states (`ModelDescription.state` / `FunctionDescription.state`).
+    pub states: Vec<FeatureDescription>,
 }
 
 #[derive(Debug, Default)]
@@ -68,6 +72,10 @@ impl ModelDescription {
                 10 => result
                     .main
                     .outputs
+                    .push(decode_feature(reader.read_length_delimited())),
+                13 => result
+                    .main
+                    .states
                     .push(decode_feature(reader.read_length_delimited())),
                 20 => result
                     .functions
@@ -126,6 +134,9 @@ fn decode_function(data: &[u8]) -> FunctionDescription {
             3 => result
                 .outputs
                 .push(decode_feature(reader.read_length_delimited())),
+            6 => result
+                .states
+                .push(decode_feature(reader.read_length_delimited())),
             _ => reader.skip(wire),
         }
     }
@@ -144,6 +155,17 @@ fn decode_feature(data: &[u8]) -> FeatureDescription {
                 while let Some((field, wire)) = ty.read_tag() {
                     match field {
                         5 => decode_array(ty.read_length_delimited(), &mut result),
+                        8 => {
+                            // StateFeatureType { ArrayFeatureType arrayType = 1; }
+                            result.state = true;
+                            let mut state = PBReader::new(ty.read_length_delimited());
+                            while let Some((field, wire)) = state.read_tag() {
+                                match field {
+                                    1 => decode_array(state.read_length_delimited(), &mut result),
+                                    _ => state.skip(wire),
+                                }
+                            }
+                        }
                         1000 => result.optional = ty.read_varint() != 0,
                         _ => ty.skip(wire),
                     }

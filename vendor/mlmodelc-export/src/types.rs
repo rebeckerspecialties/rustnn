@@ -70,11 +70,15 @@ impl std::fmt::Display for MILDimension {
     }
 }
 
-/// A MIL tensor type: data type + shape.
+/// A MIL tensor type: data type + shape, optionally wrapped in a model state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MILType {
     pub data_type: MILDataType,
     pub shape: Vec<MILDimension>,
+    /// `state<tensor<...>>` (CoreML8 / iOS 18): a mutable state the program
+    /// reads with `read_state` and writes with `write_state`. State tensors
+    /// have fixed shapes; CoreML accepts only fp16 state storage.
+    pub state: bool,
 }
 
 impl MILType {
@@ -86,7 +90,17 @@ impl MILType {
     }
 
     pub fn with_dimensions(data_type: MILDataType, shape: Vec<MILDimension>) -> Self {
-        Self { data_type, shape }
+        Self {
+            data_type,
+            shape,
+            state: false,
+        }
+    }
+
+    /// Wrap this tensor type in a model state (`state<tensor<...>>`).
+    pub fn into_state(mut self) -> Self {
+        self.state = true;
+        self
     }
 
     /// Returns `None` if any extent is determined at runtime.
@@ -105,17 +119,24 @@ impl MILType {
         self.shape.is_empty()
     }
 
-    /// Format as MIL text: `fp32` for scalars, `tensor<fp32, [1, 32]>` for tensors.
+    /// Format as MIL text: `fp32` for scalars, `tensor<fp32, [1, 32]>` for tensors
+    /// and `state<tensor<fp16, [1, 32]>>` for model states.
     pub fn text_representation(&self) -> String {
-        if self.is_scalar() {
-            return self.data_type.text_name().to_string();
+        let inner = if self.is_scalar() {
+            self.data_type.text_name().to_string()
+        } else {
+            let dims: Vec<String> = self.shape.iter().map(|d| d.to_string()).collect();
+            format!(
+                "tensor<{}, [{}]>",
+                self.data_type.text_name(),
+                dims.join(", ")
+            )
+        };
+        if self.state {
+            format!("state<{inner}>")
+        } else {
+            inner
         }
-        let dims: Vec<String> = self.shape.iter().map(|d| d.to_string()).collect();
-        format!(
-            "tensor<{}, [{}]>",
-            self.data_type.text_name(),
-            dims.join(", ")
-        )
     }
 }
 

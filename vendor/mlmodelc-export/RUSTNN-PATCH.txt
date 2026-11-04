@@ -1,2 +1,11 @@
 Source: rebeckerspecialties/mlmodelc-export commit f958affe4cc8d26776d090f27bf244840887fca2.
-Source files are unchanged from that commit. Vendored while the nested-block exporter prerequisite is awaiting release, so this RustNN branch and deployed binaries do not depend on a sibling checkout. Replace with the released crate after the prerequisite lands.
+Vendored while the nested-block exporter prerequisite is awaiting release, so this RustNN branch and deployed binaries do not depend on a sibling checkout. Replace with the released crate after the prerequisite lands.
+
+Local delta on top of that commit (to be upstreamed before the next crate release):
+- types.rs: `MILType.state` and `MILType::into_state`; `state<tensor<...>>` text form.
+- decoder.rs: `ValueType.stateType` (field 5) wrapping a tensor type.
+- description.rs: `FeatureType.stateType` (field 8), `ModelDescription.state` (field 13) and
+  `FunctionDescription.state` (field 6) as `FeatureDescription.state` / `FunctionDescription.states`.
+- emitter.rs: operations without outputs (`write_state`) are emitted as bare calls.
+- bundle.rs: state inputs leave `inputSchema` and are listed under `stateSchema` in metadata.json;
+  a synthesized description encodes states with `StateFeatureType`.

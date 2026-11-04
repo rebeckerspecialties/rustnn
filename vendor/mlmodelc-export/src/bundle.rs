@@ -232,13 +232,8 @@ pub fn generate_metadata_json(program: &MILProgram) -> Vec<u8> {
         }
     }
 
-    let inputs: Vec<(String, MILType)> = main_func
-        .map(|(_, f)| {
-            f.inputs
-                .iter()
-                .map(|i| (i.name.clone(), i.r#type.clone()))
-                .collect()
-        })
+    let (states, inputs): (NamedTypes, NamedTypes) = main_func
+        .map(|(_, f)| split_state_inputs(&f.inputs))
         .unwrap_or_default();
 
     let output_types: Vec<(String, MILType)> = main_func
@@ -295,11 +290,7 @@ pub fn generate_metadata_json(program: &MILProgram) -> Vec<u8> {
         json.push_str("    \"functions\" : [\n");
         for (index, (function_name, function)) in program.functions.iter().enumerate() {
             let function_description = description.function(function_name);
-            let function_inputs: Vec<_> = function
-                .inputs
-                .iter()
-                .map(|input| (input.name.clone(), input.r#type.clone()))
-                .collect();
+            let (function_states, function_inputs) = split_state_inputs(&function.inputs);
             let function_outputs: Vec<_> = function
                 .block
                 .outputs
@@ -318,7 +309,14 @@ pub fn generate_metadata_json(program: &MILProgram) -> Vec<u8> {
                     "        "
                 )
             ));
-            json.push_str("        \"stateSchema\" : [\n\n        ],\n");
+            json.push_str(&format!(
+                "        \"stateSchema\" : {},\n",
+                state_schema_list(
+                    &function_states,
+                    function_description.map(|d| d.states.as_slice()),
+                    "        "
+                )
+            ));
             json.push_str(&format!(
                 "        \"name\" : {},\n",
                 json_string(function_name)
@@ -367,7 +365,14 @@ pub fn generate_metadata_json(program: &MILProgram) -> Vec<u8> {
     json.push_str("    },\n");
 
     json.push_str("    \"isUpdatable\" : \"0\",\n");
-    json.push_str("    \"stateSchema\" : [\n\n    ],\n");
+    json.push_str(&format!(
+        "    \"stateSchema\" : {},\n",
+        state_schema_list(
+            &states,
+            main_description.map(|d| d.states.as_slice()),
+            "    "
+        )
+    ));
 
     json.push_str("    \"availability\" : {\n");
     for (i, (k, v)) in avail.iter().enumerate() {
@@ -422,10 +427,40 @@ pub fn generate_metadata_json(program: &MILProgram) -> Vec<u8> {
     json.into_bytes()
 }
 
+type NamedTypes = Vec<(String, MILType)>;
+
+/// Separate `state<...>` function inputs (reported under `stateSchema`) from
+/// ordinary inputs (`inputSchema`).
+fn split_state_inputs(inputs: &[MILNamedType]) -> (NamedTypes, NamedTypes) {
+    inputs
+        .iter()
+        .map(|input| (input.name.clone(), input.r#type.clone()))
+        .partition(|(_, ty)| ty.state)
+}
+
 pub(crate) fn schema_list(
     entries: &[(String, MILType)],
     features: Option<&[FeatureDescription]>,
     indent: &str,
+) -> String {
+    schema_list_of_kind(entries, features, indent, false)
+}
+
+/// `stateSchema` entries: like `schema_list`, but typed `State` and without the
+/// shape-flexibility fields (state shapes are fixed), matching `coremlc`.
+fn state_schema_list(
+    entries: &[(String, MILType)],
+    features: Option<&[FeatureDescription]>,
+    indent: &str,
+) -> String {
+    schema_list_of_kind(entries, features, indent, true)
+}
+
+fn schema_list_of_kind(
+    entries: &[(String, MILType)],
+    features: Option<&[FeatureDescription]>,
+    indent: &str,
+    state: bool,
 ) -> String {
     if entries.is_empty() {
         return format!("[\n\n{indent}]");
@@ -434,7 +469,12 @@ pub(crate) fn schema_list(
     for (i, (name, ty)) in entries.iter().enumerate() {
         let feature =
             features.and_then(|features| features.iter().find(|feature| &feature.name == name));
-        s.push_str(&schema_entry(name, ty, feature, &format!("{indent}  ")));
+        let entry = if state {
+            state_schema_entry(name, ty, feature, &format!("{indent}  "))
+        } else {
+            schema_entry(name, ty, feature, &format!("{indent}  "))
+        };
+        s.push_str(&entry);
         if i < entries.len() - 1 {
             s.push(',');
         }
@@ -442,6 +482,45 @@ pub(crate) fn schema_list(
     }
     s.push_str(indent);
     s.push(']');
+    s
+}
+
+fn state_schema_entry(
+    name: &str,
+    r#type: &MILType,
+    feature: Option<&FeatureDescription>,
+    indent: &str,
+) -> String {
+    let dt_str = match feature.map(|f| f.data_type) {
+        Some(65568) => "Float32",
+        Some(65552) => "Float16",
+        _ => format_data_type_for_meta(r#type.data_type),
+    };
+    let dimensions: Vec<String> = feature
+        .filter(|f| !f.shape.is_empty())
+        .map(|f| f.shape.iter().map(ToString::to_string).collect())
+        .unwrap_or_else(|| r#type.shape.iter().map(ToString::to_string).collect());
+    let mut s = format!("{indent}{{\n");
+    s.push_str(&format!("{indent}  \"dataType\" : \"{dt_str}\",\n"));
+    s.push_str(&format!(
+        "{indent}  \"isOptional\" : \"{}\",\n",
+        u8::from(feature.is_some_and(|f| f.optional))
+    ));
+    s.push_str(&format!(
+        "{indent}  \"formattedType\" : \"State ({dt_str} {})\",\n",
+        dimensions.join(" \u{00d7} ")
+    ));
+    s.push_str(&format!(
+        "{indent}  \"shortDescription\" : {},\n",
+        json_string(feature.map(|f| f.short_description.as_str()).unwrap_or(""))
+    ));
+    s.push_str(&format!(
+        "{indent}  \"shape\" : \"[{}]\",\n",
+        dimensions.join(", ")
+    ));
+    s.push_str(&format!("{indent}  \"name\" : {},\n", json_string(name)));
+    s.push_str(&format!("{indent}  \"type\" : \"State\"\n"));
+    s.push_str(&format!("{indent}}}"));
     s
 }
 
@@ -628,7 +707,8 @@ fn encode_function_description(name: &str, function: &MILFunction) -> Vec<u8> {
     append_proto_string(&mut bin, 1, name);
     for input in &function.inputs {
         let desc = encode_feature_description(&input.name, &input.r#type);
-        append_proto_length_delimited(&mut bin, 2, &desc);
+        // FunctionDescription.input = 2, FunctionDescription.state = 6.
+        append_proto_length_delimited(&mut bin, if input.r#type.state { 6 } else { 2 }, &desc);
     }
     for output_name in &function.block.outputs {
         let ty = find_output_type(output_name, &function.block);
@@ -645,15 +725,23 @@ fn encode_feature_description(name: &str, ty: &MILType) -> Vec<u8> {
         &ty.concrete_shape()
             .expect("a synthesized feature description needs a concrete shape"),
         ty.data_type,
+        ty.state,
     );
     append_proto_length_delimited(&mut bin, 3, &feature_type);
     bin
 }
 
-fn encode_feature_type(shape: &[usize], dt: MILDataType) -> Vec<u8> {
+fn encode_feature_type(shape: &[usize], dt: MILDataType, state: bool) -> Vec<u8> {
     let mut bin = Vec::new();
     let arr = encode_array_feature_type(shape, dt);
-    append_proto_length_delimited(&mut bin, 5, &arr);
+    if state {
+        // FeatureType.stateType = 8 { StateFeatureType.arrayType = 1 }
+        let mut state_type = Vec::new();
+        append_proto_length_delimited(&mut state_type, 1, &arr);
+        append_proto_length_delimited(&mut bin, 8, &state_type);
+    } else {
+        append_proto_length_delimited(&mut bin, 5, &arr);
+    }
     bin
 }
 

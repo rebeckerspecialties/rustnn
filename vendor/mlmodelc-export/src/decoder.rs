@@ -411,10 +411,35 @@ fn decode_value_type(data: &[u8]) -> Result<MILType, MILDecoderError> {
     while let Some((field, wire)) = reader.read_tag() {
         match field {
             1 => return decode_tensor_type(reader.read_length_delimited()),
+            5 => return decode_state_type(reader.read_length_delimited()),
             _ => reader.skip(wire),
         }
     }
     Ok(MILType::new(MILDataType::Float32, Vec::new()))
+}
+
+/// `StateType { ValueType wrappedType = 1; }`: a model state wrapping a tensor
+/// type. Function inputs of this type are declared as `state<tensor<...>>` and
+/// are read and written by `read_state` / `write_state`.
+fn decode_state_type(data: &[u8]) -> Result<MILType, MILDecoderError> {
+    let mut reader = PBReader::new(data);
+    while let Some((field, wire)) = reader.read_tag() {
+        match field {
+            1 => {
+                let wrapped = decode_value_type(reader.read_length_delimited())?;
+                if wrapped.state {
+                    return Err(MILDecoderError::UnsupportedFormat(
+                        "state types wrapping another state type".into(),
+                    ));
+                }
+                return Ok(wrapped.into_state());
+            }
+            _ => reader.skip(wire),
+        }
+    }
+    Err(MILDecoderError::UnsupportedFormat(
+        "state type without a wrapped tensor type".into(),
+    ))
 }
 
 fn decode_tensor_type(data: &[u8]) -> Result<MILType, MILDecoderError> {

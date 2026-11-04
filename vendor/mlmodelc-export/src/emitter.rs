@@ -135,17 +135,18 @@ fn emit_operation_at(op: &MILOperation, out: &mut MILOutputSink, shared_root: bo
     let padding = " ".repeat(depth);
     let indent = padding.as_str();
 
-    let Some(first_output) = op.outputs.first() else {
-        return;
-    };
-
     if op.r#type == "const" {
+        let Some(first_output) = op.outputs.first() else {
+            return;
+        };
         emit_const_operation(first_output, &op.attributes, indent, out, shared_root);
         return;
     }
 
     out.write_str(indent);
 
+    // `write_state(data = ..., input = ...)` has no outputs and therefore no
+    // left-hand side; coremlc prints it as a bare call.
     if op.outputs.len() > 1 {
         // MIL multi-output ops list each output as `type name` separated by
         // commas, with no enclosing brackets or parens. The two alternative
@@ -159,7 +160,7 @@ fn emit_operation_at(op: &MILOperation, out: &mut MILOutputSink, shared_root: bo
             out.write_str(&format!("{} {}", o.r#type.text_representation(), o.name));
         }
         out.write_str(" = ");
-    } else {
+    } else if let Some(first_output) = op.outputs.first() {
         out.write_str(&format!(
             "{} {} = ",
             first_output.r#type.text_representation(),
