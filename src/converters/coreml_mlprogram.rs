@@ -25,6 +25,7 @@
 /// - Better optimization
 ///
 /// This replaces the legacy NeuralNetwork format.
+use crate::converters::coreml_state::CarriedStatePair;
 use crate::converters::operand_name;
 use crate::error::GraphError;
 use crate::graph::{DataType, Dimension as GraphDimension, GraphInfo, OperandKind};
@@ -114,6 +115,10 @@ fn convert_zp_bytes(src: &[u8], src_dtype: &DataType, tgt_dtype: &DataType) -> V
 
 /// MIL operation type names (matching Chromium's implementation)
 mod mil_ops {
+    /// Carried state (CoreML8 / iOS 18): read the current value of a `state<...>` input.
+    pub const READ_STATE: &str = "read_state";
+    /// Carried state (CoreML8 / iOS 18): store a tensor into a `state<...>` input.
+    pub const WRITE_STATE: &str = "write_state";
     // Binary operations
     pub const ADD: &str = "add";
     pub const SUB: &str = "sub";
@@ -5549,9 +5554,137 @@ impl super::GraphConverter for CoremlMlProgramConverter {
     }
 
     fn convert(&self, graph_info: &GraphInfo) -> Result<super::ConvertedGraph, GraphError> {
+        self.convert_with_carried_state(graph_info, &[])
+    }
+}
+
+/// Lowering plan for the carried-state pairs of one conversion (see
+/// [`super::coreml_state`]): the state named after each paired input, keyed by the
+/// operand ids of the pair.
+#[derive(Default)]
+struct CarriedStates {
+    by_input: HashMap<u32, String>,
+    by_output: HashMap<u32, String>,
+}
+
+impl CarriedStates {
+    fn new(graph: &GraphInfo, pairs: &[CarriedStatePair]) -> Result<Self, GraphError> {
+        let mut states = Self::default();
+        for pair in pairs {
+            super::coreml_state::check_pair(graph, pair)?;
+            let name = pair.input_name(graph);
+            if states.by_input.insert(pair.input, name.clone()).is_some()
+                || states.by_output.insert(pair.output, name.clone()).is_some()
+            {
+                return Err(GraphError::ConversionFailed {
+                    format: "coreml_mlprogram".to_string(),
+                    reason: format!(
+                        "carried state '{}' -> '{}' reuses an operand of another pair",
+                        name,
+                        pair.output_name(graph)
+                    ),
+                });
+            }
+        }
+        Ok(states)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.by_input.is_empty()
+    }
+}
+
+impl CoremlMlProgramConverter {
+    /// `state<tensor<fp16, shape>>` function input for a carried-state pair. CoreML accepts
+    /// only float16 state storage.
+    fn create_state_value_type(
+        graph: &GraphInfo,
+        operand_id: u32,
+        name: String,
+    ) -> Result<NamedValueType, GraphError> {
+        use crate::protos::coreml::mil_spec::{DataType as MilDataType, StateType, value_type};
+        let tensor = Self::create_value_with_mil_type(
+            graph,
+            operand_id,
+            name.clone(),
+            MilDataType::Float16 as i32,
+        )?;
+        Ok(NamedValueType {
+            name,
+            r#type: Some(ValueType {
+                r#type: Some(value_type::Type::StateType(Box::new(StateType {
+                    wrapped_type: tensor.r#type.map(Box::new),
+                }))),
+            }),
+        })
+    }
+
+    /// `read_state(input = <state>)`: the current state value as a float16 tensor.
+    fn create_read_state_operation(state_name: &str, output_type: NamedValueType) -> MilOperation {
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "input".to_string(),
+            Self::create_name_argument(state_name.to_string()),
+        );
+        Self::create_mil_operation(mil_ops::READ_STATE, inputs, vec![output_type])
+    }
+
+    /// `write_state(input = <state>, data = <value>)`: store a float16 tensor into the state.
+    /// The operation has no outputs; the model carries the value to the next prediction.
+    fn create_write_state_operation(state_name: &str, data_name: String) -> MilOperation {
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "input".to_string(),
+            Self::create_name_argument(state_name.to_string()),
+        );
+        inputs.insert("data".to_string(), Self::create_name_argument(data_name));
+        Self::create_mil_operation(mil_ops::WRITE_STATE, inputs, vec![])
+    }
+
+    /// `StateFeatureType` for the model description: a float16 array of the operand's shape.
+    fn create_state_feature_type(
+        descriptor: &crate::graph::OperandDescriptor,
+    ) -> Result<crate::protos::coreml::specification::FeatureType, GraphError> {
+        use crate::protos::coreml::specification::{
+            FeatureType, StateFeatureType, feature_type, state_feature_type,
+        };
+        let mut as_float16 = descriptor.clone();
+        as_float16.data_type = DataType::Float16;
+        let array = match Self::create_feature_type(&as_float16)?.r#type {
+            Some(feature_type::Type::MultiArrayType(array)) => array,
+            _ => {
+                return Err(GraphError::ConversionFailed {
+                    format: "coreml_mlprogram".to_string(),
+                    reason: "carried state requires an array feature".to_string(),
+                });
+            }
+        };
+        Ok(FeatureType {
+            r#type: Some(feature_type::Type::StateType(StateFeatureType {
+                r#type: Some(state_feature_type::Type::ArrayType(array)),
+            })),
+            ..Default::default()
+        })
+    }
+
+    /// Convert `graph_info`, keeping each carried-state pair inside the model as a CoreML
+    /// `MLState` (see [`super::coreml_state`]).
+    ///
+    /// With no pairs this is exactly [`super::GraphConverter::convert`]. With pairs, the paired
+    /// input becomes a `state<tensor<fp16, ...>>` function input read through `read_state`, the
+    /// paired output is written back with `write_state` instead of being returned, the function
+    /// uses the CoreML8 (iOS 18 / macOS 15) opset, and the model description lists the pair under
+    /// `state` instead of `input` and `output`. A `float32` pair is cast to and from the
+    /// float16 state storage inside the model.
+    pub fn convert_with_carried_state(
+        &self,
+        graph_info: &GraphInfo,
+        pairs: &[CarriedStatePair],
+    ) -> Result<super::ConvertedGraph, GraphError> {
         if !crate::graph::dynamic_inputs_enabled() && graph_info.has_dynamic_dimensions() {
             return Err(GraphError::DynamicInputsFeatureDisabled);
         }
+        let carried = CarriedStates::new(graph_info, pairs)?;
 
         // Create weight file builder for Float16 constants
         let mut weight_builder = super::WeightFileBuilder::new();
@@ -5609,6 +5742,12 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         reason: format!("Input operand {} not found", input_id),
                     })?;
             let input_name = operand_name(graph_info, input_id);
+            if carried.by_input.contains_key(&input_id) {
+                main_function.inputs.push(Self::create_state_value_type(
+                    graph_info, input_id, input_name,
+                )?);
+                continue;
+            }
             let value_type = Self::create_value_with_mil_type(
                 graph_info,
                 input_id,
@@ -5633,6 +5772,48 @@ impl super::GraphConverter for CoremlMlProgramConverter {
                         format: "coreml_mlprogram".to_string(),
                         reason: format!("Input operand {} not found", input_id),
                     })?;
+            if let Some(state_name) = carried.by_input.get(&input_id) {
+                // The consumers of a carried input read the state instead of a model input.
+                // CoreML stores states as float16; a float32 pair is widened after the read.
+                use crate::protos::coreml::mil_spec::DataType as MilDt;
+                let read_name = format!("{state_name}_read");
+                let graph_mil_type = Self::mil_data_type(&operand.descriptor.data_type)?;
+                if graph_mil_type == MilDt::Float16 as i32 {
+                    let read_type = Self::create_value_with_mil_type(
+                        graph_info,
+                        input_id,
+                        read_name.clone(),
+                        graph_mil_type,
+                    )?;
+                    main_block
+                        .operations
+                        .push(Self::create_read_state_operation(state_name, read_type));
+                } else {
+                    let stored_name = format!("{state_name}_state_read");
+                    let stored_type = Self::create_value_with_mil_type(
+                        graph_info,
+                        input_id,
+                        stored_name.clone(),
+                        MilDt::Float16 as i32,
+                    )?;
+                    main_block
+                        .operations
+                        .push(Self::create_read_state_operation(state_name, stored_type));
+                    let read_type = Self::create_value_with_mil_type(
+                        graph_info,
+                        input_id,
+                        read_name.clone(),
+                        graph_mil_type,
+                    )?;
+                    main_block.operations.push(Self::create_cast_operation(
+                        stored_name,
+                        read_type,
+                        Self::cast_dtype_string_for_graph_type(&operand.descriptor.data_type)?,
+                    ));
+                }
+                operand_name_overrides.insert(input_id, read_name);
+                continue;
+            }
             // int4/uint4/int64/uint32/uint64 have no MIL tensor type; represent them
             // internally as int32 (a proxy). The fp32 model input is cast to int32 here;
             // the executor delivers the original integer values widened to float32.
@@ -10443,6 +10624,31 @@ impl super::GraphConverter for CoremlMlProgramConverter {
             let graph_output_name =
                 Self::output_name_for_operand(graph_info, output_id, &operand_name_overrides);
             let graph_mil_type = Self::graph_value_mil_type(&operand.descriptor.data_type)?;
+            if let Some(state_name) = carried.by_output.get(&output_id) {
+                // The paired output is stored into the state and leaves the model outputs.
+                use crate::protos::coreml::mil_spec::DataType as MilDt;
+                let data_name = if graph_mil_type == MilDt::Float16 as i32 {
+                    graph_output_name
+                } else {
+                    let stored_name = format!("{output_name}_state_value");
+                    let stored_type = Self::create_value_with_mil_type(
+                        graph_info,
+                        output_id,
+                        stored_name.clone(),
+                        MilDt::Float16 as i32,
+                    )?;
+                    main_block.operations.push(Self::create_cast_operation(
+                        graph_output_name,
+                        stored_type,
+                        "fp16",
+                    ));
+                    stored_name
+                };
+                main_block
+                    .operations
+                    .push(Self::create_write_state_operation(state_name, data_name));
+                continue;
+            }
             let interface_mil_type = Self::interface_mil_data_type(&operand.descriptor.data_type);
             // Wide ints and argmin/argmax proxy outputs use int32 at the interface
             // (not float32); the executor widens int32 -> int64/uint64 on readback.
@@ -10506,11 +10712,17 @@ impl super::GraphConverter for CoremlMlProgramConverter {
             .map(|nv| nv.name.clone())
             .collect();
 
-        // Add block to function
-        main_function.opset = "CoreML7".to_string(); // Specify the active block specialization
+        // Add block to function. `read_state` / `write_state` need the CoreML8 (iOS 18)
+        // opset; every other graph keeps CoreML7 so its model bytes are unchanged.
+        let opset = if carried.is_empty() {
+            "CoreML7"
+        } else {
+            "CoreML8"
+        };
+        main_function.opset = opset.to_string(); // Specify the active block specialization
         main_function
             .block_specializations
-            .insert("CoreML7".to_string(), main_block);
+            .insert(opset.to_string(), main_block);
 
         // Add function to program
         program.functions.insert("main".to_string(), main_function);
@@ -10528,12 +10740,21 @@ impl super::GraphConverter for CoremlMlProgramConverter {
         use crate::protos::coreml::specification::{FeatureDescription, ModelDescription};
 
         let mut input_descriptions = Vec::new();
+        let mut state_descriptions = Vec::new();
         for &input_id in &graph_info.input_operands {
             if let Some(operand) = graph_info.operand(input_id) {
                 let input_name = operand_name(graph_info, input_id);
                 // Unused inputs were dropped from the function signature above;
                 // the model description must match it.
                 if !declared_input_names.contains(&input_name) {
+                    continue;
+                }
+                if carried.by_input.contains_key(&input_id) {
+                    state_descriptions.push(FeatureDescription {
+                        name: input_name,
+                        r#type: Some(Self::create_state_feature_type(&operand.descriptor)?),
+                        ..Default::default()
+                    });
                     continue;
                 }
                 input_descriptions.push(FeatureDescription {
@@ -10546,6 +10767,9 @@ impl super::GraphConverter for CoremlMlProgramConverter {
 
         let mut output_descriptions = Vec::new();
         for &output_id in &graph_info.output_operands {
+            if carried.by_output.contains_key(&output_id) {
+                continue;
+            }
             if let Some(operand) = graph_info.operand(output_id) {
                 let output_name = operand_name(graph_info, output_id);
                 // For int32 proxy outputs (argmin/argmax, or any wide int64/uint32/uint64
@@ -10570,6 +10794,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
         model.description = Some(ModelDescription {
             input: input_descriptions,
             output: output_descriptions,
+            state: state_descriptions,
             ..Default::default()
         });
 
@@ -11957,7 +12182,7 @@ mod tests {
             ]);
             let outputs =
                 HashMap::from([("result".to_string(), graph.operands[3].descriptor.clone())]);
-            let actual = run_coreml_bytes(&model, &inputs, &outputs).unwrap();
+            let actual = run_coreml_bytes(&model, &inputs, &outputs, None).unwrap();
             assert_eq!(
                 actual["result"],
                 bytemuck::cast_slice::<f32, u8>(&[30.0f32, 20.0])
@@ -12865,6 +13090,281 @@ mod tests {
             strings.values.as_slice(),
             ["EXACT"],
             "mode must be the scalar string \"EXACT\" to match the WebNN spec default",
+        );
+    }
+
+    /// `x` and `state_0` in, `next_state_0 = state_0 + x` and `y = next_state_0 + x` out.
+    fn recurrence_graph(data_type: crate::graph::DataType) -> crate::graph::GraphInfo {
+        use crate::graph::{GraphInfo, Operand, OperandDescriptor, OperandKind};
+        use crate::operators::Operation;
+        let operand = |kind, name: &str| Operand {
+            kind,
+            name: Some(name.to_string()),
+            descriptor: OperandDescriptor {
+                data_type,
+                shape: s(&[1, 4]),
+                pending_permutation: vec![],
+            },
+        };
+        GraphInfo {
+            operands: vec![
+                operand(OperandKind::Input, "x"),
+                operand(OperandKind::Input, "state_0"),
+                operand(OperandKind::Output, "next_state_0"),
+                operand(OperandKind::Output, "y"),
+            ],
+            input_operands: vec![0, 1],
+            output_operands: vec![2, 3],
+            operations: vec![
+                Operation::Add {
+                    a: 1,
+                    b: 0,
+                    options: None,
+                    outputs: vec![2],
+                },
+                Operation::Add {
+                    a: 2,
+                    b: 0,
+                    options: None,
+                    outputs: vec![3],
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn main_function(model: &Model) -> &crate::protos::coreml::mil_spec::Function {
+        match model.r#type.as_ref().expect("model type") {
+            crate::protos::coreml::specification::model::Type::MlProgram(program) => {
+                program.functions.get("main").expect("main function")
+            }
+            _ => panic!("not an MLProgram"),
+        }
+    }
+
+    fn feature_names(
+        features: &[crate::protos::coreml::specification::FeatureDescription],
+    ) -> Vec<&str> {
+        features.iter().map(|f| f.name.as_str()).collect()
+    }
+
+    #[test]
+    fn carried_state_pairs_lower_to_read_and_write_state() {
+        use crate::converters::coreml_state::carried_state_pairs;
+        use crate::graph::DataType;
+        use crate::mlcontextoptions::CoremlOptions;
+        use crate::protos::coreml::mil_spec::{DataType as MilDt, argument::binding::Binding};
+        use crate::protos::coreml::specification::{feature_type, state_feature_type};
+
+        let options = CoremlOptions {
+            carry_state_automatically: true,
+            ..Default::default()
+        };
+        for data_type in [DataType::Float16, DataType::Float32] {
+            let graph = recurrence_graph(data_type);
+            let pairs = carried_state_pairs(&graph, &options).unwrap();
+            assert_eq!(pairs.len(), 1, "{data_type:?}");
+            let converted = CoremlMlProgramConverter
+                .convert_with_carried_state(&graph, &pairs)
+                .unwrap();
+            let model = Model::decode(converted.data.as_slice()).unwrap();
+
+            // The pair leaves the input/output features and becomes a float16 state.
+            let description = model.description.as_ref().unwrap();
+            assert_eq!(feature_names(&description.input), ["x"]);
+            assert_eq!(feature_names(&description.output), ["y"]);
+            assert_eq!(feature_names(&description.state), ["state_0"]);
+            let Some(feature_type::Type::StateType(state)) = description.state[0]
+                .r#type
+                .as_ref()
+                .and_then(|t| t.r#type.as_ref())
+            else {
+                panic!("state feature type");
+            };
+            let Some(state_feature_type::Type::ArrayType(array)) = state.r#type.as_ref() else {
+                panic!("state array type");
+            };
+            assert_eq!(array.shape, [1, 4]);
+            assert_eq!(
+                array.data_type,
+                crate::protos::coreml::specification::array_feature_type::ArrayDataType::Float16
+                    as i32
+            );
+
+            // The function declares the state input and uses the iOS 18 opset.
+            let function = main_function(&model);
+            assert_eq!(function.opset, "CoreML8");
+            let names: Vec<&str> = function.inputs.iter().map(|i| i.name.as_str()).collect();
+            assert_eq!(names, ["x", "state_0"]);
+            let state_input = function.inputs[1].r#type.as_ref().unwrap();
+            let Some(crate::protos::coreml::mil_spec::value_type::Type::StateType(wrapped)) =
+                state_input.r#type.as_ref()
+            else {
+                panic!("state input type");
+            };
+            let Some(crate::protos::coreml::mil_spec::value_type::Type::TensorType(tensor)) =
+                wrapped
+                    .wrapped_type
+                    .as_ref()
+                    .and_then(|t| t.r#type.as_ref())
+            else {
+                panic!("wrapped tensor type");
+            };
+            assert_eq!(tensor.data_type, MilDt::Float16 as i32);
+
+            let block = &function.block_specializations["CoreML8"];
+            assert_eq!(block.outputs, ["y"]);
+            let binding = |op: &crate::protos::coreml::mil_spec::Operation, key: &str| match &op
+                .inputs[key]
+                .arguments[0]
+                .binding
+            {
+                Some(Binding::Name(name)) => name.clone(),
+                other => panic!("{key}: {other:?}"),
+            };
+            let reads: Vec<_> = block
+                .operations
+                .iter()
+                .filter(|op| op.r#type == "read_state")
+                .collect();
+            let writes: Vec<_> = block
+                .operations
+                .iter()
+                .filter(|op| op.r#type == "write_state")
+                .collect();
+            let casts = block
+                .operations
+                .iter()
+                .filter(|op| op.r#type == "cast")
+                .count();
+            assert_eq!(reads.len(), 1);
+            assert_eq!(writes.len(), 1);
+            assert_eq!(binding(reads[0], "input"), "state_0");
+            assert_eq!(binding(writes[0], "input"), "state_0");
+            assert!(writes[0].outputs.is_empty());
+            // float32 pairs are cast to and from the float16 state storage.
+            if data_type == DataType::Float16 {
+                assert_eq!(reads[0].outputs[0].name, "state_0_read");
+                assert_eq!(binding(writes[0], "data"), "next_state_0");
+                assert_eq!(casts, 0);
+            } else {
+                assert_eq!(reads[0].outputs[0].name, "state_0_state_read");
+                assert_eq!(binding(writes[0], "data"), "next_state_0_state_value");
+                assert_eq!(casts, 2);
+            }
+            // The consumers of the carried input read the state.
+            let add = block
+                .operations
+                .iter()
+                .find(|op| op.r#type == "add")
+                .unwrap();
+            assert_eq!(binding(add, "x"), "state_0_read");
+
+            #[cfg(feature = "coreml-export")]
+            {
+                let text = mlmodelc_export::compile_to_text(&converted.data)
+                    .unwrap()
+                    .mil_text;
+                assert!(text.contains("func main<ios18>("), "{text}");
+                assert!(
+                    text.contains("state<tensor<fp16, [1, 4]>> state_0"),
+                    "{text}"
+                );
+                assert!(text.contains("read_state(input = state_0)"), "{text}");
+                let data = if data_type == DataType::Float16 {
+                    "next_state_0"
+                } else {
+                    "next_state_0_state_value"
+                };
+                assert!(
+                    text.contains(&format!("write_state(data = {data}, input = state_0)")),
+                    "{text}"
+                );
+                let bundle = mlmodelc_export::compile_to_bundle(&converted.data, None).unwrap();
+                let metadata = String::from_utf8(bundle.metadata_json).unwrap();
+                let state_schema = metadata.split("\"stateSchema\"").nth(1).unwrap();
+                assert!(
+                    state_schema.contains("\"name\" : \"state_0\""),
+                    "{metadata}"
+                );
+                assert!(state_schema.contains("\"type\" : \"State\""), "{metadata}");
+                let input_schema = metadata.split("\"inputSchema\"").nth(1).unwrap();
+                assert!(!input_schema.contains("state_0"), "{metadata}");
+            }
+        }
+    }
+
+    #[test]
+    fn stateless_lowering_is_unchanged_without_pairs() {
+        use crate::converters::GraphConverter;
+        use crate::converters::coreml_state::carried_state_pairs;
+        use crate::graph::DataType;
+        use crate::mlcontextoptions::CoremlOptions;
+
+        let graph = recurrence_graph(DataType::Float32);
+        // The switches default to off: nothing is paired even for a conventional name.
+        assert!(
+            carried_state_pairs(&graph, &CoremlOptions::default())
+                .unwrap()
+                .is_empty()
+        );
+        let plain = CoremlMlProgramConverter.convert(&graph).unwrap();
+        let explicit = CoremlMlProgramConverter
+            .convert_with_carried_state(&graph, &[])
+            .unwrap();
+        // prost serializes the MIL argument maps in HashMap order, so compare the decoded
+        // models rather than the bytes.
+        let model = Model::decode(plain.data.as_slice()).unwrap();
+        assert_eq!(model, Model::decode(explicit.data.as_slice()).unwrap());
+        let description = model.description.as_ref().unwrap();
+        assert_eq!(feature_names(&description.input), ["x", "state_0"]);
+        assert_eq!(feature_names(&description.output), ["next_state_0", "y"]);
+        assert!(description.state.is_empty());
+        let function = main_function(&model);
+        assert_eq!(function.opset, "CoreML7");
+        assert!(
+            function.block_specializations["CoreML7"]
+                .operations
+                .iter()
+                .all(|op| op.r#type != "read_state" && op.r#type != "write_state")
+        );
+    }
+
+    #[test]
+    fn converter_rejects_invalid_carried_state_pairs() {
+        use crate::converters::coreml_state::CarriedStatePair;
+        use crate::graph::DataType;
+
+        let graph = recurrence_graph(DataType::Float32);
+        // An output operand is not a graph input.
+        assert!(
+            CoremlMlProgramConverter
+                .convert_with_carried_state(
+                    &graph,
+                    &[CarriedStatePair {
+                        input: 3,
+                        output: 2
+                    }]
+                )
+                .is_err()
+        );
+        // The same input in two pairs.
+        assert!(
+            CoremlMlProgramConverter
+                .convert_with_carried_state(
+                    &graph,
+                    &[
+                        CarriedStatePair {
+                            input: 1,
+                            output: 2
+                        },
+                        CarriedStatePair {
+                            input: 1,
+                            output: 3
+                        },
+                    ]
+                )
+                .is_err()
         );
     }
 }

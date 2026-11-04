@@ -7,6 +7,11 @@ This changelog consolidates the previous `RELEASE_NOTES_*.md` files into a singl
 ## [Unreleased]
 
 ### Added
+- CoreML: carried-state pairs kept inside the compiled model as `MLState` (`read_state` /
+  `write_state`, iOS 18 / macOS 15): `CoremlOptions::carried_state_pairs`,
+  `CoremlOptions::carry_state_automatically`, `MLGraph::rustnn_reset_state`,
+  `CoremlLoadDiagnostics::carried_state_pairs`, `converters::coreml_state`; the vendored
+  `mlmodelc-export` emits state inputs, `write_state` and the `stateSchema` metadata.
 
 ### Changed
 

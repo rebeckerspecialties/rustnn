@@ -178,6 +178,19 @@ pub struct CoremlOptions {
     /// products are unchanged. Zero admits no products. Defaults to `None`.
     /// This does not change contraction arithmetic or relax accuracy budgets.
     pub packed_weight_expansion_bytes: Option<u64>,
+    /// Graph `(input, output)` name pairs whose value is carried between dispatches inside the
+    /// compiled model as a CoreML `MLState` instead of crossing the host boundary. Mirrors the
+    /// `kvCachePairs` of the WebNN stateful-model explainer. Both operands must have the same
+    /// `float16` or `float32` data type and static shape; CoreML stores the state as `float16`.
+    /// The paired names leave the graph's dispatch bindings; states start as zeros and are
+    /// cleared with `MLGraph::rustnn_reset_state`. Defaults to empty. See
+    /// `rustnn::converters::coreml_state` and `docs/integration/coreml.md`.
+    pub carried_state_pairs: Vec<(String, String)>,
+    /// Also pair inputs and outputs by naming convention (`X`/`next_X`, `past_X`/`present_X`,
+    /// `X_in`/`X_out`) when they have matching data types and static shapes
+    /// (`rustnn::converters::coreml_state::candidate_output_names`). Defaults to `false`, which
+    /// keeps every existing graph lowered exactly as before; accepted pairs are logged at `info`.
+    pub carry_state_automatically: bool,
 }
 
 #[allow(clippy::derivable_impls)]
@@ -187,6 +200,8 @@ impl Default for CoremlOptions {
             reuse_tensor_storage: false,
             output_backings: true,
             packed_weight_expansion_bytes: None,
+            carried_state_pairs: Vec::new(),
+            carry_state_automatically: false,
         }
     }
 }

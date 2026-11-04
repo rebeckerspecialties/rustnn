@@ -17,6 +17,7 @@ use crate::graph::GraphInfo;
 mod coreml_mlprogram;
 /// Explicit native MIL scheduling utilities; independent of host arithmetic stages.
 pub mod coreml_packed;
+pub mod coreml_state;
 #[cfg(feature = "litert-runtime")]
 pub mod litert;
 pub mod onnx;

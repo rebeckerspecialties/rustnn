@@ -109,6 +109,37 @@ These count rustnn-side work, not total memory traffic or internal CoreML alloca
 reported compute-unit policy includes load fallback but does not measure accelerator
 placement. Take counter differences around the decode loop to exclude prefill and setup.
 
+## Carrying recurrent state inside the model
+
+A decode step of a recurrent or attention model takes its state (recurrent state,
+convolution history, KV cache) as graph inputs and returns the next state as graph outputs.
+By default every step crosses the host boundary with those arrays. With
+`RustNNOptions::coreml.carried_state_pairs` (explicit `(input, output)` name pairs, the
+`kvCachePairs` of the WebNN stateful-model explainer) or
+`RustNNOptions::coreml.carry_state_automatically` (pairs by naming convention: `X`/`next_X`,
+`past_X`/`present_X`, `X_in`/`X_out`; see `rustnn::converters::coreml_state`), the converter
+keeps each pair inside the compiled model as a CoreML `MLState`: the input is read with
+`read_state`, the output is stored with `write_state`, the function uses the CoreML8 (iOS 18 /
+macOS 15 / watchOS 11) opset, and the pair leaves the model's feature description. Both
+switches default to off, and the model bytes of a graph without pairs are unchanged.
+
+Rules and consequences:
+
+- A pair needs the same `float16` or `float32` data type and the same static shape on both
+  operands. CoreML stores every state as `float16`; a `float32` pair is cast after the read and
+  before the write inside the model, so the carried value is rounded to `float16` once per step.
+  Integer or dynamically shaped pairs are rejected (explicit) or skipped (automatic).
+- The paired names are not dispatch bindings any more: `MLGraph::input_descriptors` and
+  `output_descriptors` omit them and `dispatch` rejects tensors bound under those names.
+- Every state starts as zeros when the graph is built. `MLGraph::rustnn_reset_state` replaces
+  the state with fresh zeros, which is how a new conversation starts; an initial state cannot
+  be supplied through the pair. Only one state set exists per graph.
+- `CoremlLoadDiagnostics::carried_state_pairs` lists the pairs the model carries, so an
+  application can report how many of its inputs became states.
+- The exported bundle (`coreml-export`) declares `state<tensor<fp16, ...>>` function inputs,
+  emits `read_state` / `write_state`, and lists the states under `stateSchema` in
+  `metadata.json`; the vendored `mlmodelc-export` carries that support until the crate release.
+
 ## Testing
 
 ```bash

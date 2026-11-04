@@ -15,11 +15,12 @@ use log::debug;
 
 use crate::GraphInfo;
 use crate::backend_selection::DeviceType;
-use crate::converters::{CoremlMlProgramConverter, GraphConverter};
+use crate::converters::CoremlMlProgramConverter;
+use crate::converters::coreml_state::carried_state_pairs;
 use crate::error::Error;
 use crate::executors::coreml::{
-    CompiledCoremlModel, CoremlByteInput, CoremlTensorBinding, CoremlTensorStorage, compile_model,
-    run_coreml_bytes, run_coreml_tensors,
+    CompiledCoremlModel, CoremlByteInput, CoremlState, CoremlTensorBinding, CoremlTensorStorage,
+    compile_model, run_coreml_bytes, run_coreml_tensors,
 };
 use crate::graph::DataType;
 use crate::mlcontext::RustNNOptions;
@@ -67,11 +68,26 @@ pub(crate) struct CoremlTensor {
 pub(crate) struct CoremlGraph {
     model: CompiledCoremlModel,
     output_backings_eligible: bool,
+    /// The `MLState` carrying the graph's state pairs between dispatches; `None` for a
+    /// stateless model.
+    state: Option<CoremlState>,
 }
 
 impl CoremlGraph {
     pub(crate) fn load_diagnostics(&self) -> &crate::executors::coreml::CoremlLoadDiagnostics {
         self.model.load_diagnostics()
+    }
+
+    /// Replace the carried state with a fresh zero-initialized one. No-op without states.
+    pub(crate) fn reset_state(&mut self) -> crate::error::Result<()> {
+        if self.state.is_some() {
+            self.state = Some(
+                self.model
+                    .new_state()
+                    .map_err(|e| Error::GraphDispatchError { source: e.into() })?,
+            );
+        }
+        Ok(())
     }
 }
 
@@ -85,17 +101,14 @@ impl fmt::Debug for CoremlGraph {
 
 pub(crate) struct CoremlBuilder {
     device_type: DeviceType,
-    packed_weight_expansion_bytes: Option<u64>,
+    options: CoremlOptions,
 }
 
 impl fmt::Debug for CoremlBuilder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CoremlBuilder")
             .field("device_type", &self.device_type)
-            .field(
-                "packed_weight_expansion_bytes",
-                &self.packed_weight_expansion_bytes,
-            )
+            .field("options", &self.options)
             .finish()
     }
 }
@@ -103,29 +116,55 @@ impl fmt::Debug for CoremlBuilder {
 impl<'context, 'builder> MLBackendBuilder<'context, 'builder> for CoremlBuilder {
     fn build(&mut self, graph_info: GraphInfo) -> crate::error::Result<MLGraph<'context>> {
         let output_backings_eligible = supports_output_backings(&graph_info);
-        let mut converted = CoremlMlProgramConverter
-            .convert(&graph_info)
+        let pairs = carried_state_pairs(&graph_info, &self.options)
             .map_err(|e| Error::GraphBuildError { source: e.into() })?;
-        if let Some(cap) = self.packed_weight_expansion_bytes {
+        let mut converted = CoremlMlProgramConverter
+            .convert_with_carried_state(&graph_info, &pairs)
+            .map_err(|e| Error::GraphBuildError { source: e.into() })?;
+        if let Some(cap) = self.options.packed_weight_expansion_bytes {
             let changes = converted
                 .bound_coreml_packed_matmuls(cap)
                 .map_err(|e| Error::GraphBuildError { source: e.into() })?;
             debug!("CoreML bounded packed-weight scheduling: {changes:?}");
         }
-        let model = compile_model(
+        let mut model = compile_model(
             converted.data,
             converted.weights_data,
             self.device_type,
             supports_in_memory_asset(&graph_info),
         )
         .map_err(|e| Error::GraphBuildError { source: e.into() })?;
-        MLGraph::new(
+        let carried: Vec<(String, String)> = pairs
+            .iter()
+            .map(|pair| (pair.input_name(&graph_info), pair.output_name(&graph_info)))
+            .collect();
+        // Every carried pair starts as zeros inside the model; `MLGraph::rustnn_reset_state`
+        // recreates the state.
+        let state = if carried.is_empty() {
+            None
+        } else {
+            Some(
+                model
+                    .new_state()
+                    .map_err(|e| Error::GraphBuildError { source: e.into() })?,
+            )
+        };
+        model.record_carried_state_pairs(carried.clone());
+        let mut graph = MLGraph::new(
             MLBackendGraph::CoremlModel(CoremlGraph {
                 model,
                 output_backings_eligible,
+                state,
             }),
             &graph_info,
-        )
+        )?;
+        // The pairs leave the dispatch contract: the model neither reads them as inputs nor
+        // returns them as outputs.
+        for (input, output) in &carried {
+            graph.input_descriptors.remove(input);
+            graph.output_descriptors.remove(output);
+        }
+        Ok(graph)
     }
 }
 
@@ -258,6 +297,7 @@ impl CoremlContext {
             &native_inputs,
             &native_outputs,
             self.options.output_backings && coreml_graph.output_backings_eligible,
+            coreml_graph.state.as_ref(),
             &mut self.statistics,
         )
         .map_err(|e| Error::GraphDispatchError { source: e.into() })
@@ -280,7 +320,7 @@ impl<'context> MLBackendContext<'context> for CoremlContext {
     {
         Ok(Box::new(CoremlBuilder {
             device_type: self.device_type,
-            packed_weight_expansion_bytes: self.options.packed_weight_expansion_bytes,
+            options: self.options.clone(),
         }))
     }
 
@@ -443,9 +483,13 @@ impl<'context> MLBackendContext<'context> for CoremlContext {
                 .values()
                 .map(|i| i.data.len() as u64)
                 .sum::<u64>();
-            let result =
-                run_coreml_bytes(&coreml_graph.model, &byte_inputs, &graph.output_descriptors)
-                    .map_err(|e| Error::GraphDispatchError { source: e.into() })?;
+            let result = run_coreml_bytes(
+                &coreml_graph.model,
+                &byte_inputs,
+                &graph.output_descriptors,
+                coreml_graph.state.as_ref(),
+            )
+            .map_err(|e| Error::GraphDispatchError { source: e.into() })?;
             self.statistics.output_copy_bytes +=
                 result.values().map(|b| b.len() as u64).sum::<u64>();
             result
@@ -1188,5 +1232,196 @@ mod test {
             context.read_tensor(&out, &mut result).unwrap();
             assert_eq!(result, &[11.0f32, 22., 33., 44.]);
         }
+    }
+}
+
+#[cfg(test)]
+mod carried_state_tests {
+    use crate::backend_selection::Backend;
+    use crate::mlcontext::{
+        LoadDiagnostics, MLContext, MLContextOptions, MLGraph, MLNamedOperands, MLNamedTensors,
+        MLOperandDescriptor, MLPowerPreference, MLTensor, MLTensorDescriptor, RustNNOptions,
+    };
+    use crate::mlcontextoptions::CoremlOptions;
+    use crate::mlgraphbuilder::MLGraphBuilder;
+    use crate::operator_enums::MLOperandDataType;
+
+    const STEPS: usize = 3;
+    const X: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+
+    fn coreml_context<'a>(coreml: CoremlOptions) -> Option<MLContext<'a>> {
+        let options = RustNNOptions {
+            coreml,
+            ..Default::default()
+        };
+        let context = MLContext::create(
+            &MLContextOptions::new(MLPowerPreference::Default, true)
+                .with_rustnn_backend_hint(Backend::Coreml)
+                .with_rustnn_options(options),
+        );
+        match context {
+            Ok(ctx) => Some(ctx),
+            Err(crate::error::Error::NoBackendAvailableForBackendHint { .. }) => None,
+            Err(e) => panic!("unexpected context creation error: {e:?}"),
+        }
+    }
+
+    fn descriptor() -> MLOperandDescriptor {
+        MLOperandDescriptor::new(MLOperandDataType::Float32, vec![1, 4])
+    }
+
+    /// `next_state_0 = state_0 + x`; `y = next_state_0 + x`.
+    fn build<'c>(context: &mut MLContext<'c>) -> MLGraph<'c> {
+        let mut builder = MLGraphBuilder::new(context).unwrap();
+        let x = builder.input("x", &descriptor()).unwrap();
+        let state = builder.input("state_0", &descriptor()).unwrap();
+        let next_state = builder.add(state, x).unwrap();
+        let y = builder.add(next_state, x).unwrap();
+        let mut outputs = MLNamedOperands::new();
+        outputs.insert("next_state_0", next_state);
+        outputs.insert("y", y);
+        builder.build(&outputs).unwrap()
+    }
+
+    fn tensor(context: &mut MLContext<'_>) -> MLTensor {
+        let mut io = MLTensorDescriptor::from_operand_descriptor(&descriptor());
+        io.set_writable(true);
+        io.set_readable(true);
+        context.create_tensor(&io).unwrap()
+    }
+
+    /// Three steps with the state carried by the caller through a host round trip.
+    fn stateless_outputs(reuse_tensor_storage: bool) -> Option<Vec<[f32; 4]>> {
+        let mut context = coreml_context(CoremlOptions {
+            reuse_tensor_storage,
+            ..Default::default()
+        })?;
+        let mut graph = build(&mut context);
+        assert!(graph.input_descriptors.contains_key("state_0"));
+        assert!(graph.output_descriptors.contains_key("next_state_0"));
+        let (x, state, next_state, y) = (
+            tensor(&mut context),
+            tensor(&mut context),
+            tensor(&mut context),
+            tensor(&mut context),
+        );
+        context.write_tensor(&x, &X).unwrap();
+        context.write_tensor(&state, &[0.0f32; 4]).unwrap();
+        let mut ys = Vec::new();
+        for _ in 0..STEPS {
+            let mut inputs = MLNamedTensors::new();
+            inputs.insert("x", &x);
+            inputs.insert("state_0", &state);
+            let mut outputs = MLNamedTensors::new();
+            outputs.insert("next_state_0", &next_state);
+            outputs.insert("y", &y);
+            context.dispatch(&mut graph, &inputs, &outputs).unwrap();
+            let mut carried = [0.0f32; 4];
+            context.read_tensor(&next_state, &mut carried).unwrap();
+            context.write_tensor(&state, &carried).unwrap();
+            let mut out = [0.0f32; 4];
+            context.read_tensor(&y, &mut out).unwrap();
+            ys.push(out);
+        }
+        Some(ys)
+    }
+
+    fn stateful_step(
+        context: &mut MLContext<'_>,
+        graph: &mut MLGraph<'_>,
+        x: &MLTensor,
+        y: &MLTensor,
+    ) -> [f32; 4] {
+        let mut inputs = MLNamedTensors::new();
+        inputs.insert("x", x);
+        let mut outputs = MLNamedTensors::new();
+        outputs.insert("y", y);
+        context.dispatch(graph, &inputs, &outputs).unwrap();
+        let mut out = [0.0f32; 4];
+        context.read_tensor(y, &mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn carried_state_matches_the_host_round_trip_and_resets() {
+        let _ = pretty_env_logger::try_init();
+        let expected = [
+            [2.0, 4.0, 6.0, 8.0],
+            [3.0, 6.0, 9.0, 12.0],
+            [4.0, 8.0, 12.0, 16.0],
+        ];
+        for reuse_tensor_storage in [false, true] {
+            let Some(stateless) = stateless_outputs(reuse_tensor_storage) else {
+                return;
+            };
+            assert_eq!(stateless, expected);
+
+            for coreml in [
+                CoremlOptions {
+                    reuse_tensor_storage,
+                    carried_state_pairs: vec![("state_0".into(), "next_state_0".into())],
+                    ..Default::default()
+                },
+                CoremlOptions {
+                    reuse_tensor_storage,
+                    carry_state_automatically: true,
+                    ..Default::default()
+                },
+            ] {
+                let mut context = coreml_context(coreml).unwrap();
+                let mut graph = build(&mut context);
+                // The pair leaves the dispatch contract and is reported by the diagnostics.
+                assert_eq!(graph.input_descriptors.keys().collect::<Vec<_>>(), ["x"]);
+                assert_eq!(graph.output_descriptors.keys().collect::<Vec<_>>(), ["y"]);
+                let Some(LoadDiagnostics::Coreml(diagnostics)) = graph.rustnn_load_diagnostics()
+                else {
+                    panic!("CoreML load diagnostics");
+                };
+                assert_eq!(
+                    diagnostics.carried_state_pairs,
+                    [("state_0".to_string(), "next_state_0".to_string())]
+                );
+
+                let (x, y, state) = (
+                    tensor(&mut context),
+                    tensor(&mut context),
+                    tensor(&mut context),
+                );
+                context.write_tensor(&x, &X).unwrap();
+                let stateful: Vec<[f32; 4]> = (0..STEPS)
+                    .map(|_| stateful_step(&mut context, &mut graph, &x, &y))
+                    .collect();
+                assert_eq!(stateful, stateless, "reuse={reuse_tensor_storage}");
+
+                // Binding the carried pair is an error: the model has no such features.
+                let mut inputs = MLNamedTensors::new();
+                inputs.insert("x", &x);
+                inputs.insert("state_0", &state);
+                let mut outputs = MLNamedTensors::new();
+                outputs.insert("y", &y);
+                assert!(context.dispatch(&mut graph, &inputs, &outputs).is_err());
+
+                // A reset starts again from zeros; without a reset the state keeps growing.
+                assert_eq!(
+                    stateful_step(&mut context, &mut graph, &x, &y),
+                    [5.0, 10.0, 15.0, 20.0]
+                );
+                graph.rustnn_reset_state().unwrap();
+                assert_eq!(stateful_step(&mut context, &mut graph, &x, &y), expected[0]);
+            }
+        }
+    }
+
+    #[test]
+    fn reset_state_is_a_no_op_for_stateless_graphs() {
+        let Some(mut context) = coreml_context(CoremlOptions::default()) else {
+            return;
+        };
+        let mut graph = build(&mut context);
+        graph.rustnn_reset_state().unwrap();
+        let Some(LoadDiagnostics::Coreml(diagnostics)) = graph.rustnn_load_diagnostics() else {
+            panic!("CoreML load diagnostics");
+        };
+        assert!(diagnostics.carried_state_pairs.is_empty());
     }
 }
