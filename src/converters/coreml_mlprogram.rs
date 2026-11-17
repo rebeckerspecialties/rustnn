@@ -540,6 +540,8 @@ fn layer_norm_has_trailing_axes(graph: &GraphInfo, operation: &Operation) -> boo
         })
 }
 
+mod stride_two;
+
 /// Convert zero_point byte data from a source dtype to a target dtype.
 /// Only Int32 → Uint8 and Int32 → Int8 are supported; all other pairs are returned as-is.
 /// Values are clamped to the target range to avoid silent corruption.
@@ -12844,7 +12846,11 @@ impl CoremlMlProgramConverter {
                 .map(|c| c.data.len() + 128)
                 .sum(),
         );
-        let model = self.convert_with_precision_boundaries(graph_info, &mut weight_builder)?;
+        let mut model = self.convert_with_precision_boundaries(graph_info, &mut weight_builder)?;
+
+        // Apply layout-only normalization last, including slices introduced by
+        // arithmetic lowering. Keep native partition boundaries unchanged.
+        stride_two::rewrite_model(&mut model);
 
         // Serialize to bytes
         let mut buffer = Vec::new();
