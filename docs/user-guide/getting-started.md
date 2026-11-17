@@ -8,7 +8,7 @@ then shows how to load graphs from files and how to use the command line tool.
 | Requirement | Needed for |
 |---|---|
 | Rust 1.97 or newer (edition 2024); `rust-toolchain.toml` pins it for the repository itself | the crate |
-| `protoc`, the Protocol Buffers compiler, on `PATH` | `build.rs` compiles the ONNX and CoreML schemas |
+| `protoc`, the Protocol Buffers compiler, on `PATH` | `build.rs` compiles the CoreML schemas, and `webnn-onnx-utils` the ONNX one (default `onnx` feature) |
 | `flatc` | the `litert-runtime` feature only (TFLite schema) |
 | Node.js | the WPT conformance tests only |
 | A backend library | execution; see [Backends](https://rustnn.github.io/rustnn/api/rustnn/backend_selection/). The ONNX Runtime shared library works on every platform and is the usual starting point |
@@ -37,9 +37,12 @@ it under `/api/`) and in [Backends](https://rustnn.github.io/rustnn/api/rustnn/b
 ## Provide ONNX Runtime
 
 The `onnx-runtime` feature loads the ONNX Runtime shared library at run time from the path in
-`ORT_DYLIB_PATH`. The `ort` crate rustnn is built against requires ONNX Runtime 1.29; the
-library in Windows `System32` is older (1.17) and the process aborts with a `BadVersion` panic
-from `ort` when it is picked up, so set the variable before every run.
+`ORT_DYLIB_PATH`. The `ort` crate rustnn is built against requires ONNX Runtime 1.29 or newer.
+Set the variable to select the intended library; otherwise the platform loader searches for
+`libonnxruntime.so`, `libonnxruntime.dylib`, or `onnxruntime.dll`. rustnn loads it explicitly
+with `ort::init_from`, so missing or incompatible libraries return an initialization error
+and backend discovery skips ONNX Runtime. The environment or its initialization failure is
+cached for the process lifetime; restart after changing the library path.
 
 Download the pinned release. From the repository root with `make` installed:
 
@@ -86,37 +89,44 @@ in `src/lib.rs`; API examples are maintained with the code.
 See [Graph files and weights](../reference/graph-files.md) for the shared save/load/compile
 workflow and external-weight format links.
 
-## Command line tool
+## Convert a stored graph
 
-The `rustnn` binary validates a graph file, prints its inputs, outputs and dependency fan-out,
-and optionally exports or executes it. The commands below run from the repository root, where
-the sample graphs live in `examples/` and `--features` selects the backend for this package.
-It needs a runtime feature at build time (without one it exits with "rustnn CLI requires a
-runtime feature").
-Validation and conversion do not need `ORT_DYLIB_PATH`; `--run-onnx` does. Each `--run-*` flag
-exists only when its feature is compiled in (`--run-onnx` with `onnx-runtime`, `--run-trtx`
-with `trtx-runtime`, `--run-coreml` with `coreml-runtime` on macOS) and `--help` lists the
-flags of the current build.
+Enable the format's converter feature and disable default features if execution is not
+needed, for example `default-features = false, features = ["litert-converter"]`.
+The registry exposes only enabled converters:
 
-```bash
-# Validate and describe
-cargo run --features onnx-runtime -- examples/sample_graph.webnn
-
-# Graphviz export
-cargo run --features onnx-runtime -- examples/sample_graph.webnn --export-dot target/graph.dot
-dot -Tpng target/graph.dot -o target/graph.png
-
-# Convert; formats are onnx, coreml and, with their features, trtx, litert and cann
-cargo run --features onnx-runtime -- examples/sample_graph.webnn --convert onnx --convert-output target/graph.onnx
-
-# Convert and execute once with zeroed inputs (ORT_DYLIB_PATH must be set for --run-onnx)
-cargo run --features onnx-runtime -- examples/sample_graph.webnn --convert onnx --run-onnx
-cargo run --features onnx-runtime,trtx-runtime -- examples/sample_graph.webnn --convert onnx --run-trtx
-cargo run --features coreml-runtime -- examples/sample_graph.webnn --convert coreml --run-coreml   # macOS
+```rust,ignore
+let graph = rustnn::load_graph_from_path("examples/sample_graph.webnn")?;
+let converted = rustnn::ConverterRegistry::with_defaults().convert("litert", &graph)?;
+std::fs::write("model.tflite", &converted.data)?;
 ```
 
-`--tensor-limit <bytes>` raises the validator's tensor byte limit for very large models. The
-`make run`, `make viz`, `make onnx` and `make coreml` targets wrap these commands.
+Formats with external weights also return `ConvertedGraph::weights_data`; retain this
+sidecar as described in the [converter guide](../development/converters.md).
+See the [crate feature table](https://rustnn.github.io/rustnn/api/rustnn/#cargo-features)
+for conversion and execution requirements.
+
+## Command line
+
+The `rustnn-cli` workspace member discovers converters and compiled runtime backends from
+the library. Use `--list` to probe runtimes and `--help` to see enabled choices.
+
+```bash
+cargo run -p rustnn-cli -- --list
+cargo run -p rustnn-cli -- examples/sample_graph.webnn
+cargo run -p rustnn-cli -- examples/sample_graph.webnn --convert onnx --convert-output model.onnx
+cargo run -p rustnn-cli -- examples/sample_graph.webnn --run burn-cpu
+```
+
+A graph without flags prints its input/output metadata. Execution uses `MLContext` with
+zeroed inputs and prints output previews. Select `--run auto` for normal backend selection;
+`--accelerated` requests a GPU or NPU. The CLI uses `MLGraph` descriptors for tensor bindings.
+
+CLI features forward to the library. For conversion without execution dependencies, use
+`cargo run -p rustnn-cli --no-default-features --features rustnn/litert-converter -- ...`.
+Converted models go to stdout when no output path is given; diagnostics and tracing go to
+stderr. External weights require `--convert-output`. `RUST_LOG` filters diagnostics, with
+`info` as the default level.
 
 ## Next steps
 

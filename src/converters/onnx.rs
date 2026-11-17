@@ -1326,9 +1326,7 @@ impl OnnxConverter {
         let opts = match &op {
             Operation::AveragePool2d { options, .. }
             | Operation::MaxPool2d { options, .. }
-            | Operation::L2Pool2d { options, .. }
-            | Operation::GlobalAveragePool { options, .. }
-            | Operation::GlobalMaxPool { options, .. } => options.as_ref().unwrap_or(&default_pool),
+            | Operation::L2Pool2d { options, .. } => options.as_ref().unwrap_or(&default_pool),
             _ => return attributes,
         };
 
@@ -1492,9 +1490,7 @@ impl OnnxConverter {
         let opts = match &op {
             Operation::AveragePool2d { options, .. }
             | Operation::MaxPool2d { options, .. }
-            | Operation::L2Pool2d { options, .. }
-            | Operation::GlobalAveragePool { options, .. }
-            | Operation::GlobalMaxPool { options, .. } => options.as_ref().unwrap_or(&default_pool),
+            | Operation::L2Pool2d { options, .. } => options.as_ref().unwrap_or(&default_pool),
             _ => return attributes,
         };
         let layout = opts.layout.to_ascii_lowercase();
@@ -1697,9 +1693,7 @@ impl OnnxConverter {
         let opts = match &op {
             Operation::AveragePool2d { options, .. }
             | Operation::MaxPool2d { options, .. }
-            | Operation::L2Pool2d { options, .. }
-            | Operation::GlobalAveragePool { options, .. }
-            | Operation::GlobalMaxPool { options, .. } => options.as_ref(),
+            | Operation::L2Pool2d { options, .. } => options.as_ref(),
             _ => None,
         };
         if let Some(opts) = opts {
@@ -3959,9 +3953,7 @@ impl crate::converters::GraphConverter for OnnxConverter {
                 let pool_opts = match &op {
                     Operation::AveragePool2d { options, .. }
                     | Operation::MaxPool2d { options, .. }
-                    | Operation::L2Pool2d { options, .. }
-                    | Operation::GlobalAveragePool { options, .. }
-                    | Operation::GlobalMaxPool { options, .. } => options.as_ref(),
+                    | Operation::L2Pool2d { options, .. } => options.as_ref(),
                     _ => None,
                 };
                 let layout = pool_opts
@@ -8157,7 +8149,7 @@ impl crate::converters::GraphConverter for OnnxConverter {
                     let mut sizes = Vec::with_capacity(2);
                     for (axis_idx, scale) in scales.iter().enumerate() {
                         let in_dim = input_shape[axes[axis_idx]].max(1) as f64;
-                        let out_dim = (in_dim * *scale).round().max(1.0) as i64;
+                        let out_dim = (in_dim * *scale).floor().max(1.0) as i64;
                         sizes.push(out_dim);
                     }
                     sizes
@@ -10324,7 +10316,6 @@ mod tests {
             output_operands: vec![1],
             operations: vec![op],
             constant_operand_ids_to_handles: HashMap::new(),
-            id_to_constant_tensor_operand_map: HashMap::new(),
             quantized: false,
         };
         let converted = OnnxConverter.convert(&graph).expect("convert");
@@ -10449,7 +10440,6 @@ mod tests {
             output_operands: vec![3],
             operations,
             constant_operand_ids_to_handles: HashMap::new(),
-            id_to_constant_tensor_operand_map: HashMap::new(),
             quantized: true,
         };
 
@@ -10535,7 +10525,6 @@ mod tests {
             output_operands: vec![3],
             operations,
             constant_operand_ids_to_handles: HashMap::new(),
-            id_to_constant_tensor_operand_map: HashMap::new(),
             quantized: true,
         };
 
@@ -10619,7 +10608,6 @@ mod tests {
             output_operands: vec![3],
             operations,
             constant_operand_ids_to_handles: HashMap::new(),
-            id_to_constant_tensor_operand_map: HashMap::new(),
             quantized: true,
         };
 
@@ -10661,7 +10649,6 @@ mod tests {
             output_operands: vec![],
             operations: vec![],
             constant_operand_ids_to_handles: HashMap::new(),
-            id_to_constant_tensor_operand_map: HashMap::new(),
             quantized: true,
         };
 
@@ -10688,7 +10675,6 @@ mod tests {
             output_operands: vec![],
             operations: vec![],
             constant_operand_ids_to_handles: HashMap::new(),
-            id_to_constant_tensor_operand_map: HashMap::new(),
             quantized: true,
         };
 
@@ -10756,7 +10742,6 @@ mod tests {
             output_operands: vec![1],
             operations,
             constant_operand_ids_to_handles: HashMap::new(),
-            id_to_constant_tensor_operand_map: HashMap::new(),
             quantized: false,
         };
 
@@ -10822,7 +10807,6 @@ mod tests {
             output_operands: vec![3],
             operations,
             constant_operand_ids_to_handles: HashMap::new(),
-            id_to_constant_tensor_operand_map: HashMap::new(),
             quantized: false,
         };
 
@@ -10889,7 +10873,6 @@ mod tests {
                 outputs: vec![1],
             }],
             constant_operand_ids_to_handles: HashMap::new(),
-            id_to_constant_tensor_operand_map: HashMap::new(),
             quantized: false,
         };
 
@@ -10948,7 +10931,6 @@ mod tests {
             output_operands: vec![1],
             operations,
             constant_operand_ids_to_handles: HashMap::new(),
-            id_to_constant_tensor_operand_map: HashMap::new(),
             quantized: false,
         };
 
@@ -11021,7 +11003,6 @@ mod tests {
             output_operands: vec![1],
             operations,
             constant_operand_ids_to_handles: HashMap::new(),
-            id_to_constant_tensor_operand_map: HashMap::new(),
             quantized: false,
         };
 
@@ -11060,37 +11041,42 @@ mod tests {
         assert_eq!(reverse_attr.i, 1);
     }
 
-    // TODO: Get rid of this test once we run WPT promise_test.
-    // This test verifies the behaviour logic of resample2d-gather-shape-divergence.https.any.js
     #[test]
     fn test_resample2d_emits_exact_sizes() {
-        // 19 -> 37: fractional scales (37/19) floor to 36 in ORT, so the emitted Resize
-        // must carry exact int64 `sizes` and leave `scales` empty.
-        let src = r#"
-webnn_graph "t" v1 {
-  inputs { x: f32[1, 19, 19, 64]; }
-  nodes { y = resample2d(x, scales=[1.9473684, 1.9473684], axes=[1, 2]); }
-  outputs { y; }
-}"#;
-        let json = webnn_graph::parser::parse_wg_text(src).expect("parse");
-        let graph = crate::webnn_json::from_graph_json(&json).expect("import");
-        let converted = OnnxConverter.convert(&graph).expect("convert");
-        let model = ModelProto::decode(converted.data.as_slice()).expect("decode");
-        let proto = model.graph.expect("graph");
+        for (input_size, options, expected) in [
+            (19, "sizes=[37, 1], scales=[99, 99]", 37),
+            (3, "scales=[1.5, 1]", 4),
+            (19, "scales=[1.9473684, 1]", 36),
+            (16_777_217, "scales=[1, 1]", 16_777_217),
+        ] {
+            let src = format!(
+                r#"
+webnn_graph "t" v1 {{
+  inputs {{ x: f32[1, 1, {input_size}, 1]; }}
+  nodes {{ y = resample2d(x, {options}, axes=[2, 3]); }}
+  outputs {{ y; }}
+}}"#
+            );
+            let json = webnn_graph::parser::parse_wg_text(&src).expect("parse");
+            let graph = crate::webnn_json::from_graph_json(&json).expect("import");
+            let converted = OnnxConverter.convert(&graph).expect("convert");
+            let model = ModelProto::decode(converted.data.as_slice()).expect("decode");
+            let proto = model.graph.expect("graph");
 
-        let resize = proto
-            .node
-            .iter()
-            .find(|n| n.op_type == "Resize")
-            .expect("Resize node");
-        assert!(resize.input[2].is_empty(), "scales must be omitted");
-        let sizes = proto
-            .initializer
-            .iter()
-            .find(|t| t.name == resize.input[3])
-            .expect("sizes initializer");
-        assert_eq!(sizes.data_type, ProtoDataType::Int64 as i32);
-        assert_eq!(sizes.int64_data, vec![1, 37, 37, 64]);
+            let resize = proto
+                .node
+                .iter()
+                .find(|n| n.op_type == "Resize")
+                .expect("Resize node");
+            assert!(resize.input[2].is_empty(), "scales must be omitted");
+            let sizes = proto
+                .initializer
+                .iter()
+                .find(|t| t.name == resize.input[3])
+                .expect("sizes initializer");
+            assert_eq!(sizes.data_type, ProtoDataType::Int64 as i32);
+            assert_eq!(sizes.int64_data, vec![1, 1, expected, 1]);
+        }
     }
 
     #[test]
@@ -11180,7 +11166,6 @@ webnn_graph "t" v1 {
             output_operands: vec![6],
             operations,
             constant_operand_ids_to_handles: HashMap::new(),
-            id_to_constant_tensor_operand_map: HashMap::new(),
             quantized: false,
         };
 
@@ -11282,7 +11267,6 @@ webnn_graph "t" v1 {
             output_operands: vec![1],
             operations,
             constant_operand_ids_to_handles: HashMap::new(),
-            id_to_constant_tensor_operand_map: HashMap::new(),
             quantized: false,
         };
 
@@ -11352,7 +11336,6 @@ webnn_graph "t" v1 {
             output_operands: vec![1],
             operations,
             constant_operand_ids_to_handles: HashMap::new(),
-            id_to_constant_tensor_operand_map: HashMap::new(),
             quantized: false,
         };
 
@@ -11473,7 +11456,6 @@ webnn_graph "t" v1 {
             output_operands: vec![3],
             operations,
             constant_operand_ids_to_handles: HashMap::new(),
-            id_to_constant_tensor_operand_map: HashMap::new(),
             quantized: false,
         };
 
@@ -11538,7 +11520,6 @@ webnn_graph "t" v1 {
             output_operands: vec![1],
             operations,
             constant_operand_ids_to_handles: HashMap::new(),
-            id_to_constant_tensor_operand_map: HashMap::new(),
             quantized: false,
         };
 
@@ -11682,7 +11663,6 @@ webnn_graph "t" v1 {
             output_operands: vec![4],
             operations,
             constant_operand_ids_to_handles: HashMap::new(),
-            id_to_constant_tensor_operand_map: HashMap::new(),
             quantized: false,
         };
 
@@ -11781,7 +11761,6 @@ webnn_graph "t" v1 {
             output_operands: vec![3],
             operations,
             constant_operand_ids_to_handles: HashMap::new(),
-            id_to_constant_tensor_operand_map: HashMap::new(),
             quantized: false,
         };
 
@@ -11854,7 +11833,6 @@ webnn_graph "t" v1 {
             output_operands: vec![1],
             operations,
             constant_operand_ids_to_handles: HashMap::new(),
-            id_to_constant_tensor_operand_map: HashMap::new(),
             quantized: false,
         };
 
@@ -12001,7 +11979,6 @@ webnn_graph "t" v1 {
             output_operands: vec![8, 9],
             operations: vec![op],
             constant_operand_ids_to_handles,
-            id_to_constant_tensor_operand_map: HashMap::new(),
             quantized: false,
         };
 
@@ -12130,7 +12107,6 @@ webnn_graph "t" v1 {
             output_operands: vec![5, 6, 7],
             operations,
             constant_operand_ids_to_handles: HashMap::new(),
-            id_to_constant_tensor_operand_map: HashMap::new(),
             quantized: false,
         };
 
@@ -12262,7 +12238,6 @@ webnn_graph "t" v1 {
             output_operands: vec![8, 9],
             operations: vec![op],
             constant_operand_ids_to_handles,
-            id_to_constant_tensor_operand_map: HashMap::new(),
             quantized: false,
         };
 

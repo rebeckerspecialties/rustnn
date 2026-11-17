@@ -1,4 +1,4 @@
-//! NVIDIA TensorRT-RTX backend (`trtx-runtime` and `trtx-runtime-mock` features).
+//! NVIDIA TensorRT-RTX backend (`trtx-runtime` feature).
 //!
 //! Graphs are lowered with [`TrtxConverter`] straight into a TensorRT network, built into an
 //! engine, and executed with device tensors on a CUDA stream. Constants are marked
@@ -39,6 +39,7 @@ use crate::backends::caching::PersistentCache;
 #[cfg(feature = "zstd-cache-compression")]
 use crate::backends::caching::ZstdCompressedFileCache as TrtxCache;
 use crate::converters::TrtxConverter;
+use crate::converters::trtx_logger as LOGGER;
 use crate::error::Error;
 
 use crate::error::GraphBuilderError;
@@ -307,10 +308,6 @@ impl std::fmt::Debug for TrtxContext<'_> {
     }
 }
 
-// TODO: should make logger static or remove from API. It is anyway a global for TRT
-pub(crate) static LOGGER: std::sync::LazyLock<trtx::Logger> =
-    std::sync::LazyLock::new(|| trtx::Logger::log_crate().unwrap());
-
 impl<'context> TrtxContext<'context> {
     pub(crate) fn new(cuda_device_idx: u32, options: Option<&RustNNOptions>) -> TrtxResult<Self> {
         // this retains the primary context
@@ -418,7 +415,6 @@ pub(crate) struct TrtxBuilder<'builder> {
     runtime: Arc<Mutex<trtx::Runtime<'builder>>>,
     device_cache_id: String,
     operands: HashMap<String, MLOperand>,
-    strings: Vec<String>, //_parser: Option<OnnxParser<'builder>>,
     caching_enabled: bool,
     #[cfg(not(feature = "trtx-enterprise"))]
     runtime_cache_enabled: bool,
@@ -732,7 +728,6 @@ impl<'context> MLBackendContext<'context> for TrtxContext<'context> {
             device_cache_id: self.device_cache_id.clone(),
             cuda_context: Arc::clone(&self.cuda_ctx),
             operands: HashMap::new(),
-            strings: vec![],
             caching_enabled: self.options.engine_caching,
             #[cfg(not(feature = "trtx-enterprise"))]
             runtime_cache_enabled: self.options.runtime_cache,
@@ -978,6 +973,12 @@ impl<'context> MLBackendContext<'context> for TrtxContext<'context> {
 impl ListDevices for TrtxContext<'_> {
     fn list_devices() -> Vec<crate::backend_selection::BackendDevice> {
         trace!("Enumerating Trtx devices");
+        // cudarc panics on a missing driver library before it can return a CUDA error.
+        // SAFETY: Loads the system CUDA driver from trusted library search paths.
+        if !unsafe { sys::is_culib_present() } {
+            trace!("CUDA driver library not found; skipping TensorRT RTX");
+            return Vec::new();
+        }
         let Ok(()) = result::init() else {
             warn!("Could not enumerate CUDA devices for TensorRT RTX");
             return Vec::new();

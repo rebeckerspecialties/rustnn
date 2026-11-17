@@ -1,5 +1,5 @@
 //! Converter-only coverage for gather bounds on dynamically sized data.
-#![cfg(feature = "dynamic-inputs")]
+#![cfg(all(feature = "coreml-converter", feature = "dynamic-inputs"))]
 
 use prost::Message;
 use rustnn::GraphConverter;
@@ -58,7 +58,6 @@ fn graph(
             .expect("gather operation"),
         ],
         constant_operand_ids_to_handles: HashMap::new(),
-        id_to_constant_tensor_operand_map: HashMap::new(),
         quantized: false,
     }
 }

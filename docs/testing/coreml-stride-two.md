@@ -21,13 +21,13 @@ are unchanged. The pass runs after arithmetic lowering, immediately before model
 serialization, including inside existing native pipeline children.
 
 The pass is `rewrite_model()` in `src/converters/coreml_mlprogram/stride_two.rs`.
-The CoreML converter's `GraphConverter::convert()` calls it once the MLProgram is
-assembled, immediately before the model is serialized. When combining this with
-[precision-boundary lowering (#279)](https://github.com/rustnn/rustnn/pull/279),
-keep that call at the end of `convert()`, after #279's precision boundaries are
-materialized, rather than in the program-building helper that #279 factors out of
-`convert()`. This ensures slices introduced by later arithmetic lowering are
-rewritten, without changing the resulting pipeline partitioning.
+`convert_with_float16_precision()` in `src/converters/coreml_mlprogram.rs` calls it
+immediately before the model is serialized, after `convert_with_precision_boundaries()`
+has materialized the
+[precision boundaries (#279)](https://github.com/rustnn/rustnn/pull/279). Keep the call
+there rather than in the program-building helper `convert_program()`: slices introduced
+by arithmetic lowering are then rewritten in every pipeline child, without changing the
+pipeline partitioning.
 
 ## Device evidence (13 October 2026)
 

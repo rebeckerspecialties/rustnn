@@ -42,19 +42,117 @@ establishes placement, energy savings or prediction-time fallback; use separate 
 
 ## How a graph runs
 
-1. The converter lowers the graph to a MIL program. Rank-0 operands are promoted to `[1]` at the
+1. The converter lowers the graph to MIL programs. Rank-0 operands are promoted to `[1]` at the
    model boundary, comparison and logical results are produced as `uint8`, and reductions with
    empty axes, `resample2d` on arbitrary axis pairs and the stable `reduceLogSumExp` form are
    lowered explicitly because MIL has no direct equivalent.
-2. Float16 weights are written as a separate weights blob (`ConvertedGraph::weights_data`), and
-   the model is packaged as an in-memory asset together with that blob. Graphs for which the
-   in-memory compiler is known to misbehave (`gather` with a rank-0 index) are written to a
-   temporary directory and compiled from its URL instead (`supports_in_memory_asset`).
+2. Non-scalar float16, float32, int8 and uint8 constants are written to a separate shared weights
+   blob (`ConvertedGraph::weights_data`), which also keeps the original bytes of constants that
+   outputs copy (see Tensor names below). The in-memory and URL compile routes do not produce
+   identical results for every program, and neither is uniformly closer to WebNN, so the route
+   follows the float16 lowering. With `Native`, the model is packaged as an in-memory asset
+   together with that blob, and graphs with a reproduced difference compile from a temporary
+   directory's URL instead (`supports_in_memory_asset`): `gather` with a rank-0 index, int32
+   `neg`, int32 off-diagonal `triangular`, `convTranspose2d`, and `instanceNormalization` with
+   zero epsilon. With `Exact`, graphs compile from a URL, the route through which its float16
+   guarantees were qualified: in memory, widened float16 subtraction loses NaN classes under a
+   CPU and Neural Engine request. Input-free programs made entirely of proven constant copies
+   stay in memory with either lowering, because the URL compiler can crash in BNNS for such
+   data-free programs under a CPU and Neural Engine request. An input-free program with no
+   float16 operand follows the `Native` rule under `Exact` as well: the exact lowering changes
+   nothing in it, and the URL compiler, which evaluates such a program itself, returns 0 on
+   iOS and tvOS 26 and 27 for a constant `uint8` clamp that saturates to 255 (WPT mlNumber
+   "cast float to integer overflows"). Neither route forces CPU-only execution.
+   With [`CoremlFloat16Precision::Exact`](#float16-precision), explicit float16 rounding
+   boundaries are materialized as native Pipeline children, and with either lowering a
+   `layerNormalization` over nontrailing axes keeps its affine work in its own child. The
+   children expose live values only and reuse the original weight storage; the public WebNN
+   graph, types and shapes are unchanged.
 3. `MLGraphBuilder::build` compiles the model with `MLModel` and keeps the compiled model;
    `dispatch` binds `MLMultiArray`s over the tensor storage and runs a prediction.
-4. The legacy CLI path (`--convert coreml --run-coreml`) tries the compute-unit configurations in
-   turn and reports each attempt; `--coreml-compiled-output <dir>` stores the compiled
-   `.mlmodelc` for reuse.
+4. The `_with_weights` one-shot executors accept that blob and try compute-unit
+   configurations in turn. Converter-only users can generate protobufs and weights on
+   any host with `coreml-converter`; execution requires `coreml-runtime` on Apple platforms.
+
+## Float16 precision
+
+WebNN leaves the accumulation precision of float16 operations to the implementation
+([webmachinelearning/webnn#948](https://github.com/webmachinelearning/webnn/issues/948)), and
+whether represented subnormals must survive is open
+([webmachinelearning/webnn#967](https://github.com/webmachinelearning/webnn/issues/967)). Core ML
+uses that freedom differently per compute unit and chip, so the converter offers two lowerings,
+selected with `RustNNOptions::coreml.float16_precision`:
+
+- `Native` (default) lowers float16 to native float16 MIL kernels. It adds no operations, keeps
+  one MIL program and is the only form the Neural Engine can execute. In the CoreML WPT corpus
+  on an M4 Max (macOS 27.2), CPU requests pass every float16 trial and GPU requests fail only
+  the `resample2d` nearest-neighbour ties they share with float32. Neural Engine requests fail
+  some float16 trials: arg reductions, widening of subnormals, `elu`, `l2Pool2d` and
+  `roundEven` ties.
+- `Exact` keeps float16 storage but evaluates float16 arithmetic, activations, normalization and
+  data movement in float32, rounding once at each WebNN result, and materializes explicit
+  float16 rounding boundaries as Pipeline children. In the same WPT corpus it passes every
+  trial under CPU, GPU and Neural Engine requests, and on A12 and A10X it removed every native
+  float16 GELU failure under all three. The cost is more operations, Pipelines, URL compilation
+  and longer builds. Float32 work is not eligible for the Neural Engine, so under a Neural
+  Engine request `Exact` gets its values by running that work elsewhere.
+
+`docs/development/converters.md` lists the lowering rules for both. The WPT harness selects the
+lowering with `WPT_COREML_FLOAT16=native|exact` and the device with `WPT_COREML_DEVICE`.
+
+## Tensor names
+
+Input and output names remain independent in the RustNN API, including names containing
+spaces, Unicode, punctuation, leading digits or MIL keywords. The converter records JSON
+logical-to-physical bindings in creator-defined `rustnn.webnn.input_aliases` and
+`rustnn.webnn.output_aliases` metadata. RustNN applies them automatically; standalone
+consumers should apply them when binding and retrieving CoreML features.
+The JSON maps are the binding contract; models without them keep literal feature names.
+Duplicate logical keys are rejected, even when their values match. Bindings and original
+constant references are validated once when the model is loaded.
+Proven equal copy outputs may share one physical result, avoiding CoreML's omission of
+duplicate scalar/dynamic features. RustNN supplies each requested logical output tensor;
+unequal computations and real dtype conversions remain separate. Returning an original
+input or constant directly remains invalid under WebNN's build rules.
+Same-dtype `cast` is a proven copy and may be fulfilled without reading CoreML's returned
+feature; a cast that changes dtype still executes the conversion boundary.
+For produced copy chains rooted in an input, the serialized
+`rustnn.webnn.output_passthroughs` map identifies the logical input and original descriptor.
+RustNN validates dtype, actual shape and byte length and snapshots that input before
+prediction, supplying independent output copies even if CoreML omits or changes a copy
+feature. Standalone consumers should honor these proven-copy bindings too; they must not
+infer an input/output alias from matching names or values.
+Copy proofs also cover same-shape reshape, identity transpose and static full-span
+unit-stride slice. Original constant copies use version-2
+`rustnn.webnn.output_constant_copies` metadata: each source has its original descriptor,
+a `WeightMetadata` offset in `weights/weights.bin`, and a SeaHash checksum of its raw
+bytes. Independent output bindings reference these sources; metadata contains no tensor
+payloads. Unchanged blob-backed weights reuse the existing MIL record. Constants stored
+as immediates or changed during lowering retain one additional raw UINT8 record per source.
+Consumers validate the file records, referenced ranges, descriptor byte lengths and
+checksums before prediction. The checksum detects a mismatched sidecar, not malicious
+modification. In-memory compiled graphs share the existing immutable weight allocation;
+one-shot diagnostics borrow it, without decoding a second source allocation. URL-compiled
+graphs retain that owner only when its capacity is at most twice the uniquely referenced
+bytes; otherwise they compact just those ranges into one shared allocation, so a tiny
+copy output does not retain a large unrelated weight file.
+Standalone consumers must retain the original weights sidecar alongside the compiled
+model; a `.mlmodelc` alone cannot supply RustNN's exact original-copy values. RustNN does
+not export an `.mlpackage`: converter users must write the `.mlmodel` and retain
+`ConvertedGraph::weights_data` (the `weights.bin` bytes). A supplied sidecar whose records, byte lengths or checksums do
+not match fails closed, regardless of tensor size. `MLContext` and the
+`_with_weights` one-shot executors pass the sidecar. Without one, CoreML cannot compile a
+program that references `weights.bin`; in a model that still loads, every copied constant
+is a MIL immediate, and those outputs keep CoreML's computed values like other outputs.
+The native graph still runs; these proofs do not replace arithmetic-derived results.
+The same checked bindings apply with retained tensor storage enabled. Proven copies
+are snapshotted before prediction and written into independently owned outputs;
+they do not propose native output backings. Coalesced arithmetic outputs use the
+returned physical result, with at most one backing proposed per physical feature.
+`proven_copy_outputs` counts logical outputs supplied this way in successful dispatches,
+separately from `output_copy_bytes` (which also includes those copies). WPT reports record
+per-trial deltas, including trials whose later result comparison fails. Neither counter
+measures work or copies inside CoreML or its selected hardware.
 
 ## Reusing tensor storage
 
@@ -108,6 +206,30 @@ These count rustnn-side work, not total memory traffic or internal CoreML alloca
 reported compute-unit policy includes load fallback but does not measure accelerator
 placement. Take counter differences around the decode loop to exclude prefill and setup.
 
+Precision Pipelines (the `Exact` float16 lowering, and the explicit LayerNorm affine child for
+nontrailing axes) retain input tensor storage but copy returned outputs.
+CoreML applies the outer output-backing names while evaluating earlier children,
+which reject final features absent from their own descriptions. Backings are therefore
+proposed only for a single MLProgram, even when a Pipeline's source graph is static.
+
+## Converter-private input views
+
+The `Exact` float16 lowering can request a compact native Half input through creator-defined
+`rustnn.webnn.compact_input_views` metadata: a JSON array of `{source, view}` bindings
+between declared physical input features. These are backend details, not additional
+WebNN inputs; the original graph, logical dtype and shape remain unchanged.
+
+RustNN binds each private rank-one feature using the source's actual element count,
+including growing and shrinking bounded dimensions. Contiguous source arrays share
+their pointer with a native view whose deallocator retains the source owner. Padded
+or strided arrays instead receive an exact raw-Half copy, preserving subnormals,
+signed zero and NaN bits without a Float32 round trip. The original feature remains
+bound for actual-shape queries and other consumers. Metadata, native dtype, shape
+constraints and storage layout are checked before prediction; standalone consumers
+of these exports must supply the same private bindings.
+Persistent `MLTensor` dispatch uses these bindings with output backings enabled or
+disabled, retaining the tensor storage and private view owners through prediction.
+
 ## Testing
 
 ```bash
@@ -117,6 +239,7 @@ make wpt-sync-coreml              # regenerate tests/wpt_conformance/coreml_expe
 make test-coreml                  # unit and integration tests
 WPT_COREML_TENSOR_MODE=persistent make test-wpt-coreml
 WPT_COREML_TENSOR_MODE=backings make test-wpt-coreml
+WPT_COREML_FLOAT16=exact WPT_COREML_DEVICE=gpu make test-wpt-coreml   # Exact lowering, GPU request
 ```
 
 CoreML has no PASS snapshots; failing trials are listed in

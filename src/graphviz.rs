@@ -1,4 +1,4 @@
-//! Graphviz DOT export of a [`GraphInfo`] (CLI flag `--export-dot`).
+//! Graphviz DOT export of a [`GraphInfo`].
 
 use std::fmt::Write;
 
@@ -167,7 +167,6 @@ mod tests {
                 outputs: vec![2],
             }],
             constant_operand_ids_to_handles: Default::default(),
-            id_to_constant_tensor_operand_map: Default::default(),
             quantized: false,
         };
 

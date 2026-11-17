@@ -5,12 +5,11 @@
 | Tool | Notes |
 |---|---|
 | Rust | `rust-toolchain.toml` pins the channel (1.97.0 at the time of writing) with `rustfmt` and `clippy`; rustup installs it on first use. The CI workflows pin the same version, so bump them together |
-| `protoc` | Required: `build.rs` compiles the ONNX and CoreML protobuf schemas. Linux `apt-get install protobuf-compiler`, macOS `brew install protobuf`, Windows `winget install Google.Protobuf` |
+| `protoc` | Required: `build.rs` compiles the CoreML protobuf schemas, and `webnn-onnx-utils` the ONNX one (default `onnx` feature). Linux `apt-get install protobuf-compiler`, macOS `brew install protobuf`, Windows `winget install Google.Protobuf` |
 | `flatc` | Required for `litert-runtime` (TFLite schema). CI downloads the flatbuffers release binary; macOS `brew install flatbuffers` |
 | Node.js | WPT corpus fetch and evaluation (`scripts/fetch_wpt.mjs`, `scripts/wpt_bridge/`) |
 | Python 3 | Only for MkDocs (`pip install -r docs/requirements.txt`) and `scripts/generate_backend_operator_report.py` |
 | libclang | `trtx-runtime`: the `trtx-sys` crate generates bindings with autocxx; set `LIBCLANG_PATH` if it is not found |
-| Graphviz | Optional, for `make viz` |
 | Doxygen and cbindgen | Required for the documentation website and `make docs-capi`; install Doxygen with your package manager and cbindgen with `cargo install cbindgen --locked` |
 
 Windows: install the Visual Studio C++ build tools and run `git config --system core.longpaths true`
@@ -30,36 +29,44 @@ The default build needs no native runtime beyond the prerequisites above.
 | `cann-runtime` | An OHOS/Ascend HiAI environment and `libcann_shim.so` (or `CANN_SHIM_PATH`) |
 | `webnn-runtime` with `webnn-wpt-tests` | The `wasm32-unknown-unknown` target; browser tests additionally need `wasm-pack`, Node.js, Chrome/Chromium, `curl`, and `unzip` |
 
-The mock backend features and `dynamic-inputs`, `native-examples`, `pollster`, and
+The optional features `dynamic-inputs`, `native-examples`, `pollster`, and
 `zstd-cache-compression` do not add external runtime prerequisites.
 
+Defaults enable `onnx-converter` and `burn-cpu-runtime`. Each runtime includes its
+converter. For serialization alone, disable defaults and enable `<backend>-converter`.
+See the [crate feature table](https://rustnn.github.io/rustnn/api/rustnn/#cargo-features).
+
 ## Build and test
+
+The Cargo workspace contains the `rustnn` library at the root and `rustnn-cli` in `cli/`.
+Both are default members. Use `-p rustnn` for library-only commands and `-p rustnn-cli` for
+the CLI. CLI backend features forward to the library with its defaults disabled.
+The CLI is disabled on wasm32: its entry point is empty and its dependencies are omitted.
 
 Use the Makefile targets; they set feature flags and environment variables consistently.
 `make help` prints the same list.
 
 | Target | Effect |
 |---|---|
-| `build` | `cargo build`, no backend features |
+| `build` | `cargo build` with default features |
+| `check-converters` | Check each converter independently with defaults disabled |
+| `test-cli` | CLI default, no-default-feature and portable-converter integration tests |
 | `test` | `cargo fmt`, `clippy -D warnings`, `cargo test`, operator report drift check |
 | `fmt`, `fmt-check`, `lint` | rustfmt (apply / check), clippy only |
 | `clean`, `clean-all` | `cargo clean`; also the docs site and coverage output |
 | `onnxruntime-download` | Fetch the pinned ONNX Runtime into `target/onnxruntime`; export `ORT_DYLIB_PATH` afterwards |
 | `trtxruntime-download` | Fetch the pinned TensorRT-RTX SDK into `target/tensorrt-rtx`; `test-wpt-trtx` configures its build and runtime paths |
-| `run` | Validate `examples/sample_graph.json` with the CLI |
-| `viz` | Export the sample graph as Graphviz DOT |
-| `onnx`, `onnx-validate` | Convert the sample graph to ONNX (`GRAPH_FILE=...` selects another graph); also execute it with ONNX Runtime |
-| `coreml`, `coreml-validate` | CoreML conversion and execution (macOS) |
 | `benchmark-coreml-kv` | Self-contained attention/cache comparison; optionally set `COREML_KV_CONFIG` for an external model/reference fixture; see [Examples](../user-guide/examples.md#coreml-kv-cache-benchmark) |
 | `test-coreml-kv-benchmark` | Oracle and cache-content regressions for all storage modes, without external fixtures; run in macOS CI |
-| `build-coreml`, `test-coreml` | Build all targets; run library and ordinary integration tests. `COREML_FEATURES=coreml-runtime` also checks the build without dynamic inputs |
+| `build-coreml`, `test-coreml` | Build all targets; run library and ordinary integration tests, including execution. `COREML_FEATURES=coreml-runtime` also checks the build without dynamic inputs |
 | `test-coreml-gather` | Focused active-dimension gather regressions, including scalar indices; `TEST_FILTER` selects a test |
 | `test-coreml-dtypes` | Focused numeric boundary regressions for typed dispatch and the convenience API; CI runs with and without dynamic inputs |
+| `test-coreml-gelu` | Exact Half GELU precision, shapes and compositions, including all Half encodings |
+| `test-coreml-precision` | Native typed-boundary, Half layout, constant, fanout and bounded-dynamic regressions |
 | `test-coreml-tensor-reuse` | Retained storage ownership, type conversion and shape regressions; CI runs with and without dynamic inputs |
 | `test-coreml-stride-two` | Static stride-two slice rewrite: MIL structure tests and, on macOS, exact exported-model results under every compute-unit permission; see [CoreML stride-two lowering](../testing/coreml-stride-two.md) |
-| `litert`, `cann` | LiteRT and CANN conversion of the sample graph |
 | `validate-cann-env`, `cann-build`, `cann-device-test` | OpenHarmony toolchain check, cross build, device test through `hdc`; see [CANN](../integration/cann.md) |
-| `validate-all-env` | Build, unit tests, ONNX and CoreML validation in one run |
+| `validate-all-env` | Build and unit tests in one run |
 | `fetch-wpt` | Download the pinned WPT corpus into the cache (`WPT_DIR` overrides) |
 | `test-wpt` | WPT conformance on ONNX Runtime CPU |
 | `test-wpt-tolerance`, `test-wpt-tolerance-parity` | Backend-independent comparison regressions and direct upstream JavaScript-helper parity; the latter requires Node.js and a fetched WPT corpus and also runs after successful full ONNX/CoreML WPT targets |
@@ -150,7 +157,7 @@ Then:
 | Workflow | Trigger | Content |
 |---|---|---|
 | `ci.yml` | push, pull request | Cargo.lock consistency, `cargo fmt --check`, `cargo check` per feature (including wasm32, and CoreML on macOS), `cargo test --lib` on Linux and macOS plus the CANN mock, rustdoc with `-D warnings`, operator report drift check and generator tests, MkDocs strict build |
-| `wpt-conformance.yml` | push, pull request | WPT suites for ONNX Runtime (Linux), LiteRT (Linux, non-blocking) and CoreML (macOS) |
+| `wpt-conformance.yml` | push, pull request | WPT suites for ONNX Runtime and Burn CPU (Linux), LiteRT (Linux, non-blocking) and CoreML (macOS) |
 | `wpt-conformance-nightly.yml` | schedule | Full WPT run with JSON and HTML reports; publishes the dashboard together with the docs site |
 | `wpt-sync.yml` | weekly, manual | Regenerates snapshots and expected failures against the pinned WPT revision and opens a pull request |
 | `rustnnpt-gate.yml` | pull request | Runs the external rustnnpt conformance runner against the PR's rustnn and enforces a minimum pass rate |
@@ -183,3 +190,11 @@ from the extracted package as well when changing shared documentation.
   warnings. A new module gets a `//!` header saying what the module owns. Enum variants that
   are only operand indices (`Operation`) and error fields described by their message carry an
   explicit `#[allow(missing_docs)]`.
+
+### Burn CPU development
+
+Use `cargo check --features burn-cpu-runtime --all-targets` and
+`cargo test --features burn-cpu-runtime --lib --test test_burn_precision` for the CPU
+interpreter and its public-executor datatype regressions. No native runtime
+installation is needed. Run `make test-wpt-burn-cpu` and regenerate its expected failures
+with `make wpt-sync-burn-cpu`. See [Burn CPU](../integration/burn-cpu.md).
