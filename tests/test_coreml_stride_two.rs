@@ -1,4 +1,7 @@
 //! Parity-slice lowering and exact native results for every eligible rank/axis.
+
+#![cfg(feature = "coreml-converter")]
+
 use prost::Message;
 use rustnn::converters::{CoremlMlProgramConverter, GraphConverter};
 use rustnn::graph::{
