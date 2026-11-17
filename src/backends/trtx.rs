@@ -469,7 +469,7 @@ impl<'context, 'builder> MLBackendBuilder<'context, 'builder> for TrtxBuilder<'c
         let mut hash_key: Option<String> = None;
 
         let non_refittable_constants =
-            crate::converters::TrtxConverter::gather_baked_constant_operand_ids(&graph);
+            crate::converters::TrtxConverter::gather_baked_constant_operand_ids(&graph)?;
         // Dead constants (no consumer) are eliminated by the TensorRT builder and
         // have no refit prototype; they are neither marked refittable nor refitted.
         // They do not take part in the caching decision: their values cannot
@@ -478,13 +478,22 @@ impl<'context, 'builder> MLBackendBuilder<'context, 'builder> for TrtxBuilder<'c
             crate::converters::TrtxConverter::unused_constant_operand_ids(&graph);
 
         // no caching for non_refittable_constants for now, non_refittable_constants will end up in
-        // the engine and potentially grow our cache to much. We should only consider including
-        // weights into engines for very small constants
-        if self.caching_enabled && non_refittable_constants.is_empty() {
-            let key =
-                // if deciding to do hashing for non_refittable_constants
-                //graph.hash_identifier(&TRTX_SUFFIX, WeightsToHash::Some(&non_refittable_constants));
-                graph.hash_identifier(&TRTX_SUFFIX_ENGINES, WeightsToHash::None);
+        // the engine and potentially grow our cache to much.
+        // We allow putting small non-refittable constants into the engine
+        if self.caching_enabled
+            && non_refittable_constants.iter().all(|&c| {
+                graph.operands[c as usize]
+                    .descriptor
+                    .element_count()
+                    .expect("gather_baked_constant_operand_ids fails on dynamic constants!")
+                    < 128 // 128 elements were chosen arbitrarily as the threshold for "small" constants
+            })
+        {
+            let key = graph.hash_identifier(
+                &TRTX_SUFFIX_ENGINES,
+                WeightsToHash::Some(&non_refittable_constants),
+            );
+
             if let Ok(cache) = ENGINE_CACHE.as_ref()
                 && let Ok(engine) = cache.get(&key)
             {
@@ -510,8 +519,6 @@ impl<'context, 'builder> MLBackendBuilder<'context, 'builder> for TrtxBuilder<'c
                 .take()
                 .expect("Frontend API should prevent TrtxBuilder::build to be called twice");
             crate::converters::TrtxConverter::build_network(&graph, &mut network)?;
-            let non_refittable_constants =
-                crate::converters::TrtxConverter::gather_baked_constant_operand_ids(&graph);
             for constant_id in graph.constant_operand_ids_to_handles.keys() {
                 if !non_refittable_constants.contains(constant_id)
                     && !unused_constants.contains(constant_id)
@@ -972,58 +979,57 @@ impl<'context> MLBackendContext<'context> for TrtxContext<'context> {
 
 impl ListDevices for TrtxContext<'_> {
     fn list_devices() -> Vec<crate::backend_selection::BackendDevice> {
+        Self::try_list_devices().unwrap_or_default()
+    }
+
+    fn try_list_devices() -> crate::error::Result<Vec<crate::backend_selection::BackendDevice>> {
+        let failure = |message: String| crate::error::Error::ContextCreationError {
+            source: message.into(),
+        };
         trace!("Enumerating Trtx devices");
         // cudarc panics on a missing driver library before it can return a CUDA error.
         // SAFETY: Loads the system CUDA driver from trusted library search paths.
         if !unsafe { sys::is_culib_present() } {
-            trace!("CUDA driver library not found; skipping TensorRT RTX");
-            return Vec::new();
+            return Err(failure("CUDA driver library not found".into()));
         }
-        let Ok(()) = result::init() else {
-            warn!("Could not enumerate CUDA devices for TensorRT RTX");
-            return Vec::new();
-        };
-        let Ok(device_count) = result::device::get_count() else {
-            warn!("Could not get CUDA device count for TensorRT RTX");
-            return Vec::new();
-        };
+        result::init().map_err(|e| failure(format!("CUDA initialization failed: {e}")))?;
+        let device_count = result::device::get_count()
+            .map_err(|e| failure(format!("CUDA device enumeration failed: {e}")))?;
 
         let mut devices = Vec::new();
+        let mut device_errors = Vec::new();
         for cuda_device_idx in 0..device_count {
-            let Ok(device) = result::device::get(cuda_device_idx) else {
-                continue;
+            let inspect = || -> std::result::Result<_, DriverError> {
+                let device = result::device::get(cuda_device_idx)?;
+                // SAFETY: `device` is a valid handle returned by CUDA.
+                let major = unsafe {
+                    result::device::get_attribute(
+                        device,
+                        sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+                    )?
+                };
+                Ok(major)
             };
-
-            // SAFETY: `device` is returned by `result::device::get`, so it is a valid CUdevice.
-            let Ok(major) = (unsafe {
-                result::device::get_attribute(
-                    device,
-                    sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
-                )
-            }) else {
-                continue;
-            };
-
-            // SAFETY: `device` is returned by `result::device::get`, so it is a valid CUdevice.
-            let Ok(minor) = (unsafe {
-                result::device::get_attribute(
-                    device,
-                    sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
-                )
-            }) else {
-                continue;
-            };
-
-            // Accept Ampere+ devices only (compute capability >= 8.0).
-            if major > 8 || (major == 8 && minor >= 0) {
-                devices.push(crate::backend_selection::BackendDevice::Trtx {
-                    cuda_device_idx: cuda_device_idx as u32,
-                });
+            match inspect() {
+                Ok(major) if major >= 8 => {
+                    devices.push(crate::backend_selection::BackendDevice::Trtx {
+                        cuda_device_idx: cuda_device_idx as u32,
+                    });
+                }
+                Ok(major) => device_errors.push(format!(
+                    "CUDA device {cuda_device_idx}: compute capability {major}.x requires >= 8.0"
+                )),
+                Err(error) => device_errors.push(format!(
+                    "CUDA device {cuda_device_idx}: discovery failed: {error}"
+                )),
             }
+        }
+        if devices.is_empty() && !device_errors.is_empty() {
+            return Err(failure(device_errors.join("; ")));
         }
 
         info!("Found Trtx devices {devices:?} from {device_count} CUDA devices");
-        devices
+        Ok(devices)
     }
 }
 

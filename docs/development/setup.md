@@ -8,8 +8,8 @@
 | `protoc` | Required: `build.rs` compiles the CoreML protobuf schemas, and `webnn-onnx-utils` the ONNX one (default `onnx` feature). Linux `apt-get install protobuf-compiler`, macOS `brew install protobuf`, Windows `winget install Google.Protobuf` |
 | `flatc` | Required for `litert-runtime` (TFLite schema). CI downloads the flatbuffers release binary; macOS `brew install flatbuffers` |
 | Node.js | WPT corpus fetch and evaluation (`scripts/fetch_wpt.mjs`, `scripts/wpt_bridge/`) |
-| Python 3 | Only for MkDocs (`pip install -r docs/requirements.txt`) and `scripts/generate_backend_operator_report.py` |
-| libclang | `trtx-runtime`: the `trtx-sys` crate generates bindings with autocxx; set `LIBCLANG_PATH` if it is not found |
+| Python 3 | MkDocs (`pip install -r docs/requirements.txt`) and the generator scripts in `scripts/` |
+| libclang | `trtx-runtime` and `make docs-api`: the `trtx-sys` crate generates bindings with autocxx, which needs libclang 21 or older; set `LIBCLANG_PATH` if it is not found or a newer libclang is the default (CI installs `libclang-21-dev` and sets `LIBCLANG_PATH=/usr/lib/llvm-21/lib`) |
 | Doxygen and cbindgen | Required for the documentation website and `make docs-capi`; install Doxygen with your package manager and cbindgen with `cargo install cbindgen --locked` |
 
 Windows: install the Visual Studio C++ build tools and run `git config --system core.longpaths true`
@@ -24,6 +24,7 @@ The default build needs no native runtime beyond the prerequisites above.
 |---|---|
 | `onnx-runtime` | The pinned ONNX Runtime; `make onnxruntime-download` installs it and the related Make targets configure `ORT_DYLIB_PATH` |
 | `coreml-runtime` | Xcode and system CoreML on macOS/iOS; see the [CoreML guide](../integration/coreml.md) for deployment requirements and the tvOS dependency caveat |
+| `coreml-export` | None beyond `protoc`: the pure-Rust `mlmodelc-export` crate writes `.mlmodelc` bundles on any host; see [Compile routes](../integration/coreml.md#compile-routes) |
 | `trtx-runtime`, `trtx-enterprise` | A compatible NVIDIA GPU and driver, CUDA 13.0, and a loadable TensorRT-RTX runtime |
 | `litert-runtime` | `flatc` on `PATH` plus the native LiteRT library provisioned by `litert-sys`; WPT runs also configure its library search path |
 | `cann-runtime` | An OHOS/Ascend HiAI environment and `libcann_shim.so` (or `CANN_SHIM_PATH`) |
@@ -42,6 +43,8 @@ The Cargo workspace contains the `rustnn` library at the root and `rustnn-cli` i
 Both are default members. Use `-p rustnn` for library-only commands and `-p rustnn-cli` for
 the CLI. CLI backend features forward to the library with its defaults disabled.
 The CLI is disabled on wasm32: its entry point is empty and its dependencies are omitted.
+`cargo test -p rustnn-cli` runs CLI unit tests, also run by CI on Linux and macOS.
+There is no CLI integration-test suite.
 
 Use the Makefile targets; they set feature flags and environment variables consistently.
 `make help` prints the same list.
@@ -50,7 +53,6 @@ Use the Makefile targets; they set feature flags and environment variables consi
 |---|---|
 | `build` | `cargo build` with default features |
 | `check-converters` | Check each converter independently with defaults disabled |
-| `test-cli` | CLI default, no-default-feature and portable-converter integration tests |
 | `test` | `cargo fmt`, `clippy -D warnings`, `cargo test`, operator report drift check |
 | `fmt`, `fmt-check`, `lint` | rustfmt (apply / check), clippy only |
 | `clean`, `clean-all` | `cargo clean`; also the docs site and coverage output |
@@ -68,6 +70,8 @@ Use the Makefile targets; they set feature flags and environment variables consi
 | `validate-cann-env`, `cann-build`, `cann-device-test` | OpenHarmony toolchain check, cross build, device test through `hdc`; see [CANN](../integration/cann.md) |
 | `validate-all-env` | Build and unit tests in one run |
 | `fetch-wpt` | Download the pinned WPT corpus into the cache (`WPT_DIR` overrides) |
+| `fetch-webnn-spec` | Refresh the live WebNN Bikeshed source in `target/webnn-index.bs` (requires `curl`) |
+| `generate-operation-data-types`, `check-operation-data-types` | Generate `src/generated/operation_data_types.rs` from the cached spec; check for drift. Requires Python 3 and rustfmt; downloads the spec if missing |
 | `test-wpt` | WPT conformance on ONNX Runtime CPU |
 | `test-wpt-tolerance`, `test-wpt-tolerance-parity` | Backend-independent comparison regressions and direct upstream JavaScript-helper parity; the latter requires Node.js and a fetched WPT corpus and also runs after successful full ONNX/CoreML WPT targets |
 | `test-wpt-op OP=relu` | One operation; `WPT_BACKEND=onnx|trtx|litert|coreml` selects the backend |
@@ -94,6 +98,12 @@ cargo test --lib --features cann-runtime-mock
 ```
 
 ## Workflow for a change
+
+For specification data type metadata, run `make fetch-webnn-spec` followed by
+`make generate-operation-data-types`, review the generated diff, and run
+`python3 -m unittest scripts/test_generate_operation_data_types.py`.
+See the [specification reference](https://github.com/rustnn/rustnn/blob/main/docs/reference/README.md)
+for the extraction scope.
 
 1. Branch from `main`.
 2. Make the change with its tests. Unit tests live in `#[cfg(test)]` modules at the end of each

@@ -26,6 +26,14 @@ fn parse_coreml_device(value: Option<&str>) -> &'static str {
     }
 }
 
+/// CoreML compiled-bundle cache directory for the trials: `WPT_COREML_BUNDLE_CACHE=<dir>`
+/// sets `CoremlOptions::compiled_bundle_cache`; unset (default) leaves the cache off.
+pub fn coreml_bundle_cache() -> Option<std::path::PathBuf> {
+    std::env::var_os("WPT_COREML_BUNDLE_CACHE")
+        .filter(|directory| !directory.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
 /// CoreML float16 lowering for the trials: `WPT_COREML_FLOAT16=native` (default) or `exact`.
 pub fn coreml_float16_precision() -> rustnn::mlcontext::CoremlFloat16Precision {
     parse_coreml_float16(std::env::var("WPT_COREML_FLOAT16").ok().as_deref())
@@ -40,8 +48,46 @@ fn parse_coreml_float16(value: Option<&str>) -> rustnn::mlcontext::CoremlFloat16
     }
 }
 
+/// CoreML compile route for the trials: `WPT_COREML_COMPILE_ROUTE=auto` (default), `native`
+/// or `rust-export`. `rust-export` needs the `coreml-export` feature
+/// (`make test-wpt-coreml WPT_COREML_FEATURES=coreml-runtime,coreml-export`).
+pub fn coreml_compile_route() -> rustnn::mlcontext::CoremlCompileRoute {
+    parse_coreml_compile_route(std::env::var("WPT_COREML_COMPILE_ROUTE").ok().as_deref())
+}
+
+fn parse_coreml_compile_route(value: Option<&str>) -> rustnn::mlcontext::CoremlCompileRoute {
+    use rustnn::mlcontext::CoremlCompileRoute;
+    match value {
+        None | Some("auto") => CoremlCompileRoute::Auto,
+        Some("native") => CoremlCompileRoute::Native,
+        Some("rust-export") => CoremlCompileRoute::RustExport,
+        Some(other) => {
+            panic!("WPT_COREML_COMPILE_ROUTE must be auto, native or rust-export; got {other:?}")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn coreml_compile_route_defaults_to_auto_and_accepts_each_route() {
+        use rustnn::mlcontext::CoremlCompileRoute;
+        for (value, expected) in [
+            (None, CoremlCompileRoute::Auto),
+            (Some("auto"), CoremlCompileRoute::Auto),
+            (Some("native"), CoremlCompileRoute::Native),
+            (Some("rust-export"), CoremlCompileRoute::RustExport),
+        ] {
+            assert_eq!(super::parse_coreml_compile_route(value), expected);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "WPT_COREML_COMPILE_ROUTE must be auto, native or rust-export")]
+    fn invalid_coreml_compile_route_is_rejected() {
+        super::parse_coreml_compile_route(Some("export"));
+    }
+
     #[test]
     fn coreml_float16_defaults_to_native_and_accepts_exact() {
         use rustnn::mlcontext::CoremlFloat16Precision;

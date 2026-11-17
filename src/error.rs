@@ -23,6 +23,45 @@ use thiserror::Error;
 /// Result of the WebNN API (`MLContext`, `MLGraphBuilder::build`, dispatch).
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// An operation operand violates the generated allowed data type rules.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum AllowedDataTypesError {
+    /// The used type is outside the spec domain or differs from a `SameAs` operand.
+    #[error("{operation_name}.{operand_name} allows {allowed_dtype:?}, but uses {used_dtype:?}")]
+    NotAllowed {
+        /// Operation identifier from the generated table.
+        operation_name: crate::operation_data_types::OperationName,
+        /// Input, option member, or output identifier.
+        operand_name: crate::operation_data_types::OperandName,
+        /// Allowed types; a `SameAs` violation lists the referenced actual type.
+        allowed_dtype: Vec<crate::operator_enums::MLOperandDataType>,
+        /// Actual operand type.
+        used_dtype: crate::operator_enums::MLOperandDataType,
+    },
+    /// A concat input differs from the first input's data type.
+    #[error(
+        "concat input {input_index} has data type {used_dtype:?}, but input 0 has {expected_dtype:?}; all concat inputs must have the same data type (cast inputs explicitly)"
+    )]
+    InconsistentConcatInput {
+        /// Zero-based index in the concat input sequence.
+        input_index: usize,
+        /// Data type of the first input.
+        expected_dtype: crate::operator_enums::MLOperandDataType,
+        /// Data type of the mismatched input.
+        used_dtype: crate::operator_enums::MLOperandDataType,
+    },
+    /// An operation references an operand missing from its graph.
+    #[error("{operation_name}.{operand_name} references missing operand {operand_id}")]
+    MissingOperand {
+        /// Operation identifier.
+        operation_name: crate::operation_data_types::OperationName,
+        /// Operand role whose reference is invalid.
+        operand_name: crate::operation_data_types::OperandName,
+        /// Missing graph operand index.
+        operand_id: u32,
+    },
+}
+
 /// Shape or data type conflicts found while recording an operation.
 ///
 /// Variant fields carry the values named in the message; they are not documented separately.
@@ -115,6 +154,9 @@ pub enum ShapeInferenceError {
 #[derive(Debug, Error)]
 #[allow(missing_docs)]
 pub enum GraphBuilderError {
+    /// Operand type validation failed while recording an operation.
+    #[error(transparent)]
+    AllowedDataTypes(#[from] AllowedDataTypesError),
     /// Failed to build: requested MLGraphBuilder.build with an empty output map.
     #[error("Failed to build: requested MLGraphBuilder.build with an empty output map")]
     EmptyOutputHashMap,
@@ -207,15 +249,33 @@ pub enum GraphBuilderError {
     InconsistentGraphInfo { message: String },
 }
 
+/// Render each error and its sources on separate lines, indented by two spaces per level.
+/// Messages are printed unchanged; this does not filter causes or reconstruct stack frames.
+pub fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut lines = Vec::new();
+    let mut current = Some(error);
+    let mut depth = 0;
+    while let Some(error) = current {
+        for line in error.to_string().lines() {
+            lines.push(format!("{}{line}", "  ".repeat(depth)));
+        }
+        current = error.source();
+        depth += 1;
+    }
+    lines.join("\n")
+}
+
 /// Errors of the WebNN API: context creation, building, tensors and dispatch.
 ///
 /// Variant fields carry the values named in the message; they are not documented separately.
 #[derive(Debug, Error)]
 #[allow(missing_docs)]
 pub enum Error {
-    /// No backend is available for context creation.
-    #[error("No backend is available for context creation")]
+    /// No backend matched the requested hints; `reason` retains discovery and runtime failures.
+    #[error("No backend is available for context creation: {reason}")]
     NoBackendAvailable {
+        #[source]
+        reason: Box<dyn std::error::Error + Send + Sync>,
         want_trtx: bool,
         have_trtx: bool,
         want_onnx: bool,
@@ -227,9 +287,11 @@ pub enum Error {
         want_cann: bool,
         have_cann: bool,
     },
-    /// No backend is available for backend hint: `backend_hint`.
-    #[error("No backend is available for backend hint: {backend_hint:?}.")]
+    /// The requested backend is disabled or failed discovery; `reason` describes the failure.
+    #[error("No backend is available for backend hint {backend_hint:?}: {reason}")]
     NoBackendAvailableForBackendHint {
+        #[source]
+        reason: Box<dyn std::error::Error + Send + Sync>,
         backend_hint: Backend,
         want_trtx: bool,
         have_trtx: bool,
@@ -399,44 +461,24 @@ pub enum Error {
     },
 }
 
-/// Why the scale and zero point of a `quantizeLinear` or `dequantizeLinear` do not fit its
-/// input. Checked when the builder records the operation, including graph import.
-///
-/// Variant fields carry the values named in the message; they are not documented separately.
+/// Error for failed validation on a `quantizeLinear`/`dequantizeLinear` operation
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[allow(missing_docs)]
 pub enum QuantizationParameterError {
-    /// The scale is not float16 or float32.
-    #[error("scale must be float16 or float32 (got {found:?})")]
-    ScaleDataType { found: DataType },
-    /// The quantize input is not float16, float32 or int32.
-    #[error("quantize input must be float16/float32/int32 (got {found:?})")]
-    QuantizeInputDataType { found: DataType },
-    /// The dequantize input is not a quantized integer type.
-    #[error("dequantize input must be int4/uint4/int8/uint8/int32/uint32 (got {found:?})")]
-    DequantizeInputDataType { found: DataType },
-    /// A floating-point quantize input and its scale have different types.
-    #[error("scale dtype {scale:?} must match quantize input dtype {input:?}")]
-    ScaleInputDataTypeMismatch { scale: DataType, input: DataType },
-    /// The zero point is not a quantized integer type.
-    #[error("zeroPoint must be int4/uint4/int8/uint8/int32/uint32 (got {found:?})")]
-    ZeroPointDataType { found: DataType },
-    /// The dequantize zero point and input have different types.
-    #[error("zeroPoint dtype {zero_point:?} must match dequantize input dtype {input:?}")]
-    ZeroPointInputDataTypeMismatch {
-        zero_point: DataType,
-        input: DataType,
-    },
     /// The zero point and scale have different shapes.
     #[error("zeroPoint shape {zero_point:?} must match scale shape {scale:?}")]
     ZeroPointShapeMismatch {
+        /// The zero point's shape.
         zero_point: Vec<crate::graph::Dimension>,
+        /// The scale's shape.
         scale: Vec<crate::graph::Dimension>,
     },
     /// The scale does not have the input's rank.
     #[error("scale rank {scale_rank} must match input rank {input_rank}")]
     ScaleRankMismatch {
+        /// The scale's rank.
         scale_rank: usize,
+        /// The input's rank.
         input_rank: usize,
     },
     /// A scale dimension is zero or does not divide the input dimension (blockwise).
@@ -444,8 +486,11 @@ pub enum QuantizationParameterError {
         "scale dim {axis} (value {scale_dim}) must divide input dim {axis} (value {input_dim}) for blockwise quantization"
     )]
     ScaleDoesNotDivideInput {
+        /// The dimension index.
         axis: usize,
+        /// The scale dimension's size.
         scale_dim: u32,
+        /// The input dimension's size.
         input_dim: u32,
     },
 }
@@ -456,6 +501,9 @@ pub enum QuantizationParameterError {
 #[derive(Debug, Error)]
 #[allow(missing_docs)]
 pub enum GraphError {
+    /// An operation violates the generated operand data type rules.
+    #[error(transparent)]
+    AllowedDataTypes(#[from] AllowedDataTypesError),
     /// Graph file `path` could not be read: `source`.
     #[error("graph file {path} could not be read: {source}")]
     Io {
@@ -604,6 +652,12 @@ pub enum GraphError {
     /// Onnx runtime failed: `reason`.
     #[error("onnx runtime failed: {reason}")]
     OnnxRuntimeFailed { reason: String },
+    /// ONNX Runtime initialization failed; retains the cached loader or environment error.
+    #[error("onnx runtime initialization failed: {source}")]
+    OnnxRuntimeInitializationFailed {
+        #[source]
+        source: std::sync::Arc<dyn std::error::Error + Send + Sync>,
+    },
     /// Tensorrt runtime is only available with the `trtx-runtime` feature enabled.
     #[error("tensorrt runtime is only available with the `trtx-runtime` feature enabled")]
     TrtxRuntimeUnavailable,
@@ -631,6 +685,9 @@ pub enum GraphError {
     /// Device tensor is not writable.
     #[error("device tensor is not writable")]
     DeviceTensorNotWritable,
+    /// Encountered a dynamically sized constant in the graph. Constants have by nature a fixed size.
+    #[error("Dynamic constants are not allowed: operand_id {operand_id}, {operand:?}")]
+    DynamicConstant { operand_id: u32, operand: Operand },
     /// Missing runtime `kind` tensor ``name``.
     #[error("missing runtime {kind} tensor `{name}`")]
     RuntimeTensorMissing { kind: String, name: String },
@@ -863,14 +920,14 @@ mod tests {
     fn quantization_parameter_errors_name_the_operation_and_the_rule() {
         let err = GraphError::QuantizationParameters {
             operation: "dequantizeLinear".to_string(),
-            source: QuantizationParameterError::ZeroPointInputDataTypeMismatch {
-                zero_point: DataType::Uint8,
-                input: DataType::Int8,
+            source: QuantizationParameterError::ScaleRankMismatch {
+                scale_rank: 1,
+                input_rank: 2,
             },
         };
         assert_eq!(
             err.to_string(),
-            "quantization validation failed for `dequantizeLinear`: zeroPoint dtype Uint8 must match dequantize input dtype Int8"
+            "quantization validation failed for `dequantizeLinear`: scale rank 1 must match input rank 2"
         );
     }
 
@@ -883,5 +940,48 @@ mod tests {
         let msg = format!("{}", err);
         assert!(msg.contains("quantizeLinear"));
         assert!(msg.contains("scale must be float32"));
+    }
+}
+
+#[cfg(test)]
+mod error_chain_tests {
+    use super::{Error, GraphError, format_error_chain};
+
+    #[test]
+    fn formats_cached_sources_without_splitting_colons() {
+        let source: std::sync::Arc<dyn std::error::Error + Send + Sync> = std::sync::Arc::new(
+            std::io::Error::other("failed to load C:\\runtime:custom\\onnx.dll: dlopen failed"),
+        );
+        let error = GraphError::OnnxRuntimeInitializationFailed {
+            source: source.clone(),
+        };
+        let wrapped = Error::ContextCreationError {
+            source: error.into(),
+        };
+        assert_eq!(
+            format_error_chain(&wrapped),
+            concat!(
+                "Failed to create context: onnx runtime initialization failed: failed to load C:\\runtime:custom\\onnx.dll: dlopen failed\n",
+                "  onnx runtime initialization failed: failed to load C:\\runtime:custom\\onnx.dll: dlopen failed\n",
+                "    failed to load C:\\runtime:custom\\onnx.dll: dlopen failed"
+            )
+        );
+        assert_eq!(
+            source.to_string(),
+            "failed to load C:\\runtime:custom\\onnx.dll: dlopen failed"
+        );
+    }
+
+    #[test]
+    fn indents_multiline_causes_without_rewriting_messages() {
+        let error = Error::ContextCreationError {
+            source: std::io::Error::other("first line\nsecond line: details").into(),
+        };
+        assert_eq!(
+            format_error_chain(&error),
+            "Failed to create context: first line\nsecond line: details\n  first line\n  second line: details"
+        );
+        let leaf = std::io::Error::other("context: cause: details");
+        assert_eq!(format_error_chain(&leaf), "context: cause: details");
     }
 }

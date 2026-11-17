@@ -7,6 +7,10 @@
 //! [`MLContextOptions`] carries the two WebNN hints (`powerPreference`, `accelerated`) plus
 //! rustnn extensions: a backend or device hint that overrides automatic selection, and
 //! [`RustNNOptions`] with per-backend tuning such as [`TrtxOptions`].
+//! [`MLContextOptions::with_rustnn_bypass_allowed_data_types_checks`] permits
+//! backend type extensions while recording, with a warning for every bypassed operation.
+//! [`MLContextOptions::with_rustnn_allow_int4_uint4`] permits packed integer
+//! extensions while retaining all other type validation.
 //! [`BackendStatistics`] holds optional, backend-specific diagnostic snapshots.
 
 use crate::mlcontext::{Backend, BackendDevice};
@@ -37,6 +41,8 @@ pub struct MLContextOptions {
     pub(crate) device_hint: Option<BackendDevice>,
     pub(crate) backend_hint: Option<Backend>,
     pub(crate) rustnn_options: RustNNOptions,
+    pub(crate) bypass_allowed_data_types_checks: bool,
+    pub(crate) allow_int4_uint4: bool,
 }
 
 impl MLContextOptions {
@@ -48,6 +54,8 @@ impl MLContextOptions {
             device_hint: None,
             backend_hint: None,
             rustnn_options: RustNNOptions::default(),
+            bypass_allowed_data_types_checks: false,
+            allow_int4_uint4: false,
         }
     }
 
@@ -87,6 +95,28 @@ impl MLContextOptions {
     /// Attach backend-specific tuning options.
     pub fn with_rustnn_options(mut self, options: RustNNOptions) -> Self {
         self.rustnn_options = options;
+        self
+    }
+
+    /// Bypass specification operand data type checks while recording operations.
+    ///
+    /// Defaults to `false`. When enabled, each checked operation emits a warning.
+    /// Shape, rank, operand-reference, and backend constraints still apply.
+    pub fn with_rustnn_bypass_allowed_data_types_checks(mut self, bypass: bool) -> Self {
+        self.bypass_allowed_data_types_checks = bypass;
+        self
+    }
+
+    /// Allow packed int4/uint4 where the spec permits int8/uint8, respectively.
+    ///
+    /// Defaults to `false`. This enables packed integer backend extensions without
+    /// bypassing other data type checks, `SameAs` equality, or shape validation.
+    /// Unrestricted spec operands already accept every rustnn data type.
+    ///
+    /// This option will be removed in a future version of RustNN when
+    /// uint4/int4 are a regular part of the WebNN spec.
+    pub fn with_rustnn_allow_int4_uint4(mut self, allow: bool) -> Self {
+        self.allow_int4_uint4 = allow;
         self
     }
 }
@@ -186,6 +216,46 @@ pub enum CoremlFloat16Precision {
     Exact,
 }
 
+/// How the CoreML backend turns the lowered MLProgram into a loadable model (rustnn extension).
+///
+/// This selects the compile step only; the converter, the numerical lowering and the
+/// compute-unit policy are unchanged. The successful route is reported as
+/// `CoremlLoadRoute` in the graph's load diagnostics. See the "Compile routes" section of
+/// the CoreML integration guide.
+#[derive(PartialEq, Eq, Clone, Copy, Debug, Default)]
+#[non_exhaustive]
+pub enum CoremlCompileRoute {
+    /// [`Native`](Self::Native) where Apple's compiler exists, otherwise
+    /// [`RustExport`](Self::RustExport). On watchOS the public `MLModel.compileModel`
+    /// API does not exist, so `Auto` selects `RustExport` there; the build then needs the
+    /// `coreml-export` feature. With that feature enabled on any other Apple target, `Auto`
+    /// also retries through `RustExport` when the native compile step fails, and records the
+    /// native failure in the load diagnostics.
+    #[default]
+    Auto,
+    /// Compile with Apple's `MLModel` (in memory through `MLModelAsset`, or from a temporary
+    /// `.mlmodel`/`.mlpackage` URL). This is the only route without the `coreml-export`
+    /// feature.
+    Native,
+    /// Write the `.mlmodelc` bundle in this process with the pure-Rust `mlmodelc-export`
+    /// crate and load it with `MLModel(contentsOf:)`. Requires the `coreml-export` feature;
+    /// without it, `build` fails. The bundle contains source MIL, which Core ML compiles for
+    /// the device at load time. This is the route for watchOS and other targets where
+    /// `MLModel.compileModel` is unavailable.
+    ///
+    /// The bundle is always loaded from disk, so the values are those of the native URL
+    /// route, not those of the in-memory asset that [`Native`](Self::Native) uses for most
+    /// graphs. Float16 graphs can differ between the two under
+    /// [`CoremlFloat16Precision::Native`] (WPT's float16 NHWC `l2Pool2d` trial, and on some
+    /// hosts its float16 `gru` and `lstm` trials, fail from a URL); use
+    /// [`CoremlFloat16Precision::Exact`] for float16 graphs on this route.
+    ///
+    /// An input-free program whose outputs are all copies of constants is not loaded from
+    /// the bundle, because Core ML can crash on it from a URL. It is loaded as an in-memory
+    /// asset instead, and on watchOS, which has no such loader, `build` fails.
+    RustExport,
+}
+
 /// CoreML tensor storage and lowering options; see the CoreML integration guide.
 #[derive(PartialEq, Eq, Clone, Debug)]
 #[non_exhaustive]
@@ -200,6 +270,50 @@ pub struct CoremlOptions {
     pub output_backings: bool,
     /// Float16 lowering. Defaults to [`CoremlFloat16Precision::Native`].
     pub float16_precision: CoremlFloat16Precision,
+    /// Compile step. Defaults to [`CoremlCompileRoute::Auto`], which keeps the native
+    /// compiler wherever it exists.
+    pub compile_route: CoremlCompileRoute,
+
+    // Compiled-bundle cache (see "Compiled-bundle cache" in the CoreML integration guide).
+    /// Directory of the compiled-bundle cache; `None` (the default) disables it.
+    ///
+    /// When set, `MLGraphBuilder::build` keeps the compiled `.mlmodelc` of every graph under
+    /// `<dir>/<key>/` and loads it from there on the next build of the same graph instead of
+    /// compiling again, which is the slow step on small devices. The key covers the graph
+    /// (operands, operations and every constant's bytes, through
+    /// `GraphInfo::hash_identifier`), the emitted weights blob and program size, the
+    /// compute-unit policy, `float16_precision`, the compile route, the crate version, a hash
+    /// of the CoreML converter sources and the OS build, so a converter, crate or OS change
+    /// never serves a stale bundle. Operand names and ids are part of the graph, so the same
+    /// WebNN graph built in another order or with other names is a different key.
+    ///
+    /// Only the URL route yields a bundle, so with the cache enabled a graph that would load
+    /// in memory compiles from a URL instead (`CoremlLoadRoute::CompiledUrl`). Two classes
+    /// keep the route they have without the cache, and report the cache as disabled when
+    /// that route is the in-memory one: input-free programs, and float16 graphs under
+    /// [`CoremlFloat16Precision::Native`], where URL compilation is known to return other
+    /// values. Use [`CoremlFloat16Precision::Exact`] to cache float16 graphs. Under
+    /// [`CoremlCompileRoute::RustExport`] the exported bundle is what is kept, under a key
+    /// of its own, for every graph that route loads from a URL. A cache failure never fails a
+    /// build: the graph compiles as without the cache and the outcome is reported in
+    /// `CoremlLoadDiagnostics::cache` (a `CacheOutcome`), reachable through
+    /// `MLGraph::rustnn_load_diagnostics`.
+    /// The directory grows by about the weights size per graph and is never evicted by rustnn;
+    /// deleting it is always safe. On iOS and watchOS use a `Library/Caches` location.
+    pub compiled_bundle_cache: Option<std::path::PathBuf>,
+    /// Graph `(input, output)` name pairs whose value is carried between dispatches inside the
+    /// compiled model as a CoreML `MLState` instead of crossing the host boundary. Mirrors the
+    /// `kvCachePairs` of the WebNN stateful-model explainer. Both operands must have the same
+    /// `float16` or `float32` data type and static shape; CoreML stores the state as `float16`.
+    /// The paired names leave the graph's dispatch bindings; states start as zeros and are
+    /// cleared with `MLGraph::rustnn_reset_state`. Defaults to empty. See
+    /// `rustnn::converters::coreml_state` and `docs/integration/coreml.md`.
+    pub carried_state_pairs: Vec<(String, String)>,
+    /// Also pair inputs and outputs by naming convention (`X`/`next_X`, `past_X`/`present_X`,
+    /// `X_in`/`X_out`) when they have matching data types and static shapes
+    /// (`rustnn::converters::coreml_state::candidate_output_names`). Defaults to `false`, which
+    /// keeps every existing graph lowered exactly as before; accepted pairs are logged at `info`.
+    pub carry_state_automatically: bool,
 }
 
 #[allow(clippy::derivable_impls)]
@@ -209,6 +323,10 @@ impl Default for CoremlOptions {
             reuse_tensor_storage: false,
             output_backings: true,
             float16_precision: CoremlFloat16Precision::Native,
+            compile_route: CoremlCompileRoute::Auto,
+            compiled_bundle_cache: None,
+            carried_state_pairs: Vec::new(),
+            carry_state_automatically: false,
         }
     }
 }

@@ -91,13 +91,15 @@ Rules that hold for every converter:
 
 ### TensorRT-RTX
 
+- `bloat16`, `float8e4m3` are currently accepted by the converter but not fully implemented.
+  Undefined errors are expected until bloat16/fp8 is actually tested
 - `uint8` is legal only at network I/O or through a cast to or from float; internal `uint8`
   results stay `int32` and become `uint8` at the outputs. Boolean masks are stored as `int8`.
 - `IDequantizeLayer` cannot take `uint8`; unsigned `dequantizeLinear` uses the manual
   multiply path.
 - Integer broadcast uses a stride-0 slice (as `expand` does); `IResizeLayer` rejects integers.
 - Constants are refittable and set after the build; constants that TensorRT folds away (unused,
-  or feeding only casts) are excluded from refit (`unused_constant_operand_ids`,
+  or feeding only casts and certain data types) are excluded from refit (`unused_constant_operand_ids`,
   `constant_only_feeds_casts`). Refit failures raise `TrtxError::ConstantRefitFailed` with the
   operand and its consumers.
 - The engine cache key hashes the converter sources (`build.rs`, `SOURCE_HASH`), so converter
@@ -119,6 +121,10 @@ Rules that hold for every converter:
   float32.
 - Comparison results are `uint8`; `reduceLogSumExp` uses the max-shifted form; reductions with
   empty `axes` and `resample2d` on arbitrary axes are lowered explicitly.
+- Normalization affine parameters use native constants or rank-aligned reshapes with
+  elementwise broadcasting. Keep their representation independent of the activation tensor's
+  element count: activation-sized integer gather maps become enormous textual MIL literals
+  during CoreML compilation and model loading.
 - Gather-family index normalization uses active indexed dimensions, not their declared maxima.
   Scalar `gather` indices stay as one-element vectors through normalization and gathering;
   an axis-specific squeeze removes only the indexed dimension afterward. This avoids native
@@ -129,8 +135,21 @@ Rules that hold for every converter:
   pipeline children (`coreml_mlprogram/stride_two.rs`). On A12/A13, native stride-two
   slices made the CPU+GPU model exit during loading; see
   [Static stride-two CoreML lowering](https://rustnn.github.io/rustnn/testing/coreml-stride-two/).
+- A power of two scalar constants promotes one argument to `[1]` so MIL infers the
+  scalar result using the same boundary representation. Scalar constants used by other
+  operations retain their native rank.
+- Height-only NCHW/IOHW transposed convolutions with singleton width use an equivalent
+  width-only kernel, reshaping the operands and swapping spatial attributes before restoring
+  the output shape. This avoids incorrect repeated values in the native height-only kernel.
+  This adaptation currently applies to static shapes.
 - Float16 weights go to the weight blob written by `weight_file_builder.rs` and returned as
   `weights_data`.
+- Static float32 `add`, `sub`, `mul`, `div`, `pow`, `sin`, `cos` and `concat` expressions are evaluated before
+  CoreML lowering when each result is at most 4 MiB. This avoids a BNNS compiler
+  memory fault for broadcast sinusoidal positional embeddings followed by concat
+  and transpose (observed on macOS 26.6.2). Floating inputs retain float32 arithmetic;
+  dynamic values and float16 expressions use their native lowering. The existing
+  constant-view pass then resolves reshapes and transposes of those results.
 - `transpose`, `reshape` and `cast` of a constant are folded into a new constant before
   emission (`coreml_constant_fold.rs`, applied to a copy of the graph at the start of
   `convert_with_float16_precision`, for both float16 lowerings). The Neural Engine admits `matmul(x, const)` but refuses
@@ -225,6 +244,18 @@ Rules that hold for every converter:
 - The internal `shape` extension lowers to MIL `shape`, retaining its native int32 result
   inside CoreML and widening the public int64 result at readback. Imported shape tensors
   retain their type and rank through the shared `unsqueeze` inference path.
+- Carried-state pairs (`CoremlMlProgramConverter::convert_with_carried_state`, pairs from
+  `converters::coreml_state`) become `state<tensor<fp16, ...>>` function inputs: the input's
+  consumers read `read_state` (through a `cast` to `fp32` for `float32` pairs), the output is
+  stored with `write_state` (through a `cast` to `fp16`) and leaves the block outputs, and
+  `ModelDescription.state` replaces the two features. Without pairs the lowering is unchanged;
+  a test asserts the decoded models are equal. CoreML's validator accepts only `float16` state
+  storage. A conversion that ends in a Pipeline rejects pairs. When the stored `float32`
+  value is also a block output (after proven copies are coalesced), the `cast` reads
+  `mul(value, 1.0)` instead of the value: Core ML returns zeros for an `add` result that is
+  both returned and narrowed for `write_state` (macOS 26.7 and 27.3, every compute unit),
+  and a runtime test covers `add`, `sub` and `gruCell`.
+- Every function uses the `CoreML8` opset (`MIL_OPSET`) with specification version 9.
 
 ### LiteRT
 

@@ -21,7 +21,7 @@ are unchanged. The pass runs after arithmetic lowering, immediately before model
 serialization, including inside existing native pipeline children.
 
 The pass is `rewrite_model()` in `src/converters/coreml_mlprogram/stride_two.rs`.
-`convert_with_float16_precision()` in `src/converters/coreml_mlprogram.rs` calls it
+`convert_with_carried_state()` in `src/converters/coreml_mlprogram.rs` calls it
 immediately before the model is serialized, after `convert_with_precision_boundaries()`
 has materialized the
 [precision boundaries (#279)](https://github.com/rustnn/rustnn/pull/279). Keep the call

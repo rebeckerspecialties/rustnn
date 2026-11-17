@@ -2,14 +2,18 @@
 
 Errors you are likely to meet, what causes them, and where to look. Error types are described
 in the [error reference](https://rustnn.github.io/rustnn/api/rustnn/error/); `RUST_LOG=debug` adds the backend's own log
-lines to most of these situations.
+lines to most of these situations. CLI errors use indented causal chains, not execution stack
+traces. `error::format_error_chain` prints each `source()` message unchanged; opaque dependency
+messages remain single entries. Ordinary error display also includes initialization causes;
+chain output may repeat causes already included in a wrapper's message. Runtime initialization
+caches share the original error. CLI `--list` retains distinct failures from all discovery probes.
 
 ## Context creation
 
 | Symptom | Cause and fix |
 |---|---|
-| `Error::NoBackendAvailable { want_*, have_* }` | No compiled backend can serve the hints. The `have_*` flags show which features the binary was built with; add `--features onnx-runtime` (or another backend) or relax the hints |
-| `Error::NoBackendAvailableForBackendHint` | The hinted backend is compiled in but reports no device, or its library failed to load. Check the backend-specific rows below |
+| `Error::NoBackendAvailable { want_*, have_* }` | No backend can serve the hints. The `reason` includes runtime-loading and device-discovery failures; automatic selection still tries other backends. The `have_*` flags show which features the binary was built with; add `--features onnx-runtime` (or another backend) or relax the hints |
+| `Error::NoBackendAvailableForBackendHint` | The hinted backend is disabled, reports no matching device, or fails initialization. The `reason` distinguishes compile-time disabled support from runtime-loading or device-discovery failures. Check the backend-specific rows below |
 | ONNX Runtime is unavailable, or initialization reports a missing library or incompatible version | Set `ORT_DYLIB_PATH` to the downloaded ONNX Runtime 1.29 or newer shared library and restart the process. rustnn uses `ort::init_from` to return loading errors; backend discovery skips an unavailable runtime. An old `onnxruntime.dll` in Windows `System32` can be selected if the variable is unset. See [Getting Started](getting-started.md#provide-onnx-runtime) |
 | ONNX Runtime repeats the same initialization error after fixing `ORT_DYLIB_PATH` | Initialization failures are cached for the process lifetime. Restart the process after fixing the library path |
 | TensorRT-RTX not selected, log shows a library load error (`LoadLibraryExW` code 126 on Windows) | `tensorrt_rtx_1_6` is not on `PATH` / `LD_LIBRARY_PATH`; add the SDK library directory or call `dynamically_load_tensorrt` |
@@ -22,7 +26,9 @@ lines to most of these situations.
 | `GraphBuilderError::GraphAlreadyBuilt` | A builder compiles exactly one graph; create a new `MLGraphBuilder` for the next one |
 | `GraphBuilderError::WrongConstantSize` | The byte size of the slice does not match the descriptor; check the element count and the data type (4-bit types pack two values per byte) |
 | `GraphBuilderError::RequestedInputAsOutput` / `RequestedConstantAsOutput` | Outputs must be operation results; pass the result of `identity` if an input must be echoed |
-| `ShapeInferenceError::InconsistentDataTypes` or `BroadcastError` | The inputs of a binary operation differ in data type or are not broadcast-compatible; insert `cast`, `reshape` or `expand` |
+| `GraphBuilderError::AllowedDataTypes` | An input, option operand, or output violates the spec's type rules. The nested `AllowedDataTypesError` reports the operation, operand, allowed types, and used type; insert a cast or correct the descriptor. Packed 4-bit extensions use `with_rustnn_allow_int4_uint4(true)` on context options. The separate `with_rustnn_bypass_allowed_data_types_checks(true)` bypasses all type checks and emits warnings |
+| `AllowedDataTypesError::InconsistentConcatInput` | Concat inputs have different data types. The error identifies the zero-based input index and both types; cast inputs to a common type before concatenating |
+| `ShapeInferenceError::BroadcastError` | Input shapes are not broadcast-compatible; insert `reshape` or `expand` |
 | `GraphError::DynamicInputsFeatureDisabled` | The graph file declares a dynamic dimension; build with `--features dynamic-inputs` |
 | `Failed to convert graph: ... Unsupported operation: <name>` | The selected backend's converter has no lowering for that operation; see the [operator support report](../development/backend-operator-support.md) and pick another backend or decompose the operation |
 | `Error::GraphBuildError` from CoreML, LiteRT or TensorRT with a backend message | The backend rejected the converted model. `RUSTNN_ONNX_DUMP_DIR=<dir>` dumps the ONNX model, `TRTX_JSON_DUMP_PATH` the TensorRT layers; run the WPT case for the operation (`make test-wpt-op OP=<name>`) to compare |
@@ -40,6 +46,7 @@ lines to most of these situations.
 | `Error::WriteToNonWritableTensor` / `ReadToNonReadableTensor` | Create the tensor with `to_writable()` or `to_readable()` |
 | `Error::TensorCapacityError` | `rustnn_set_tensor_capacity` requested less storage than the active shape. Resize it first; rejection leaves shape and values unchanged on every backend |
 | Wrong results after editing a converter (TensorRT) | A cached engine from before the edit is unlikely (the cache key includes the converter sources) but possible for local uncommitted files; delete `<cache_dir>/rustnn/trtx` |
+| CoreML build still compiles for seconds with `compiled_bundle_cache` set, or `CoremlLoadDiagnostics::cache` is `Error(...)` | The outcome message names the step (`publish failed`, `cached bundle rebuilt`, `cache unusable`) and `RUST_LOG=warn` prints the cause; check that the directory is writable and has space. `Disabled` for a graph with inputs means the option was not set on this context. Deleting the directory or any `<key>` entry is safe; see [Compiled-bundle cache](../integration/coreml.md#compiled-bundle-cache) |
 
 ## Tests and tooling
 
@@ -53,3 +60,9 @@ lines to most of these situations.
 | `make docs-backend-ops-check` fails | A converter's operator support changed; run `make docs-backend-ops` and commit the report |
 | CI job fails with `detected conflict: 'bin/cargo-clippy'` from rustup | rustup was adding components from `rust-toolchain.toml` at the first cargo call; the workflows install them in the toolchain step, keep that when adding jobs |
 | Windows: `Access is denied` from `cargo fmt` or the linker | A test binary is still running; wait for it |
+
+### ONNX Runtime environment already initialized
+
+`init_global_ort_env` returns `OrtAlreadyInitialized` after an environment has been
+installed. Register EP libraries and supply the environment before listing devices
+or creating an ONNX context; an existing environment cannot be replaced.

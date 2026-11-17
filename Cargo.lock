@@ -3029,6 +3029,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlmodelc-export"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d15602dc8e4e635d0eb95b1e815882a2a66ab7989df50468c37d064855b6225"
+
+[[package]]
 name = "moddef"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4301,6 +4307,7 @@ dependencies = [
  "litert",
  "litert-sys",
  "log",
+ "mlmodelc-export",
  "ndarray",
  "objc",
  "ort",

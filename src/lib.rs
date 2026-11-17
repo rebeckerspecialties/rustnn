@@ -93,7 +93,8 @@
 //! | `trtx-converter` | Serialized TensorRT-RTX engines through `trtx`; conversion requires the NVIDIA SDK and GPU |
 //! | `cann-converter` | HiAI offline models through `hiai-rs`; conversion requires the CANN DDK |
 //! | `onnx-runtime` | ONNX Runtime execution through `ort` (dynamic loading, `ORT_DYLIB_PATH`) |
-//! | `coreml-runtime` | Apple CoreML execution on macOS/iOS; failing shims on other targets |
+//! | `coreml-export` | Pure-Rust `.mlmodelc` bundles through `mlmodelc-export`: `ConvertedGraph::write_coreml_bundle` and the `RustExport` compile route of [`mlcontextoptions::CoremlCompileRoute`]; required for CoreML on watchOS; works on non-Apple hosts |
+//! | `coreml-runtime` | Apple CoreML execution on Apple targets (macOS, iOS; tvOS, watchOS and visionOS build gates are present, see the CoreML guide); failing shims on other targets |
 //! | `litert-runtime` | LiteRT execution through `litert` and `litert-sys` |
 //! | `burn-cpu-runtime` | Burn NdArray CPU execution (default); no native runtime library |
 //! | `trtx-runtime` | TensorRT-RTX execution, CUDA tensors and compressed engine caches |
@@ -119,6 +120,8 @@
 //! | `ORT_DYLIB_PATH` | Path of the ONNX Runtime shared library loaded by `ort` |
 //! | `WPT_COREML_TENSOR_MODE` | WPT harness only: `baseline` (default), `persistent`, or `backings`; does not change library defaults |
 //! | `WPT_COREML_FLOAT16` | WPT harness only: `native` (default) or `exact` CoreML float16 lowering; does not change library defaults |
+//! | `WPT_COREML_COMPILE_ROUTE` | WPT harness only: `auto` (default), `native` or `rust-export` CoreML compile route; `rust-export` needs the `coreml-export` feature |
+//! | `WPT_COREML_BUNDLE_CACHE` | WPT harness only: directory for the CoreML compiled-bundle cache; unset (default) leaves it off |
 //!
 //! Persistent caches (TensorRT engines and the TensorRT runtime cache) live under the
 //! platform cache directory, `<cache_dir>/rustnn/<category>`; see [`backends::caching`].
@@ -144,6 +147,9 @@ pub mod loader;
 pub mod mlcontext;
 pub mod mlcontextoptions;
 pub mod mlgraphbuilder;
+#[path = "generated/operation_data_types.rs"]
+pub mod operation_data_types;
+pub mod operation_type_support;
 pub mod operator_enums;
 pub mod operator_options;
 pub mod operators;
@@ -157,6 +163,8 @@ pub(crate) mod webnn_save;
 #[cfg(all(target_os = "macos", feature = "coreml-runtime"))]
 pub use executors::coreml;
 
+#[cfg(feature = "coreml-export")]
+pub use converters::CoremlBundleStats;
 #[cfg(feature = "litert-runtime")]
 pub use converters::litert::LiteRtConverter;
 pub use converters::{

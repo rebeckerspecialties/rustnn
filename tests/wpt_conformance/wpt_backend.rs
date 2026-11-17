@@ -20,7 +20,11 @@ impl Hash for WptBackend {
 
 impl WptBackend {
     fn new(prefix: &'static str, options: MLContextOptions) -> Self {
-        Self { prefix, options }
+        // The pinned WPT corpus includes packed 4-bit quantization extensions.
+        Self {
+            prefix,
+            options: options.with_rustnn_allow_int4_uint4(true),
+        }
     }
 
     pub fn trial_prefix(&self) -> &'static str {
@@ -57,6 +61,8 @@ impl WptBackend {
             ),
         }
         coreml.coreml.float16_precision = super::wpt_config::coreml_float16_precision();
+        coreml.coreml.compile_route = super::wpt_config::coreml_compile_route();
+        coreml.coreml.compiled_bundle_cache = super::wpt_config::coreml_bundle_cache();
         vec![
             Self::new(
                 "burn-cpu",
@@ -188,6 +194,7 @@ mod tests {
                 )
                 .with_rustnn_backend_hint(Backend::Coreml)
                 .with_rustnn_options(tuning.clone())
+                .with_rustnn_allow_int4_uint4(true)
                 .with_rustnn_device_hint(BackendDevice::Coreml { device_type });
                 assert_eq!(
                     backend.context_options(),

@@ -20,7 +20,7 @@ pub use crate::backend_selection::{Backend, BackendDevice, DeviceType};
 use crate::backends::trtx::TrtxGraph;
 use crate::error::Error;
 use crate::error::Result;
-use crate::graph::{DataType, Dimension, Operand, get_static_or_max_size};
+use crate::graph::{Dimension, Operand, get_static_or_max_size};
 use crate::mlgraphbuilder::get_operand;
 use crate::operator_options::OperandIndex;
 use crate::runtime_checks::{RuntimeShapeState, TensorKind};
@@ -34,8 +34,9 @@ use std::collections::BTreeMap;
 use std::{collections::HashMap, fmt::Display, marker::PhantomData};
 
 pub use crate::mlcontextoptions::{
-    BackendStatistics, CoremlFloat16Precision, CoremlOptions, CoremlTensorStatistics,
-    LiteRtOptions, MLContextOptions, MLPowerPreference, OrtOptions, RustNNOptions, TrtxOptions,
+    BackendStatistics, CoremlCompileRoute, CoremlFloat16Precision, CoremlOptions,
+    CoremlTensorStatistics, LiteRtOptions, MLContextOptions, MLPowerPreference, OrtOptions,
+    RustNNOptions, TrtxOptions,
 };
 
 /// <https://www.w3.org/TR/webnn/#typedefdef-mlnamedtensors>
@@ -83,8 +84,12 @@ use crate::{
 // Backend traits
 
 pub(crate) trait ListDevices {
-    // TODO: should probably be a Result or just be an empty Vec when something is not working the
     fn list_devices() -> Vec<BackendDevice>;
+
+    /// Enumerate devices while retaining initialization failures for backend selection.
+    fn try_list_devices() -> Result<Vec<BackendDevice>> {
+        Ok(Self::list_devices())
+    }
 }
 
 // could make public later if interface stabilized
@@ -139,7 +144,9 @@ pub(crate) enum MLBackendGraph<'context> {
         std::marker::PhantomData<&'context ()>,
     ),
     #[cfg(feature = "coreml-runtime")]
-    CoremlModel(crate::backends::coreml::CoremlGraph),
+    // Boxed: the compiled model with its load diagnostics and state is far larger than
+    // the other variants.
+    CoremlModel(Box<crate::backends::coreml::CoremlGraph>),
     #[cfg(feature = "litert-runtime")]
     LiteRtGraph(crate::backends::litert::LiteRtGraph),
     #[cfg(any(feature = "cann-runtime", feature = "cann-runtime-mock"))]
@@ -179,7 +186,18 @@ impl<'context> MLBackendGraph<'context> {
     #[cfg(feature = "coreml-runtime")]
     pub(crate) fn as_coreml_model(&self) -> Option<&crate::backends::coreml::CoremlGraph> {
         if let Self::CoremlModel(v) = self {
-            Some(v)
+            Some(v.as_ref())
+        } else {
+            None
+        }
+    }
+
+    #[cfg(feature = "coreml-runtime")]
+    pub(crate) fn as_coreml_model_mut(
+        &mut self,
+    ) -> Option<&mut crate::backends::coreml::CoremlGraph> {
+        if let Self::CoremlModel(v) = self {
+            Some(v.as_mut())
         } else {
             None
         }
@@ -308,6 +326,21 @@ impl<'context> MLGraph<'context> {
         }
     }
 
+    /// Reset the state the backend carries between dispatches to zeros (rustnn extension).
+    ///
+    /// CoreML graphs built with `CoremlOptions::carried_state_pairs` or
+    /// `carry_state_automatically` keep those pairs inside the compiled model; this replaces
+    /// the model's `MLState` with a fresh one, as at build time. Graphs without carried state
+    /// return `Ok(())` unchanged. The carried pairs are listed in
+    /// `CoremlLoadDiagnostics::carried_state_pairs`.
+    pub fn rustnn_reset_state(&mut self) -> Result<()> {
+        #[cfg(feature = "coreml-runtime")]
+        if let Some(graph) = self.backend.as_coreml_model_mut() {
+            return graph.reset_state();
+        }
+        Ok(())
+    }
+
     pub(crate) fn new(backend: MLBackendGraph<'context>, graph_info: &GraphInfo) -> Result<Self> {
         let (input_descriptors, output_descriptors) = graph_info
             .io_binding_maps()
@@ -362,7 +395,7 @@ impl<'context> MLGraph<'context> {
 
         for (&name, tensor) in inputs {
             let expected = self.input_descriptors.get(name).expect("validated above");
-            if DataType::from(tensor.data_type()) != expected.data_type {
+            if tensor.data_type() != expected.data_type {
                 return Err(Error::GraphDispatchError {
                     source: format!(
                         "input '{name}' data type mismatch (expected {:?}, got {:?})",
@@ -376,7 +409,7 @@ impl<'context> MLGraph<'context> {
 
         for (&name, tensor) in outputs {
             let expected = self.output_descriptors.get(name).expect("validated above");
-            if DataType::from(tensor.data_type()) != expected.data_type {
+            if tensor.data_type() != expected.data_type {
                 return Err(Error::GraphDispatchError {
                     source: format!(
                         "output '{name}' data type mismatch (expected {:?}, got {:?})",
@@ -408,7 +441,7 @@ pub struct MLOperandDescriptor {
 impl From<&MLOperandDescriptor> for OperandDescriptor {
     fn from(val: &MLOperandDescriptor) -> Self {
         OperandDescriptor {
-            data_type: val.data_type.into(),
+            data_type: val.data_type,
             shape: val
                 .shape
                 .iter()
@@ -491,7 +524,7 @@ impl MLOperand {
     pub fn data_type(self, graph: &GraphInfo) -> Result<MLOperandDataType> {
         let operand = get_operand(self, graph)?;
 
-        Ok(operand.descriptor.data_type.try_into()?)
+        Ok(operand.descriptor.data_type)
     }
 
     /// Index of the operand in its builder's graph (rustnn extension). Operand fields of the
@@ -599,6 +632,8 @@ impl MLTensorDescriptor {
 pub struct MLContext<'context> {
     pub(crate) backend: Box<dyn MLBackendContext<'context> + 'context>,
     pub(crate) device: BackendDevice,
+    pub(crate) bypass_allowed_data_types_checks: bool,
+    pub(crate) allow_int4_uint4: bool,
 }
 
 impl<'context> MLContext<'context> {
@@ -655,7 +690,12 @@ impl<'context> MLContext<'context> {
                 CannContext::new_from_device_type(device_type, Some(&options.rustnn_options))?,
             ),
         };
-        Ok(Self { backend, device })
+        Ok(Self {
+            backend,
+            device,
+            bypass_allowed_data_types_checks: options.bypass_allowed_data_types_checks,
+            allow_int4_uint4: options.allow_int4_uint4,
+        })
     }
 
     /// Not implemented: `ML.createContext(GPUDevice)`.
@@ -670,7 +710,12 @@ impl<'context> MLContext<'context> {
             crate::backend_selection::BackendDevice::Cann { .. } => todo!(),
             BackendDevice::BurnCpu => todo!(),
         };
-        Ok(Self { backend, device })
+        Ok(Self {
+            backend,
+            device,
+            bypass_allowed_data_types_checks: false,
+            allow_int4_uint4: false,
+        })
     }
     /// Whether the selected device is a GPU or NPU rather than a CPU.
     pub fn accelerated(&self) -> bool {
@@ -914,6 +959,8 @@ mod test {
     #[test]
     fn capacity_shrink_is_rejected_before_calling_any_backend() {
         let mut context = MLContext {
+            bypass_allowed_data_types_checks: false,
+            allow_int4_uint4: false,
             // All mutation methods panic, so reaching it would fail this test.
             backend: Box::new(crate::backends::DisabledContext {}),
             device: BackendDevice::LiteRt {
@@ -966,6 +1013,8 @@ mod test {
     #[test]
     fn capacity_overflow_is_rejected_before_calling_any_backend() {
         let mut context = MLContext {
+            bypass_allowed_data_types_checks: false,
+            allow_int4_uint4: false,
             backend: Box::new(crate::backends::DisabledContext {}),
             device: BackendDevice::LiteRt {
                 device_type: DeviceType::Cpu,
@@ -987,6 +1036,8 @@ mod test {
     fn backend_statistics_are_optional() {
         // This backend uses the default trait method, without a runtime dependency.
         let context = MLContext {
+            bypass_allowed_data_types_checks: false,
+            allow_int4_uint4: false,
             backend: Box::new(crate::backends::DisabledContext {}),
             device: BackendDevice::LiteRt {
                 device_type: DeviceType::Cpu,

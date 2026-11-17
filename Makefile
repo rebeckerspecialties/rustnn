@@ -7,6 +7,8 @@ ONNX_PATH ?= target/graph.onnx
 COREML_PATH ?= target/graph.mlmodel
 COREMLC_PATH ?= target/graph.mlmodelc
 COREML_FEATURES ?= coreml-runtime,dynamic-inputs
+# Add coreml-export to qualify WPT_COREML_COMPILE_ROUTE=rust-export.
+WPT_COREML_FEATURES ?= coreml-runtime
 COREML_KV_CONFIG ?=
 TEST_FILTER ?=
 LITERT_PATH ?= target/graph.tflite
@@ -107,6 +109,7 @@ CANN_CROSS_ENV = CC_aarch64_unknown_linux_ohos=$(OHOS_SDK_NATIVE)/llvm/bin/clang
 .PHONY: build test fmt fmt-check lint clean clean-all help \
 	coverage coverage-html coverage-lcov coverage-open coverage-clean \
 	docs-serve docs-build docs-clean ci-docs docs-api docs-capi docs-backend-ops docs-backend-ops-check \
+	fetch-webnn-spec generate-operation-data-types \
 	fetch-wpt require-wpt-cache test-wpt test-wpt-trtx test-wpt-litert test-wpt-coreml \
 	test-wpt-coreml-report build-coreml test-coreml benchmark-coreml-kv test-wpt-op test-wpt-report test-wpt-cann \
 	wpt-sync-onnx wpt-sync-litert wpt-sync-coreml wpt-sync-trtx wpt-sync-cann \
@@ -132,6 +135,18 @@ test:
 	$(CARGO) test
 	@echo "Checking backend operator support report drift..."
 	$(MAKE) docs-backend-ops-check
+
+# Explicitly refresh the live source; generation reuses it for offline repeatability.
+fetch-webnn-spec:
+	mkdir -p target
+	curl --fail --location --retry 3 https://raw.githubusercontent.com/webmachinelearning/webnn/refs/heads/main/index.bs -o target/webnn-index.bs.tmp
+	mv target/webnn-index.bs.tmp target/webnn-index.bs
+
+target/webnn-index.bs:
+	$(MAKE) fetch-webnn-spec
+
+generate-operation-data-types: target/webnn-index.bs
+	python3 scripts/generate_operation_data_types.py
 
 fetch-wpt:
 	node scripts/fetch_wpt.mjs
@@ -182,14 +197,14 @@ test-webnn-wpt-chrome-headless: require-wpt-cache webnn-chromedriver
 
 # WPT conformance (requires Node.js, WPT cache; set WPT_BACKEND=onnx|trtx to pick backend)
 test-wpt: onnxruntime-download
-	$(ORT_ENV_VARS) $(CARGO) test --test run_wpt_conformance --features onnx-runtime -- --test-threads 1
+	$(ORT_ENV_VARS) $(CARGO) test --test run_wpt_conformance --features onnx-runtime --
 	$(MAKE) test-wpt-tolerance-parity
 
 test-wpt-trtx: onnxruntime-download trtxruntime-download
-	$(ORT_ENV_VARS) $(TRT_ENV_VARS) $(CARGO) test --test run_wpt_conformance --features "onnx-runtime,trtx-runtime" -- trtx --test-threads 1
+	$(ORT_ENV_VARS) $(TRT_ENV_VARS) $(CARGO) test --test run_wpt_conformance --features "onnx-runtime,trtx-runtime" -- trtx
 
 test-wpt-burn-cpu:
-	WPT_BACKEND=burn-cpu $(CARGO) test --test run_wpt_conformance --features burn-cpu-runtime -- $(TEST_FILTER) --test-threads 1
+	WPT_BACKEND=burn-cpu $(CARGO) test --release --test run_wpt_conformance --features burn-cpu-runtime -- $(TEST_FILTER)
 
 wpt-sync-burn-cpu: fetch-wpt
 	./scripts/update_expected_failures.sh burn-cpu 2>&1 | tee /tmp/wpt-burn-cpu.log || true
@@ -197,10 +212,10 @@ wpt-sync-burn-cpu: fetch-wpt
 
 test-wpt-litert:
 	@WPT_REPORT_JSON="$(WPT_REPORT_LITERT_JSON)" \
-	$(CARGO) test --test run_wpt_conformance --features "litert-runtime" -- litert --test-threads=1
+	$(CARGO) test --test run_wpt_conformance --features "litert-runtime" -- litert
 
 test-wpt-coreml:
-	WPT_BACKEND=coreml $(CARGO) test --test run_wpt_conformance --features coreml-runtime -- $(if $(TEST_FILTER),$(TEST_FILTER),coreml) --test-threads 1
+	WPT_BACKEND=coreml $(CARGO) test --test run_wpt_conformance --features $(WPT_COREML_FEATURES) -- $(if $(TEST_FILTER),$(TEST_FILTER),coreml)
 	$(MAKE) test-wpt-tolerance-parity
 
 .PHONY: test-wpt-burn-cpu wpt-sync-burn-cpu test-wpt-tolerance test-wpt-tolerance-parity test-wpt-source-tolerance
@@ -214,11 +229,11 @@ test-wpt-tolerance-parity: require-wpt-cache
 
 .PHONY: test-coreml-gather
 test-coreml-gather:
-	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_dynamic_gather --test test_coreml_gather_bounds -- $(TEST_FILTER) --test-threads=1
+	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_dynamic_gather --test test_coreml_gather_bounds -- $(TEST_FILTER)
 
 .PHONY: test-coreml-dtypes
 test-coreml-dtypes:
-	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_dtypes -- $(TEST_FILTER) --test-threads=1
+	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_dtypes -- $(TEST_FILTER)
 
 .PHONY: test-coreml-stride-two
 test-coreml-stride-two:
@@ -227,15 +242,15 @@ test-coreml-stride-two:
 
 .PHONY: test-coreml-gelu
 test-coreml-gelu:
-	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_gelu --test test_coreml_gelu_precision -- $(TEST_FILTER) --test-threads=1
+	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_gelu --test test_coreml_gelu_precision -- $(TEST_FILTER)
 
 .PHONY: test-coreml-precision
 test-coreml-precision:
-	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_precision_pipeline -- $(TEST_FILTER) --test-threads=1
+	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_precision_pipeline -- $(TEST_FILTER)
 
 .PHONY: test-coreml-tensor-reuse
 test-coreml-tensor-reuse:
-	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_tensor_reuse -- $(TEST_FILTER) --test-threads=1
+	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_tensor_reuse -- $(TEST_FILTER)
 
 # Build every target, including examples and the separately run WPT harness.
 build-coreml:
@@ -244,7 +259,7 @@ build-coreml:
 # Ordinary integration suites use test_*. The live WPT and browser harnesses
 # have their own targets and corpus/device setup; do not run them here.
 test-coreml:
-	$(CARGO) test --lib --test 'test_*' --no-default-features --features $(COREML_FEATURES) -- $(TEST_FILTER) --test-threads=1
+	$(CARGO) test --lib --test 'test_*' --no-default-features --features $(COREML_FEATURES) -- $(TEST_FILTER)
 
 # Defaults to self-contained attention/cache chaining with an independent oracle.
 benchmark-coreml-kv:
@@ -256,7 +271,7 @@ test-coreml-kv-benchmark:
 
 test-wpt-coreml-report:
 	@mkdir -p reports
-	WPT_REPORT_JSON=reports/wpt-conformance.json $(CARGO) test --test run_wpt_conformance --features coreml-runtime -- coreml --test-threads 1
+	WPT_REPORT_JSON=reports/wpt-conformance.json $(CARGO) test --test run_wpt_conformance --features $(WPT_COREML_FEATURES) -- coreml
 	$(MAKE) test-wpt-tolerance-parity
 
 test-wpt-cann: require-wpt-cache validate-cann-env
@@ -268,14 +283,14 @@ test-wpt-cann: require-wpt-cache validate-cann-env
 
 test-wpt-op: onnxruntime-download
 	@test -n "$(OP)" || (echo "Usage: make test-wpt-op OP=add" && exit 1)
-	$(ORT_ENV_VARS) $(CARGO) test --test run_wpt_conformance --features onnx-runtime -- $(OP) --test-threads 1
+	$(ORT_ENV_VARS) $(CARGO) test --test run_wpt_conformance --features onnx-runtime -- $(OP)
 
 WPT_BACKEND ?= onnx
 # Full WPT run with JSON/HTML reports; exits 0 even if trials fail (for nightly pages).
 test-wpt-report: fetch-wpt onnxruntime-download
 	@mkdir -p reports
 	$(MAKE) test-wpt-tolerance-parity
-	@RUST_BACKTRACE=1 WPT_REPORT_JSON=reports/wpt-conformance.json $(ORT_ENV_VARS) $(CARGO) test --test run_wpt_conformance --features $(WPT_BACKEND)-runtime -- --test-threads 1
+	@RUST_BACKTRACE=1 WPT_REPORT_JSON=reports/wpt-conformance.json $(ORT_ENV_VARS) $(CARGO) test --test run_wpt_conformance --features $(WPT_BACKEND)-runtime --
 
 # ONNX: onnx_expected_failures.txt.
 wpt-sync-onnx: fetch-wpt
@@ -496,6 +511,10 @@ help:
 	@echo "  test               - Run rustfmt, clippy, Rust tests, and backend report drift check"
 	@echo "  fmt                - Format Rust code"
 	@echo "  clean              - Clean Rust build artifacts"
+	@echo ""
+	@echo "WebNN Specification:"
+	@echo "  fetch-webnn-spec   - Refresh the WebNN Bikeshed source in target/webnn-index.bs"
+	@echo "  generate-operation-data-types - Generate Rust allowed data type rules from the cached spec"
 	@echo ""
 	@echo "Code Coverage:"
 	@echo "  coverage           - Run tests with coverage (text output)"
