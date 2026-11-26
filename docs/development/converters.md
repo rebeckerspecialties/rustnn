@@ -130,6 +130,11 @@ Rules that hold for every converter:
   an axis-specific squeeze removes only the indexed dimension afterward. This avoids native
   scalar-index gather failures while retaining dynamic extents and unrelated singleton axes.
   A scalar result keeps the `[1]` CoreML boundary representation without changing the WebNN rank.
+- Static full-axis stride-two (even/odd) `slice` on float16/float32 tensors is rewritten as
+  reshape, unit-stride slice and reshape after the program is assembled, including inside
+  pipeline children (`coreml_mlprogram/stride_two.rs`). On A12/A13, native stride-two
+  slices made the CPU+GPU model exit during loading; see
+  [Static stride-two CoreML lowering](https://rustnn.github.io/rustnn/testing/coreml-stride-two/).
 - A power of two scalar constants promotes one argument to `[1]` so MIL infers the
   scalar result using the same boundary representation. Scalar constants used by other
   operations retain their native rank.

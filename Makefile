@@ -235,6 +235,11 @@ test-coreml-gather:
 test-coreml-dtypes:
 	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_dtypes -- $(TEST_FILTER)
 
+.PHONY: test-coreml-stride-two
+test-coreml-stride-two:
+	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --lib stride_two -- --test-threads=1
+	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_stride_two -- --test-threads=1
+
 .PHONY: test-coreml-gelu
 test-coreml-gelu:
 	$(CARGO) test --no-default-features --features $(COREML_FEATURES) --test test_coreml_gelu --test test_coreml_gelu_precision -- $(TEST_FILTER)

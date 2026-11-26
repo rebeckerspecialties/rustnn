@@ -66,6 +66,7 @@ Use the Makefile targets; they set feature flags and environment variables consi
 | `test-coreml-gelu` | Exact Half GELU precision, shapes and compositions, including all Half encodings |
 | `test-coreml-precision` | Native typed-boundary, Half layout, constant, fanout and bounded-dynamic regressions |
 | `test-coreml-tensor-reuse` | Retained storage ownership, type conversion and shape regressions; CI runs with and without dynamic inputs |
+| `test-coreml-stride-two` | Static stride-two slice rewrite: MIL structure tests and, on macOS, exact exported-model results under every compute-unit permission; see [CoreML stride-two lowering](../testing/coreml-stride-two.md) |
 | `validate-cann-env`, `cann-build`, `cann-device-test` | OpenHarmony toolchain check, cross build, device test through `hdc`; see [CANN](../integration/cann.md) |
 | `validate-all-env` | Build and unit tests in one run |
 | `fetch-wpt` | Download the pinned WPT corpus into the cache (`WPT_DIR` overrides) |
